@@ -14,13 +14,6 @@
 #include "type_index.h"
 #include "vector.h"
 
-#if !_ELFUTILS_PREREQ(0, 162)
-#define DW_TAG_atomic_type 0x47
-#endif
-#if !_ELFUTILS_PREREQ(0, 171)
-#define DW_FORM_implicit_const 0x21
-#endif
-
 DEFINE_HASH_TABLE_FUNCTIONS(dwarf_type_map, hash_pair_ptr_type,
 			    hash_table_scalar_eq)
 
@@ -1537,14 +1530,20 @@ drgn_dwarf_object_find(const char *name, size_t name_len, const char *filename,
 
 struct drgn_error *
 drgn_dwarf_info_cache_create(struct drgn_type_index *tindex,
+			     const Dwfl_Callbacks *dwfl_callbacks,
 			     struct drgn_dwarf_info_cache **ret)
 {
+	struct drgn_error *err;
 	struct drgn_dwarf_info_cache *dicache;
 
 	dicache = malloc(sizeof(*dicache));
 	if (!dicache)
 		return &drgn_enomem;
-	drgn_dwarf_index_init(&dicache->dindex);
+	err = drgn_dwarf_index_init(&dicache->dindex, dwfl_callbacks);
+	if (err) {
+		free(dicache);
+		return err;
+	}
 	dwarf_type_map_init(&dicache->map);
 	dwarf_type_map_init(&dicache->cant_be_incomplete_array_map);
 	dicache->depth = 0;

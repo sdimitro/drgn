@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -27,17 +28,10 @@
 #include "type_index.h"
 #include "vector.h"
 
-/* This definition was added to elf.h in glibc 2.18. */
-#ifndef NT_FILE
-#define NT_FILE 0x46494c45
-#endif
-
 static Elf_Type note_header_type(GElf_Phdr *phdr)
 {
-#if _ELFUTILS_PREREQ(0, 175)
 	if (phdr->p_align == 8)
 		return ELF_T_NHDR8;
-#endif
 	return ELF_T_NHDR;
 }
 
@@ -93,10 +87,6 @@ void drgn_program_deinit(struct drgn_program *prog)
 		close(prog->core_fd);
 
 	drgn_dwarf_info_cache_destroy(prog->_dicache);
-	if (prog->_dwfl) {
-		drgn_remove_all_dwfl_modules(prog->_dwfl);
-		dwfl_end(prog->_dwfl);
-	}
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -187,9 +177,12 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 	struct drgn_platform platform;
 	bool is_64_bit, is_kdump;
 	size_t phnum, i;
+	size_t num_file_segments;
 	bool have_non_zero_phys_addr = false;
 	struct drgn_memory_file_segment *current_file_segment;
-	bool have_nt_taskstruct = false, have_vmcoreinfo = false, is_proc_kcore;
+	const char *vmcoreinfo_note = NULL;
+	size_t vmcoreinfo_size = 0;
+	bool have_nt_taskstruct = false, is_proc_kcore;
 
 	err = drgn_program_check_initialized(prog);
 	if (err)
@@ -203,6 +196,7 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 	if (err)
 		goto out_fd;
 	if (is_kdump) {
+set_kdump:
 		err = drgn_program_set_kdump(prog);
 		if (err)
 			goto out_fd;
@@ -233,35 +227,109 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 	}
 
 	/*
-	 * First pass: count the number of loadable segments and check if p_addr
-	 * is valid.
+	 * First pass: count the number of loadable segments, check if p_paddr
+	 * is valid, and check for notes.
 	 */
-	prog->num_file_segments = 0;
+	num_file_segments = 0;
 	for (i = 0; i < phnum; i++) {
 		GElf_Phdr phdr_mem, *phdr;
 
 		phdr = gelf_getphdr(elf, i, &phdr_mem);
 		if (!phdr) {
 			err = drgn_error_libelf();
-			goto out_segments;
+			goto out_elf;
 		}
 
 		if (phdr->p_type == PT_LOAD) {
 			if (phdr->p_paddr)
 				have_non_zero_phys_addr = true;
-			prog->num_file_segments++;
+			num_file_segments++;
+		} else if (phdr->p_type == PT_NOTE) {
+			Elf_Data *data;
+			size_t offset;
+			GElf_Nhdr nhdr;
+			size_t name_offset, desc_offset;
+
+			data = elf_getdata_rawchunk(elf, phdr->p_offset,
+						    phdr->p_filesz,
+						    note_header_type(phdr));
+			if (!data) {
+				err = drgn_error_libelf();
+				goto out_elf;
+			}
+
+			offset = 0;
+			while (offset < data->d_size &&
+			       (offset = gelf_getnote(data, offset, &nhdr,
+						      &name_offset,
+						      &desc_offset))) {
+				const char *name, *desc;
+
+				name = (char *)data->d_buf + name_offset;
+				desc = (char *)data->d_buf + desc_offset;
+				if (strncmp(name, "CORE", nhdr.n_namesz) == 0) {
+					if (nhdr.n_type == NT_TASKSTRUCT)
+						have_nt_taskstruct = true;
+				} else if (strncmp(name, "VMCOREINFO",
+						   nhdr.n_namesz) == 0) {
+					vmcoreinfo_note = desc;
+					vmcoreinfo_size = nhdr.n_descsz;
+				}
+			}
 		}
 	}
 
-	prog->file_segments = malloc_array(prog->num_file_segments,
+	if (have_nt_taskstruct) {
+		/*
+		 * If the core file has an NT_TASKSTRUCT note and is in /proc,
+		 * then it's probably /proc/kcore.
+		 */
+		struct statfs fs;
+
+		if (fstatfs(prog->core_fd, &fs) == -1) {
+			err = drgn_error_create_os("fstatfs", errno, path);
+			if (err)
+				goto out_elf;
+		}
+		is_proc_kcore = fs.f_type == 0x9fa0; /* PROC_SUPER_MAGIC */
+	} else {
+		is_proc_kcore = false;
+	}
+
+	if (vmcoreinfo_note && !is_proc_kcore) {
+		char *env;
+		bool use_libkdumpfile;
+
+		/*
+		 * Use libkdumpfile for ELF vmcores if we were compiled with
+		 * libkdumpfile support unless specified otherwise.
+		 */
+		env = getenv("DRGN_USE_LIBKDUMPFILE_FOR_ELF");
+		if (env) {
+			use_libkdumpfile = atoi(env);
+		} else {
+#ifdef WITH_LIBKDUMPFILE
+			use_libkdumpfile = true;
+#else
+			use_libkdumpfile = false;
+#endif
+		}
+		if (use_libkdumpfile) {
+			elf_end(elf);
+			goto set_kdump;
+		}
+	}
+
+	prog->file_segments = malloc_array(num_file_segments,
 					   sizeof(*prog->file_segments));
 	if (!prog->file_segments) {
 		err = &drgn_enomem;
-		goto out_segments;
+		goto out_elf;
 	}
+	prog->num_file_segments = num_file_segments;
 	current_file_segment = prog->file_segments;
 
-	/* Second pass: add the segments and parse notes. */
+	/* Second pass: add the segments. */
 	for (i = 0; i < phnum; i++) {
 		GElf_Phdr phdr_mem, *phdr;
 
@@ -304,77 +372,31 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 					goto out_segments;
 			}
 			current_file_segment++;
-		} else if (phdr->p_type == PT_NOTE) {
-			Elf_Data *data;
-			size_t offset;
-			GElf_Nhdr nhdr;
-			size_t name_offset, desc_offset;
-
-			data = elf_getdata_rawchunk(elf, phdr->p_offset,
-						    phdr->p_filesz,
-						    note_header_type(phdr));
-			if (!data) {
-				err = drgn_error_libelf();
-				goto out_segments;
-			}
-
-			offset = 0;
-			while (offset < data->d_size &&
-			       (offset = gelf_getnote(data, offset, &nhdr,
-						      &name_offset,
-						      &desc_offset))) {
-				const char *name, *desc;
-
-				name = (char *)data->d_buf + name_offset;
-				desc = (char *)data->d_buf + desc_offset;
-				if (strncmp(name, "CORE", nhdr.n_namesz) == 0) {
-					if (nhdr.n_type == NT_TASKSTRUCT)
-						have_nt_taskstruct = true;
-				} else if (strncmp(name, "VMCOREINFO",
-						   nhdr.n_namesz) == 0) {
-					err = parse_vmcoreinfo(desc,
-							       nhdr.n_descsz,
-							       &prog->vmcoreinfo);
-					if (err)
-						goto out_segments;
-					have_vmcoreinfo = true;
-				}
-			}
 		}
+	}
+	if (vmcoreinfo_note) {
+		err = parse_vmcoreinfo(vmcoreinfo_note, vmcoreinfo_size,
+				       &prog->vmcoreinfo);
+		if (err)
+			goto out_segments;
 	}
 	elf_end(elf);
 	elf = NULL;
 
-	if (have_nt_taskstruct) {
-		/*
-		 * If the core file has an NT_TASKSTRUCT note and is in /proc,
-		 * then it's probably /proc/kcore.
-		 */
-		struct statfs fs;
-
-		if (fstatfs(prog->core_fd, &fs) == -1) {
-			err = drgn_error_create_os("fstatfs", errno, path);
+	if (is_proc_kcore) {
+		if (!vmcoreinfo_note) {
+			err = read_vmcoreinfo_fallback(&prog->reader,
+						       have_non_zero_phys_addr,
+						       &prog->vmcoreinfo);
 			if (err)
 				goto out_segments;
 		}
-		is_proc_kcore = fs.f_type == 0x9fa0; /* PROC_SUPER_MAGIC */
-	} else {
-		is_proc_kcore = false;
-	}
-
-	if (!have_vmcoreinfo && is_proc_kcore) {
-		err = read_vmcoreinfo_fallback(&prog->reader,
-					       have_non_zero_phys_addr,
-					       &prog->vmcoreinfo);
-		if (err)
-			goto out_segments;
-		have_vmcoreinfo = true;
-	}
-
-	if (have_vmcoreinfo)
+		prog->flags |= (DRGN_PROGRAM_IS_LINUX_KERNEL |
+				DRGN_PROGRAM_IS_LIVE);
+	} else if (vmcoreinfo_note) {
 		prog->flags |= DRGN_PROGRAM_IS_LINUX_KERNEL;
-	if (is_proc_kcore)
-		prog->flags |= DRGN_PROGRAM_IS_LIVE;
+	}
+
 	drgn_program_set_platform(prog, &platform);
 	return NULL;
 
@@ -445,32 +467,113 @@ out_fd:
 	return err;
 }
 
-static const Dwfl_Callbacks linux_proc_dwfl_callbacks = {
-	.find_elf = dwfl_linux_proc_find_elf,
-	.find_debuginfo = dwfl_standard_find_debuginfo,
-};
-
-static const Dwfl_Callbacks userspace_core_dump_dwfl_callbacks = {
-	.find_elf = dwfl_build_id_find_elf,
-	.find_debuginfo = dwfl_standard_find_debuginfo,
-};
-
-struct drgn_error *drgn_program_get_dwfl(struct drgn_program *prog, Dwfl **ret)
+static struct drgn_error *drgn_program_get_dindex(struct drgn_program *prog,
+						  struct drgn_dwarf_index **ret)
 {
-	const Dwfl_Callbacks *dwfl_callbacks;
+	struct drgn_error *err;
 
-	if (!prog->_dwfl) {
+	if (!prog->_dicache) {
+		const Dwfl_Callbacks *dwfl_callbacks;
+		struct drgn_dwarf_info_cache *dicache;
+
 		if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
 			dwfl_callbacks = &drgn_dwfl_callbacks;
 		else if (prog->flags & DRGN_PROGRAM_IS_LIVE)
-			dwfl_callbacks = &linux_proc_dwfl_callbacks;
+			dwfl_callbacks = &drgn_linux_proc_dwfl_callbacks;
 		else
-			dwfl_callbacks = &userspace_core_dump_dwfl_callbacks;
-		prog->_dwfl = dwfl_begin(dwfl_callbacks);
-		if (!prog->_dwfl)
-			return drgn_error_libdwfl();
+			dwfl_callbacks = &drgn_userspace_core_dump_dwfl_callbacks;
+
+		err = drgn_dwarf_info_cache_create(&prog->tindex,
+						   dwfl_callbacks, &dicache);
+		if (err)
+			return err;
+		err = drgn_program_add_type_finder(prog, drgn_dwarf_type_find,
+						   dicache);
+		if (err) {
+			drgn_dwarf_info_cache_destroy(dicache);
+			return err;
+		}
+		err = drgn_program_add_object_finder(prog,
+						     drgn_dwarf_object_find,
+						     dicache);
+		if (err) {
+			drgn_type_index_remove_finder(&prog->tindex);
+			drgn_dwarf_info_cache_destroy(dicache);
+			return err;
+		}
+		prog->_dicache = dicache;
 	}
-	*ret = prog->_dwfl;
+	*ret = &prog->_dicache->dindex;
+	return NULL;
+}
+
+struct drgn_error *drgn_program_get_dwfl(struct drgn_program *prog, Dwfl **ret)
+{
+	struct drgn_error *err;
+	struct drgn_dwarf_index *dindex;
+
+	err = drgn_program_get_dindex(prog, &dindex);
+	if (err)
+		return err;
+	*ret = dindex->dwfl;
+	return NULL;
+}
+
+static struct drgn_error *
+userspace_report_debug_info(struct drgn_program *prog,
+			    struct drgn_dwarf_index *dindex,
+			    const char **paths, size_t n,
+			    bool report_default)
+{
+	struct drgn_error *err;
+	size_t i;
+
+	for (i = 0; i < n; i++) {
+		int fd;
+		Elf *elf;
+
+		err = open_elf_file(paths[i], &fd, &elf);
+		if (err) {
+			err = drgn_dwarf_index_report_error(dindex, paths[i],
+							    NULL, err);
+			if (err)
+				return err;
+			continue;
+		}
+		/*
+		 * We haven't implemented a way to get the load address for
+		 * anything reported here, so for now we report it as unloaded.
+		 */
+		err = drgn_dwarf_index_report_elf(dindex, paths[i], fd, elf, 0,
+						  0, NULL, NULL);
+		if (err)
+			return err;
+	}
+
+	if (report_default) {
+		if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
+			int ret;
+
+			ret = dwfl_linux_proc_report(dindex->dwfl, prog->pid);
+			if (ret == -1) {
+				return drgn_error_libdwfl();
+			} else if (ret) {
+				return drgn_error_create_os("dwfl_linux_proc_report",
+							    ret, NULL);
+			}
+		} else {
+			Elf *elf;
+			int ret;
+
+			elf = elf_begin(prog->core_fd, ELF_C_READ, NULL);
+			if (!elf)
+				return drgn_error_libelf();
+			ret = dwfl_core_file_report(dindex->dwfl, elf, NULL);
+			elf_end(elf);
+			if (ret == -1)
+				return drgn_error_libdwfl();
+		}
+	}
 	return NULL;
 }
 
@@ -494,119 +597,41 @@ static int drgn_set_platform_from_dwarf(Dwfl_Module *module, void **userdatap,
 	return DWARF_CB_ABORT;
 }
 
-struct drgn_error *drgn_program_update_dwarf_index(struct drgn_program *prog)
-{
-	struct drgn_error *err;
-
-	/* If we don't have a Dwfl handle yet, there's nothing to index. */
-	if (!prog->_dwfl)
-		return NULL;
-	if (!prog->_dicache) {
-		struct drgn_dwarf_info_cache *dicache;
-
-		err = drgn_dwarf_info_cache_create(&prog->tindex, &dicache);
-		if (err)
-			return err;
-		err = drgn_program_add_type_finder(prog, drgn_dwarf_type_find,
-						   dicache);
-		if (err) {
-			drgn_dwarf_info_cache_destroy(dicache);
-			return err;
-		}
-		err = drgn_program_add_object_finder(prog,
-						     drgn_dwarf_object_find,
-						     dicache);
-		if (err) {
-			drgn_type_index_remove_finder(&prog->tindex);
-			drgn_dwarf_info_cache_destroy(dicache);
-			return err;
-		}
-		prog->_dicache = dicache;
-	}
-	err = drgn_dwarf_index_update(&prog->_dicache->dindex, prog->_dwfl);
-	if (err)
-		return err;
-	if (!prog->has_platform) {
-		dwfl_getdwarf(prog->_dwfl, drgn_set_platform_from_dwarf, prog,
-			      0);
-	}
-	return NULL;
-}
-
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_load_debug_info(struct drgn_program *prog, const char **paths,
-			     size_t n)
+			     size_t n, bool load_default)
 {
 	struct drgn_error *err;
-	Dwfl *dwfl;
-	size_t i;
+	struct drgn_dwarf_index *dindex;
+	bool report_from_dwfl;
 
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
-		return linux_kernel_load_debug_info(prog, paths, n);
+	if (!n && !load_default)
+		return NULL;
 
-	err = drgn_program_get_dwfl(prog, &dwfl);
+	err = drgn_program_get_dindex(prog, &dindex);
 	if (err)
 		return err;
-	for (i = 0; i < n; i++) {
-		if (!dwfl_report_elf(dwfl, paths[i], paths[i], -1, 0, true)) {
-			err = drgn_error_libdwfl();
-			goto out;
-		}
-	}
-	err = drgn_program_update_dwarf_index(prog);
-out:
-	if (err)
-		drgn_remove_unindexed_dwfl_modules(dwfl);
-	return err;
-}
 
-LIBDRGN_PUBLIC struct drgn_error *
-drgn_program_load_default_debug_info(struct drgn_program *prog)
-{
-	struct drgn_error *err;
-	Dwfl *dwfl;
-
-	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
-		return linux_kernel_load_default_debug_info(prog);
-
-	err = drgn_program_get_dwfl(prog, &dwfl);
-	if (err)
-		return err;
-	dwfl_report_begin_add(dwfl);
-	if (prog->flags & DRGN_PROGRAM_IS_LIVE) {
-		int ret;
-
-		ret = dwfl_linux_proc_report(dwfl, prog->pid);
-		if (ret == -1) {
-			err = drgn_error_libdwfl();
-		} else if (ret) {
-			err = drgn_error_create_os("dwfl_linux_proc_report",
-						   ret, NULL);
-		} else {
-			err = NULL;
-		}
+	drgn_dwarf_index_report_begin(dindex);
+	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
+		err = linux_kernel_report_debug_info(prog, dindex, paths, n,
+						     load_default);
 	} else {
-		Elf *elf;
-
-		elf = elf_begin(prog->core_fd, ELF_C_READ, NULL);
-		if (elf) {
-			if (dwfl_core_file_report(dwfl, elf, NULL) == -1)
-				err = drgn_error_libdwfl();
-			else
-				err = NULL;
-			elf_end(elf);
-		} else {
-			err = drgn_error_libelf();
-		}
+		err = userspace_report_debug_info(prog, dindex, paths, n,
+						  load_default);
 	}
-	dwfl_report_end(dwfl, NULL, NULL);
-	if (err)
-		goto out;
-
-	err = drgn_program_update_dwarf_index(prog);
-out:
-	if (err)
-		drgn_remove_unindexed_dwfl_modules(dwfl);
+	if (err) {
+		drgn_dwarf_index_report_abort(dindex);
+		return err;
+	}
+	report_from_dwfl = (!(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) &&
+			    load_default);
+	err = drgn_dwarf_index_report_end(dindex, report_from_dwfl);
+	if ((!err || err->code == DRGN_ERROR_MISSING_DEBUG_INFO) &&
+	    !prog->has_platform) {
+		dwfl_getdwarf(prog->_dicache->dindex.dwfl,
+			      drgn_set_platform_from_dwarf, prog, 0);
+	}
 	return err;
 }
 
@@ -618,7 +643,7 @@ struct drgn_error *drgn_program_init_core_dump(struct drgn_program *prog,
 	err = drgn_program_set_core_dump(prog, path);
 	if (err)
 		return err;
-	err = drgn_program_load_default_debug_info(prog);
+	err = drgn_program_load_debug_info(prog, NULL, 0, true);
 	if (err && err->code == DRGN_ERROR_MISSING_DEBUG_INFO) {
 		drgn_error_destroy(err);
 		err = NULL;
@@ -633,7 +658,7 @@ struct drgn_error *drgn_program_init_kernel(struct drgn_program *prog)
 	err = drgn_program_set_kernel(prog);
 	if (err)
 		return err;
-	err = drgn_program_load_default_debug_info(prog);
+	err = drgn_program_load_debug_info(prog, NULL, 0, true);
 	if (err && err->code == DRGN_ERROR_MISSING_DEBUG_INFO) {
 		drgn_error_destroy(err);
 		err = NULL;
@@ -648,7 +673,7 @@ struct drgn_error *drgn_program_init_pid(struct drgn_program *prog, pid_t pid)
 	err = drgn_program_set_pid(prog, pid);
 	if (err)
 		return err;
-	err = drgn_program_load_default_debug_info(prog);
+	err = drgn_program_load_debug_info(prog, NULL, 0, true);
 	if (err && err->code == DRGN_ERROR_MISSING_DEBUG_INFO) {
 		drgn_error_destroy(err);
 		err = NULL;
@@ -799,10 +824,10 @@ struct drgn_error *drgn_program_find_symbol_internal(struct drgn_program *prog,
 	GElf_Off offset;
 	GElf_Sym elf_sym;
 
-	if (!prog->_dwfl)
+	if (!prog->_dicache)
 		return &drgn_not_found;
 
-	module = dwfl_addrmodule(prog->_dwfl, address);
+	module = dwfl_addrmodule(prog->_dicache->dindex.dwfl, address);
 	if (!module)
 		return &drgn_not_found;
 	name = dwfl_module_addrinfo(module, address, &offset, &elf_sym, NULL,
