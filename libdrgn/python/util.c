@@ -42,26 +42,6 @@ int append_format(PyObject *parts, const char *format, ...)
 	return ret;
 }
 
-unsigned long long index_arg(PyObject *obj, const char *msg)
-{
-	if (PyLong_Check(obj)) {
-		return PyLong_AsUnsignedLongLong(obj);
-	} else if (PyIndex_Check(obj)) {
-		PyObject *index_obj;
-		unsigned long long ret;
-
-		index_obj = PyNumber_Index(obj);
-		if (!index_obj)
-			return -1;
-		ret = PyLong_AsUnsignedLongLong(index_obj);
-		Py_DECREF(index_obj);
-		return ret;
-	} else {
-		PyErr_SetString(PyExc_TypeError, msg);
-		return -1;
-	}
-}
-
 PyObject *byteorder_string(bool little_endian)
 {
 	_Py_IDENTIFIER(little);
@@ -73,42 +53,54 @@ PyObject *byteorder_string(bool little_endian)
 	return ret;
 }
 
-int parse_byteorder(const char *s, bool *ret)
+int byteorder_converter(PyObject *o, void *p)
 {
-	if (strcmp(s, "little") == 0) {
-		*ret = true;
-		return 0;
-	} else if (strcmp(s, "big") == 0) {
-		*ret = false;
-		return 0;
-	} else {
-		PyErr_SetString(PyExc_ValueError,
-				"byteorder must be either 'little' or 'big'");
-		return -1;
-	}
-}
+	struct byteorder_arg *arg = p;
 
-int parse_optional_byteorder(PyObject *obj, enum drgn_byte_order *ret)
-{
-	if (obj == Py_None) {
-		*ret = DRGN_PROGRAM_ENDIAN;
-		return 0;
-	}
-	if (PyUnicode_Check(obj)) {
+	arg->is_none = o == Py_None;
+	if (arg->allow_none && o == Py_None)
+		return 1;
+
+	if (PyUnicode_Check(o)) {
 		const char *s;
 
-		s = PyUnicode_AsUTF8(obj);
+		s = PyUnicode_AsUTF8(o);
 		if (strcmp(s, "little") == 0) {
-			*ret = DRGN_LITTLE_ENDIAN;
-			return 0;
+			arg->value = DRGN_LITTLE_ENDIAN;
+			return 1;
 		} else if (strcmp(s, "big") == 0) {
-			*ret = DRGN_BIG_ENDIAN;
-			return 0;
+			arg->value = DRGN_BIG_ENDIAN;
+			return 1;
 		}
 	}
-	PyErr_SetString(PyExc_ValueError,
-			"byteorder must be 'little', 'big', or None");
-	return -1;
+	PyErr_Format(PyExc_ValueError,
+		     "expected 'little'%s 'big'%s for byteorder",
+		     arg->allow_none ? "," : " or",
+		     arg->allow_none ? ", or None" : "");
+	return 0;
+}
+
+int index_converter(PyObject *o, void *p)
+{
+	struct index_arg *arg = p;
+
+	arg->is_none = o == Py_None;
+	if (arg->allow_none && arg->is_none)
+		return 1;
+
+	if (PyLong_Check(o)) {
+		arg->value = PyLong_AsUnsignedLongLong(o);
+	} else {
+		PyObject *index_obj;
+
+		index_obj = PyNumber_Index(o);
+		if (!index_obj)
+			return 0;
+		arg->value = PyLong_AsUnsignedLongLong(index_obj);
+		Py_DECREF(index_obj);
+	}
+	return (arg->value != (unsigned long long)-1 ||
+		!PyErr_Occurred());
 }
 
 int path_converter(PyObject *o, void *p)
