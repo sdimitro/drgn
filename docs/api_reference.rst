@@ -1225,7 +1225,7 @@ can be used just like types obtained from :meth:`Program.type()`.
     :param tag: :attr:`Type.tag`
     :type tag: str or None
     :param type: The compatible integer type (:attr:`Type.type`)
-    :type param Type or None:
+    :type type: Type or None
     :param enumerators: :attr:`Type.enumerators`
     :type enumerators: list[tuple] or None
     :param qualifiers: :attr:`Type.qualifiers`
@@ -1281,6 +1281,16 @@ can be used just like types obtained from :meth:`Program.type()`.
 
 Miscellaneous
 -------------
+
+.. function:: sizeof(type_or_obj)
+
+    Get the size of a :class:`Type` or :class:`Object` in bytes.
+
+    :param type_or_obj: Entity to get the size of.
+    :type type_or_obj: Type or Object
+    :rtype: int
+    :raises TypeError: if the type does not have a size (e.g., because it is
+        incomplete or void)
 
 .. autofunction:: execscript
 
