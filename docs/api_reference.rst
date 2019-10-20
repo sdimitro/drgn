@@ -424,7 +424,7 @@ Platforms
 
     .. attribute:: arch
 
-        The instruction set architecture of this platform.
+        Instruction set architecture of this platform.
 
         :vartype: Architecture
 
@@ -433,6 +433,12 @@ Platforms
         Flags which apply to this platform.
 
         :vartype: PlatformFlags
+
+    .. attribute:: registers
+
+        Processor registers on this platform.
+
+        :vartype: list[Register]
 
 .. class:: Architecture
 
@@ -460,6 +466,23 @@ Platforms
     .. attribute:: IS_LITTLE_ENDIAN
 
         Platform is little-endian.
+
+.. class:: Register
+
+    A ``Register`` represents information about a processor register.
+
+    .. attribute:: name
+
+        Name of this register.
+
+        :vartype: str
+
+    .. attribute:: number
+
+        Arbitrary number which uniquely identifies this register on its
+        platform.
+
+        :vartype: int
 
 .. attribute:: host_platform
 
@@ -855,6 +878,23 @@ Stack Traces
         :meth:`prog.symbol(frame.pc) <Program.symbol>`.
 
         :rtype: Symbol
+
+    .. method:: register(reg)
+
+        Get the value of the given register at this stack frame. The register
+        can be specified by name (e.g., ``'rax'``), number (see
+        :attr:`RegisterInfo.number`), or as a :class:`RegisterInfo`.
+
+        :param reg: Register to get.
+        :type reg: str, int, or RegisterInfo
+        :rtype: int
+
+    .. method:: registers()
+
+        Get the values of all available registers at this stack frame as a
+        dictionary with the register names as keys.
+
+        :rtype: dict[str, int]
 
 .. _api-reference-types:
 
