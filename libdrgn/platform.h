@@ -13,6 +13,17 @@ struct drgn_register {
 	enum drgn_register_number number;
 };
 
+/* Register in NT_PRSTATUS note or struct pt_regs used for stack unwinding. */
+struct drgn_frame_register {
+	enum drgn_register_number number;
+	size_t size;
+	size_t prstatus_offset;
+	/* Name used in the kernel. */
+	const char *pt_regs_name;
+	/* Name used for the UAPI, if different from above. */
+	const char *pt_regs_name2;
+};
+
 struct drgn_architecture_info {
 	const char *name;
 	enum drgn_architecture arch;
@@ -20,8 +31,10 @@ struct drgn_architecture_info {
 	const struct drgn_register *registers;
 	size_t num_registers;
 	const struct drgn_register *(*register_by_name)(const char *name);
+	const struct drgn_frame_register *frame_registers;
+	size_t num_frame_registers;
 	struct drgn_error *(*linux_kernel_set_initial_registers)(Dwfl_Thread *,
-								 struct drgn_object *);
+								 const struct drgn_object *);
 };
 
 static inline const struct drgn_register *

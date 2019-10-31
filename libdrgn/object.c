@@ -457,7 +457,7 @@ drgn_object_copy(struct drgn_object *res, const struct drgn_object *obj)
 		char *dst;
 		const char *src;
 
-		size = drgn_value_size(obj->bit_size, obj->value.bit_offset);
+		size = drgn_buffer_object_size(obj);
 		if (size <= sizeof(obj->value.ibuf)) {
 			dst = res->value.ibuf;
 			src = obj->value.ibuf;
@@ -584,7 +584,7 @@ drgn_object_read_reference(const struct drgn_object *obj,
 						  obj->type);
 	}
 
-	size = drgn_value_size(obj->bit_size, obj->reference.bit_offset);
+	size = drgn_reference_object_size(obj);
 	if (obj->kind == DRGN_OBJECT_BUFFER) {
 		char *buf;
 
@@ -738,6 +738,26 @@ drgn_object_read_unsigned(const struct drgn_object *obj, uint64_t *ret)
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
+drgn_object_read_integer(const struct drgn_object *obj, union drgn_value *ret)
+{
+	struct drgn_error *err;
+	union drgn_value value_mem;
+	const union drgn_value *value;
+
+	if (obj->kind != DRGN_OBJECT_SIGNED &&
+	    obj->kind != DRGN_OBJECT_UNSIGNED) {
+		return drgn_error_create(DRGN_ERROR_TYPE,
+					 "not an integer");
+	}
+	err = drgn_object_read_value(obj, &value_mem, &value);
+	if (err)
+		return err;
+	*ret = *value;
+	drgn_object_deinit_value(obj, value);
+	return NULL;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
 drgn_object_read_float(const struct drgn_object *obj, double *ret)
 {
 	if (obj->kind != DRGN_OBJECT_FLOAT) {
@@ -783,8 +803,7 @@ drgn_object_read_c_string(const struct drgn_object *obj, char **ret)
 			char *p, *str;
 
 			buf = drgn_object_buffer(obj);
-			value_size = drgn_value_size(obj->bit_size,
-						     obj->value.bit_offset);
+			value_size = drgn_buffer_object_size(obj);
 			len = min(value_size, (uint64_t)max_size);
 			p = memchr(buf, 0, len);
 			if (p)

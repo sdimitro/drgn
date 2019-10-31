@@ -17,6 +17,7 @@
 #include <libkdumpfile/kdumpfile.h>
 #endif
 
+#include "hash_table.h"
 #include "memory_reader.h"
 #include "object_index.h"
 #include "platform.h"
@@ -48,6 +49,8 @@ struct vmcoreinfo {
 	uint64_t kaslr_offset;
 };
 
+DEFINE_HASH_MAP_TYPE(drgn_prstatus_map, uint32_t, struct string)
+
 struct drgn_dwarf_info_cache;
 struct drgn_dwarf_index;
 
@@ -62,26 +65,38 @@ struct drgn_program {
 	 * Valid iff <tt>flags & DRGN_PROGRAM_IS_LINUX_KERNEL</tt>.
 	 */
 	struct vmcoreinfo vmcoreinfo;
+#ifdef WITH_LIBKDUMPFILE
+	kdump_ctx_t *kdump_ctx;
+#endif
+	/*
+	 * Valid iff <tt>!(flags & DRGN_PROGRAM_IS_LIVE)</tt>, unless the file
+	 * was a kdump file.
+	 */
+	Elf *core;
+	int core_fd;
 	 /*
 	  * Valid iff
 	  * <tt>(flags & (DRGN_PROGRAM_IS_LINUX_KERNEL | DRGN_PROGRAM_IS_LIVE)) ==
 	  * DRGN_PROGRAM_IS_LIVE</tt>.
 	  */
 	pid_t pid;
-#ifdef WITH_LIBKDUMPFILE
-	kdump_ctx_t *kdump_ctx;
-#endif
 	struct drgn_dwarf_info_cache *_dicache;
-	/* See @ref drgn_object_stack_trace_next_thread(). */
-	const struct drgn_object *stack_trace_obj;
+	struct drgn_prstatus_map prstatus_cache;
 	/* See @ref drgn_object_stack_trace(). */
 	struct drgn_error *stack_trace_err;
-	int core_fd;
+	/* See @ref drgn_object_stack_trace_next_thread(). */
+	const struct drgn_object *stack_trace_obj;
+	uint32_t stack_trace_tid;
 	enum drgn_program_flags flags;
 	struct drgn_platform platform;
 	bool has_platform;
 	bool added_vmcoreinfo_object_finder;
 	bool attached_dwfl_state;
+	bool prstatus_cached;
+
+	/* Cache for @ref linux_helper_task_state_to_char(). */
+	char *task_state_chars;
+	uint64_t task_report;
 };
 
 /** Initialize a @ref drgn_program. */
@@ -130,17 +145,27 @@ static inline bool drgn_program_is_64_bit(struct drgn_program *prog)
 
 struct drgn_error *drgn_program_get_dwfl(struct drgn_program *prog, Dwfl **ret);
 
-/* TODO: comment this. */
+/**
+ * Find the @c NT_PRSTATUS note for the given thread ID.
+ *
+ * This assumes that <tt>prog->core</tt> is not @c NULL.
+ *
+ * @param[out] ret Returned note data. If not found, <tt>ret->str</tt> is set to
+ * @c NULL and <tt>ret->len</tt> is set to zero.
+ */
+struct drgn_error *drgn_program_find_prstatus(struct drgn_program *prog,
+					      uint32_t tid, struct string *ret);
+
+/* Like @ref drgn_program_find_symbol(), but the module is known. */
 struct drgn_error *drgn_program_find_symbol_in_module(struct drgn_program *prog,
 						      Dwfl_Module *module,
 						      uint64_t address,
 						      struct drgn_symbol **ret);
 
 /*
- * TODO: update this.
- * Like @ref drgn_program_find_symbol(), but the module is known, @p ret is
- * already allocated, and returns @ref drgn_not_found instead of a more
- * informative message.
+ * Like @ref drgn_program_find_symbol_in_module(), but @p ret is already
+ * allocated, and returns @ref drgn_not_found instead of a more informative
+ * message.
  */
 struct drgn_error *drgn_program_find_symbol_internal(struct drgn_program *prog,
 						     Dwfl_Module *module,
