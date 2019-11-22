@@ -42,12 +42,12 @@ def _follow_mount(mnt, dentry):
     # hasn't changed since v2.6.38, so let's hardcode it for now.
     DCACHE_MOUNTED = 0x10000
     while dentry.d_flags & DCACHE_MOUNTED:
-        for other_mnt in list_for_each_entry_reverse('struct mount',
-                                                     mnt.mnt_ns.list.address_of_(),
-                                                     'mnt_list'):
-            if other_mnt.mnt_mountpoint == dentry:
-                mnt = other_mnt.read_()
-                dentry = mnt.mnt.mnt_root.read_()
+        for mounted in list_for_each_entry_reverse('struct mount',
+                                                   mnt.mnt_ns.list.address_of_(),
+                                                   'mnt_list'):
+            if mounted.mnt_parent == mnt and mounted.mnt_mountpoint == dentry:
+                mnt = mounted.read_()
+                dentry = mounted.mnt.mnt_root.read_()
                 break
         else:
             break
@@ -148,18 +148,19 @@ def d_path(path_or_vfsmnt, dentry=None):
 
     components = []
     while True:
-        while True:
-            d_parent = dentry.d_parent.read_()
-            if dentry == d_parent:
+        if dentry == mnt.mnt.mnt_root:
+            mnt_parent = mnt.mnt_parent.read_()
+            if mnt == mnt_parent:
                 break
-            components.append(dentry.d_name.name.string_())
-            components.append(b'/')
-            dentry = d_parent
-        mnt_parent = mnt.mnt_parent.read_()
-        if mnt == mnt_parent:
+            dentry = mnt.mnt_mountpoint.read_()
+            mnt = mnt_parent
+            continue
+        d_parent = dentry.d_parent.read_()
+        if dentry == d_parent:
             break
-        dentry = mnt.mnt_mountpoint
-        mnt = mnt_parent
+        components.append(dentry.d_name.name.string_())
+        components.append(b'/')
+        dentry = d_parent
     if components:
         return b''.join(reversed(components))
     else:
