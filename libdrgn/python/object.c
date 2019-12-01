@@ -431,7 +431,7 @@ static int DrgnObject_init(DrgnObject *self, PyObject *args, PyObject *kwds)
 			     &qualified_type) == -1)
 		return -1;
 
-	if (!bit_field_size.is_none && bit_field_size.value == 0) {
+	if (!bit_field_size.is_none && bit_field_size.uvalue == 0) {
 		PyErr_SetString(PyExc_ValueError,
 				"bit field size cannot be zero");
 		return -1;
@@ -449,8 +449,9 @@ static int DrgnObject_init(DrgnObject *self, PyObject *args, PyObject *kwds)
 		}
 
 		err = drgn_object_set_reference(&self->obj, qualified_type,
-						address.value, bit_offset.value,
-						bit_field_size.value,
+						address.uvalue,
+						bit_offset.uvalue,
+						bit_field_size.uvalue,
 						byteorder.value);
 	} else if (value_obj != Py_None && !qualified_type.type) {
 		int ret;
@@ -515,7 +516,7 @@ static int DrgnObject_init(DrgnObject *self, PyObject *args, PyObject *kwds)
 		case DRGN_OBJECT_BUFFER:
 			if (buffer_object_from_value(&self->obj, qualified_type,
 						     value_obj,
-						     bit_offset.value,
+						     bit_offset.uvalue,
 						     byteorder.value) == -1)
 				return -1;
 			err = NULL;
@@ -545,12 +546,12 @@ static int DrgnObject_init(DrgnObject *self, PyObject *args, PyObject *kwds)
 				err = drgn_object_set_signed(&self->obj,
 							     qualified_type,
 							     tmp.svalue,
-							     bit_field_size.value);
+							     bit_field_size.uvalue);
 			} else {
 				err = drgn_object_set_unsigned(&self->obj,
 							       qualified_type,
 							       tmp.uvalue,
-							       bit_field_size.value);
+							       bit_field_size.uvalue);
 			}
 			break;
 		}
@@ -1476,7 +1477,7 @@ static Py_ssize_t DrgnObject_length(DrgnObject *self)
 }
 
 static DrgnObject *DrgnObject_subscript_impl(DrgnObject *self,
-					     uint64_t index)
+					     int64_t index)
 {
 	struct drgn_error *err;
 	DrgnObject *res;
@@ -1495,11 +1496,11 @@ static DrgnObject *DrgnObject_subscript_impl(DrgnObject *self,
 
 static DrgnObject *DrgnObject_subscript(DrgnObject *self, PyObject *key)
 {
-	struct index_arg index = {};
+	struct index_arg index = { .is_signed = true };
 
 	if (!index_converter(key, &index))
 		return NULL;
-	return DrgnObject_subscript_impl(self, index.value);
+	return DrgnObject_subscript_impl(self, index.svalue);
 }
 
 static ObjectIterator *DrgnObject_iter(DrgnObject *self)

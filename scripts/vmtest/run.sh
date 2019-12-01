@@ -4,7 +4,7 @@ set -uo pipefail
 trap 'exit 2' ERR
 
 usage () {
-	USAGE_STRING="usage: $0 [-k KERNELRELEASE] [[-r ROOTFSVERSION] [-fo]|-I] [-Si] [-d DIR] IMG
+	USAGE_STRING="usage: $0 [-k KERNELRELEASE|-b DIR] [[-r ROOTFSVERSION] [-fo]|-I] [-Si] [-d DIR] IMG
        $0 [-k KERNELRELEASE] -l
        $0 -h
 
@@ -19,33 +19,45 @@ Arguments:
   IMG                 path of virtual machine disk image to create
 
 Versions:
-  -k KERNELRELEASE    kernel release to test. This is a glob pattern; the
-		      newest (sorted by version number) release that matches
-		      the pattern is used (default: newest available release)
-  -r ROOTFSVERSION    version of root filesystem to use (default: newest
-                      available version)
+  -k, --kernel=KERNELRELEASE
+                       kernel release to test. This is a glob pattern; the
+		       newest (sorted by version number) release that matches
+		       the pattern is used (default: newest available release)
+
+  -b, --build DIR      use the kernel built in the given directory. This option
+                       cannot be combined with -k
+
+  -r, --rootfs=ROOTFSVERSION
+                       version of root filesystem to use (default: newest
+                       available version)
 
 Setup:
-  -f                  overwrite IMG if it already exists
-  -o                  one-shot mode. By default, this script saves a clean copy
-		      of the downloaded root filesystem image and vmlinux and
-		      makes a copy (reflinked, when possible) for executing the
-		      virtual machine. This allows subsequent runs to skip
-		      downloading these files. If this option is given, the
-		      root filesystem image and vmlinux are always
-		      re-downloaded and are not saved. This option implies -f
-  -I                  skip creating the disk image; use the existing one at
-                      IMG. This option cannot be combined with -r, -f, or -o
-  -S                  skip copying the source files and init scripts
+  -f, --force          overwrite IMG if it already exists
+
+  -o, --one-shot       one-shot mode. By default, this script saves a clean copy
+		       of the downloaded root filesystem image and vmlinux and
+		       makes a copy (reflinked, when possible) for executing the
+		       virtual machine. This allows subsequent runs to skip
+		       downloading these files. If this option is given, the
+		       root filesystem image and vmlinux are always
+		       re-downloaded and are not saved. This option implies -f
+
+  -I, --skip-image     skip creating the disk image; use the existing one at
+                       IMG. This option cannot be combined with -r, -f, or -o
+
+  -S, --skip-source    skip copying the source files and init scripts
 
 Miscellaneous:
-  -i                  interactive mode. Boot the virtual machine into an
-		      interactive shell instead of automatically running tests
-  -d DIR              working directory to use for downloading and caching
-                      files (default: current working directory)
-  -l                  list available kernel releases instead of running tests.
-		      The list may be filtered with -k
-  -h                  display this help message and exit"
+  -i, --interactive    interactive mode. Boot the virtual machine into an
+		       interactive shell instead of automatically running tests
+
+  -d, --dir=DIR        working directory to use for downloading and caching
+                       files (default: current working directory)
+
+  -l, --list           list available kernel releases instead of running tests.
+		       The list may be filtered with -k
+
+  -h, --help           display this help message and exit"
 
 	case "$1" in
 		out)
@@ -59,7 +71,12 @@ Miscellaneous:
 	esac
 }
 
-KERNELRELEASE='*'
+TEMP=$(getopt -o 'k:b:r:foISid:lh' --long 'kernel:,build:,rootfs:,force,one-shot,skip-image,skip-source,interactive,dir:,list,help' -n "$0" -- "$@")
+eval set -- "$TEMP"
+unset TEMP
+
+unset KERNELRELEASE
+unset BUILDDIR
 unset ROOTFSVERSION
 unset IMG
 FORCE=0
@@ -69,54 +86,77 @@ SKIPSOURCE=0
 APPEND=""
 DIR="$PWD"
 LIST=0
-while getopts "k:r:foISid:lh" OPT; do
-	case "$OPT" in
-		k)
-			KERNELRELEASE="$OPTARG"
+while true; do
+	case "$1" in
+		-k|--kernel)
+			KERNELRELEASE="$2"
+			shift 2
 			;;
-		r)
-			ROOTFSVERSION="$OPTARG"
+		-b|--build)
+			BUILDDIR="$2"
+			shift 2
 			;;
-		f)
+		-r|--rootfs)
+			ROOTFSVERSION="$2"
+			shift 2
+			;;
+		-f|--force)
 			FORCE=1
+			shift
 			;;
-		o)
+		-o|--one-shot)
 			ONESHOT=1
 			FORCE=1
+			shift
 			;;
-		I)
+		-I|--skip-image)
 			SKIPIMG=1
+			shift
 			;;
-		S)
+		-S|--skip-source)
 			SKIPSOURCE=1
+			shift
 			;;
-		i)
+		-i|--interactive)
 			APPEND=" single"
+			shift
 			;;
-		d)
-			DIR="$OPTARG"
+		-d|--dir)
+			DIR="$2"
+			shift 2
 			;;
-		l)
+		-l|--list)
 			LIST=1
 			;;
-		h)
+		-h|--help)
 			usage out
+			;;
+		--)
+			shift
+			break
 			;;
 		*)
 			usage err
 			;;
 	esac
 done
+if [[ -v BUILDDIR ]]; then
+      if [[ -v KERNELRELEASE ]]; then
+	      usage err
+      fi
+elif [[ ! -v KERNELRELEASE ]]; then
+	KERNELRELEASE='*'
+fi
 if [[ $SKIPIMG -ne 0 && ( -v ROOTFSVERSION || $FORCE -ne 0 ) ]]; then
 	usage err
 fi
 if (( LIST )); then
-	if [[ $OPTIND -le $# || -v ROOTFSVERSION || $FORCE -ne 0 ||
+	if [[ $# -ne 0 || -v BUILDDIR || -v ROOTFSVERSION || $FORCE -ne 0 ||
 	      $SKIPIMG -ne 0 || $SKIPSOURCE -ne 0 || -n $APPEND ]]; then
 		usage err
 	fi
 else
-	if [[ $OPTIND -ne $# ]]; then
+	if [[ $# -ne 1 ]]; then
 		usage err
 	fi
 	IMG="${!OPTIND}"
@@ -210,7 +250,9 @@ if [[ $FORCE -eq 0 && $SKIPIMG -eq 0 && -e $IMG ]]; then
 fi
 
 # Only go to the network if it's actually a glob pattern.
-if [[ ! $KERNELRELEASE =~ ^([^\\*?[]|\\[*?[])*\\?$ ]]; then
+if [[ -v BUILDDIR ]]; then
+	KERNELRELEASE="$(make -C "$BUILDDIR" -s kernelrelease)"
+elif [[ ! $KERNELRELEASE =~ ^([^\\*?[]|\\[*?[])*\\?$ ]]; then
 	# We need to cache the list of URLs outside of the command
 	# substitution, which happens in a subshell.
 	cache_urls
@@ -250,12 +292,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
-bzImage="$DIR/bzImage-$KERNELRELEASE"
-if [[ ! -e $bzImage ]]; then
-	tmp="$(mktemp "$bzImage.XXX.part")"
-	download "bzImage-$KERNELRELEASE" -o "$tmp"
-	mv "$tmp" "$bzImage"
-	tmp=
+if [[ -v BUILDDIR ]]; then
+	vmlinuz="$BUILDDIR/$(make -C "$BUILDDIR" -s image_name)"
+else
+	vmlinuz="$DIR/bzImage-$KERNELRELEASE"
+	if [[ ! -e $vmlinuz ]]; then
+		tmp="$(mktemp "$vmlinuz.XXX.part")"
+		download "bzImage-$KERNELRELEASE" -o "$tmp"
+		mv "$tmp" "$vmlinuz"
+		tmp=
+	fi
 fi
 
 # Mount and set up the rootfs image.
@@ -290,28 +336,25 @@ fi
 
 # Install vmlinux.
 vmlinux="$mnt/boot/vmlinux-$KERNELRELEASE"
-if [[ ! -e $vmlinux ]]; then
-	if (( ! ONESHOT )); then
-		downloaded_vmlinux="$DIR/vmlinux-$KERNELRELEASE"
-		if [[ ! -e $downloaded_vmlinux ]]; then
-			tmp="$(mktemp "$downloaded_vmlinux.XXX.part")"
+if [[ -v BUILDDIR || $ONESHOT -eq 0 ]]; then
+	if [[ -v BUILDDIR ]]; then
+		source_vmlinux="$BUILDDIR/vmlinux"
+	else
+		source_vmlinux="$DIR/vmlinux-$KERNELRELEASE"
+		if [[ ! -e $source_vmlinux ]]; then
+			tmp="$(mktemp "$source_vmlinux.XXX.part")"
 			download "vmlinux-$KERNELRELEASE.zst" | zstd -dfo "$tmp"
-			mv "$tmp" "$downloaded_vmlinux"
+			mv "$tmp" "$source_vmlinux"
 			tmp=
 		fi
 	fi
-	tmp="$(sudo mktemp -p "$mnt/boot" "vmlinux-$KERNELRELEASE.XXX.part")"
-	if (( ONESHOT )); then
-		# We could use "sudo zstd -o", but let's not run zstd as root
-		# with input from the internet.
-		download "vmlinux-$KERNELRELEASE.zst" |
-			zstd -d | sudo tee "$tmp" > /dev/null
-	else
-		echo "Copying vmlinux..." >&2
-		sudo cp "$downloaded_vmlinux" "$tmp"
-	fi
-	sudo mv "$tmp" "$vmlinux"
-	tmp=
+	echo "Copying vmlinux..." >&2
+	sudo rsync -cp --chmod 0644 "$source_vmlinux" "$vmlinux"
+else
+	# We could use "sudo zstd -o", but let's not run zstd as root with
+	# input from the internet.
+	download "vmlinux-$KERNELRELEASE.zst" |
+		zstd -d | sudo tee "$vmlinux" > /dev/null
 	sudo chmod 644 "$vmlinux"
 fi
 
@@ -328,7 +371,7 @@ else
 	else
 		tr '\n' '\0' < drgn.egg-info/SOURCES.txt
 	fi
-	} | sudo xargs -0 cp --parents --preserve=mode,timestamps -t "$mnt/drgn"
+	} | sudo rsync --files-from=- -0cpt . "$mnt/drgn"
 
 	# Create the init scripts.
 	sudo tee "$mnt/etc/rcS.d/S50-run-tests" > /dev/null << "EOF"
@@ -357,7 +400,7 @@ echo "Starting virtual machine..." >&2
 qemu-system-x86_64 -nodefaults -display none -serial mon:stdio \
 	-cpu kvm64 -enable-kvm -smp "$(nproc)" -m 2G \
 	-drive file="$IMG",format=raw,index=1,media=disk,if=virtio,cache=none \
-	-kernel "$bzImage" -append "root=/dev/vda rw console=ttyS0,115200$APPEND"
+	-kernel "$vmlinuz" -append "root=/dev/vda rw console=ttyS0,115200$APPEND"
 
 sudo mount -o loop "$IMG" "$mnt"
 if exitstatus="$(cat "$mnt/exitstatus" 2>/dev/null)"; then
