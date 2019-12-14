@@ -883,7 +883,7 @@ get_kernel_module_name_from_modinfo(Elf_Scn *modinfo_scn, const char **ret)
 			nul = memchr(p, 0, end - p);
 			if (!nul)
 				break;
-			if (strncmp(p, "name=", 5) == 0) {
+			if (strstartswith(p, "name=")) {
 				*ret = p + 5;
 				return NULL;
 			}
@@ -954,8 +954,16 @@ cache_kernel_module_sections(struct kernel_module_iterator *kmod_it, Elf *elf,
 			goto out_scn_map;
 		}
 
+		if (!(shdr->sh_flags & SHF_ALLOC))
+			continue;
+
 		entry.key = elf_strptr(elf, shstrndx, shdr->sh_name);
-		if (!entry.key)
+		/*
+		 * .init sections are freed once the module is initialized, but
+		 * they remain in the section list. Ignore them so we don't get
+		 * confused if the address gets reused for another module.
+		 */
+		if (!entry.key || strstartswith(entry.key, ".init"))
 			continue;
 		entry.value = scn;
 
