@@ -41,15 +41,15 @@ struct drgn_type_index;
 struct drgn_language {
 	/** Name of this programming language. */
 	const char *name;
-	/** Implement @ref drgn_pretty_print_type_name(). */
-	struct drgn_error *(*pretty_print_type_name)(struct drgn_qualified_type,
-						     char **);
-	/** Implement @ref drgn_pretty_print_type(). */
-	struct drgn_error *(*pretty_print_type)(struct drgn_qualified_type,
-						char **);
-	/** Implement @ref drgn_pretty_print_object(). */
-	struct drgn_error *(*pretty_print_object)(const struct drgn_object *,
-						  size_t, char **);
+	/** Implement @ref drgn_format_type_name(). */
+	struct drgn_error *(*format_type_name)(struct drgn_qualified_type,
+					       char **);
+	/** Implement @ref drgn_format_type(). */
+	struct drgn_error *(*format_type)(struct drgn_qualified_type, char **);
+	/** Implement @ref drgn_format_object(). */
+	struct drgn_error *(*format_object)(const struct drgn_object *, size_t,
+					    enum drgn_format_object_flags,
+					    char **);
 	/**
 	 * Implement @ref drgn_type_index_find().
 	 *
@@ -118,6 +118,42 @@ struct drgn_language {
 
 /** The C programming language. */
 extern const struct drgn_language drgn_language_c;
+
+/**
+ * Return flags that should be passed through when formatting an object
+ * recursively.
+ */
+static inline enum drgn_format_object_flags
+drgn_passthrough_format_object_flags(enum drgn_format_object_flags flags)
+{
+	return (flags & (DRGN_FORMAT_OBJECT_SYMBOLIZE |
+			 DRGN_FORMAT_OBJECT_STRING |
+			 DRGN_FORMAT_OBJECT_CHAR |
+			 DRGN_FORMAT_OBJECT_MEMBER_TYPE_NAMES |
+			 DRGN_FORMAT_OBJECT_ELEMENT_TYPE_NAMES |
+			 DRGN_FORMAT_OBJECT_MEMBERS_SAME_LINE |
+			 DRGN_FORMAT_OBJECT_ELEMENTS_SAME_LINE |
+			 DRGN_FORMAT_OBJECT_MEMBER_NAMES |
+			 DRGN_FORMAT_OBJECT_ELEMENT_INDICES |
+			 DRGN_FORMAT_OBJECT_IMPLICIT_MEMBERS |
+			 DRGN_FORMAT_OBJECT_IMPLICIT_ELEMENTS));
+}
+
+/** Return flags that should be passed when formatting object members. */
+static inline enum drgn_format_object_flags
+drgn_member_format_object_flags(enum drgn_format_object_flags flags)
+{
+	return (drgn_passthrough_format_object_flags(flags) |
+		(flags & DRGN_FORMAT_OBJECT_MEMBER_TYPE_NAMES) >> 1);
+}
+
+/** Return flags that should be passed when formatting object elements. */
+static inline enum drgn_format_object_flags
+drgn_element_format_object_flags(enum drgn_format_object_flags flags)
+{
+	return (drgn_passthrough_format_object_flags(flags) |
+		(flags & DRGN_FORMAT_OBJECT_ELEMENT_TYPE_NAMES) >> 2);
+}
 
 /** @} */
 

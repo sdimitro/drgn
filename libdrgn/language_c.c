@@ -16,6 +16,7 @@
 #include "object.h"
 #include "program.h"
 #include "string_builder.h"
+#include "symbol.h"
 #include "type.h"
 #include "type_index.h"
 
@@ -504,7 +505,7 @@ c_define_type(struct drgn_qualified_type qualified_type, size_t indent,
 		return c_declare_array(qualified_type, NULL, indent, sb);
 	case DRGN_TYPE_FUNCTION:
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "function type cannot be pretty-printed");
+					 "function type cannot be formatted");
 	}
 	DRGN_UNREACHABLE();
 }
@@ -524,8 +525,8 @@ c_anonymous_type_name(struct drgn_qualified_type qualified_type,
 }
 
 static struct drgn_error *
-c_pretty_print_type_name_impl(struct drgn_qualified_type qualified_type,
-			      struct string_builder *sb)
+c_format_type_name_impl(struct drgn_qualified_type qualified_type,
+			struct string_builder *sb)
 {
 	if (drgn_type_is_anonymous(qualified_type.type)) {
 		return c_anonymous_type_name(qualified_type, sb);
@@ -542,12 +543,12 @@ c_pretty_print_type_name_impl(struct drgn_qualified_type qualified_type,
 }
 
 static struct drgn_error *
-c_pretty_print_type_name(struct drgn_qualified_type qualified_type, char **ret)
+c_format_type_name(struct drgn_qualified_type qualified_type, char **ret)
 {
 	struct drgn_error *err;
 	struct string_builder sb = {};
 
-	err = c_pretty_print_type_name_impl(qualified_type, &sb);
+	err = c_format_type_name_impl(qualified_type, &sb);
 	if (err) {
 		free(sb.str);
 		return err;
@@ -558,7 +559,7 @@ c_pretty_print_type_name(struct drgn_qualified_type qualified_type, char **ret)
 }
 
 static struct drgn_error *
-c_pretty_print_type(struct drgn_qualified_type qualified_type, char **ret)
+c_format_type(struct drgn_qualified_type qualified_type, char **ret)
 {
 	struct drgn_error *err;
 	struct string_builder sb = {};
@@ -566,7 +567,7 @@ c_pretty_print_type(struct drgn_qualified_type qualified_type, char **ret)
 	if (drgn_type_is_complete(qualified_type.type))
 		err = c_define_type(qualified_type, 0, &sb);
 	else
-		err = c_pretty_print_type_name_impl(qualified_type, &sb);
+		err = c_format_type_name_impl(qualified_type, &sb);
 	if (err) {
 		free(sb.str);
 		return err;
@@ -577,16 +578,130 @@ c_pretty_print_type(struct drgn_qualified_type qualified_type, char **ret)
 }
 
 static struct drgn_error *
-c_pretty_print_object_impl(const struct drgn_object *obj, bool cast,
-			   bool dereference, size_t indent,
-			   size_t one_line_columns, size_t multi_line_columns,
-			   struct string_builder *sb);
+c_format_object_impl(const struct drgn_object *obj, size_t indent,
+		     size_t one_line_columns, size_t multi_line_columns,
+		     enum drgn_format_object_flags flags,
+		     struct string_builder *sb);
+
+static bool is_character_type(struct drgn_type *type)
+{
+	switch (drgn_type_primitive(type)) {
+	case DRGN_C_TYPE_CHAR:
+	case DRGN_C_TYPE_SIGNED_CHAR:
+	case DRGN_C_TYPE_UNSIGNED_CHAR:
+		return true;
+	default:
+		return false;
+	}
+}
 
 static struct drgn_error *
-c_pretty_print_int_object(const struct drgn_object *obj,
-			  struct string_builder *sb)
+c_format_character(unsigned char c, bool escape_single_quote,
+		   bool escape_double_quote, struct string_builder *sb)
+{
+	bool ret;
+
+	switch (c) {
+	case '\0':
+		ret = string_builder_append(sb, "\\0");
+		break;
+	case '\a':
+		ret = string_builder_append(sb, "\\a");
+		break;
+	case '\b':
+		ret = string_builder_append(sb, "\\b");
+		break;
+	case '\t':
+		ret = string_builder_append(sb, "\\t");
+		break;
+	case '\n':
+		ret = string_builder_append(sb, "\\n");
+		break;
+	case '\v':
+		ret = string_builder_append(sb, "\\v");
+		break;
+	case '\f':
+		ret = string_builder_append(sb, "\\f");
+		break;
+	case '\r':
+		ret = string_builder_append(sb, "\\r");
+		break;
+	case '"':
+		if (!escape_double_quote)
+			goto no_escape;
+		ret = string_builder_append(sb, "\\\"");
+		break;
+	case '\'':
+		if (!escape_single_quote)
+			goto no_escape;
+		ret = string_builder_append(sb, "\\'");
+		break;
+	case '\\':
+		ret = string_builder_append(sb, "\\\\");
+		break;
+	default:
+		if (c <= '\x1f' || c >= '\x7f') {
+			ret = string_builder_appendf(sb, "\\x%02x", c);
+		} else {
+no_escape:
+			ret = string_builder_appendc(sb, c);
+		}
+		break;
+	}
+	return ret ? NULL : &drgn_enomem;
+}
+
+static struct drgn_error *
+c_format_string(struct drgn_memory_reader *reader, uint64_t address,
+		uint64_t length, struct string_builder *sb)
 {
 	struct drgn_error *err;
+
+	if (!string_builder_appendc(sb, '"'))
+		return &drgn_enomem;
+	while (length) {
+		unsigned char c;
+
+		err = drgn_memory_reader_read(reader, &c, address++, 1, false);
+		if (err)
+			return err;
+
+		if (c == '\0') {
+			break;
+		} else {
+			err = c_format_character(c, false, true, sb);
+			if (err)
+				return err;
+		}
+		length--;
+	}
+	if (!string_builder_appendc(sb, '"'))
+		return &drgn_enomem;
+	return NULL;
+}
+
+static struct drgn_error *
+c_format_int_object(const struct drgn_object *obj,
+		    enum drgn_format_object_flags flags,
+		    struct string_builder *sb)
+{
+	struct drgn_error *err;
+
+	if ((flags & DRGN_FORMAT_OBJECT_CHAR) && is_character_type(obj->type)) {
+		union drgn_value value;
+
+		if (!string_builder_appendc(sb, '\''))
+			return &drgn_enomem;
+		err = drgn_object_read_integer(obj, &value);
+		if (err)
+			return err;
+		err = c_format_character(value.uvalue, true, false, sb);
+		if (err)
+			return err;
+		if (!string_builder_appendc(sb, '\''))
+			return &drgn_enomem;
+		return NULL;
+	}
 
 	switch (obj->kind) {
 	case DRGN_OBJECT_SIGNED: {
@@ -615,8 +730,7 @@ c_pretty_print_int_object(const struct drgn_object *obj,
 }
 
 static struct drgn_error *
-c_pretty_print_float_object(const struct drgn_object *obj,
-			    struct string_builder *sb)
+c_format_float_object(const struct drgn_object *obj, struct string_builder *sb)
 {
 	struct drgn_error *err;
 	double fvalue;
@@ -635,88 +749,373 @@ c_pretty_print_float_object(const struct drgn_object *obj,
 	return NULL;
 }
 
-static struct drgn_error *c_pretty_print_members(const struct drgn_object *obj,
-						 struct drgn_object *member,
-						 struct drgn_type *type,
-						 uint64_t bit_offset,
-						 size_t indent,
-						 size_t multi_line_columns,
-						 struct string_builder *sb)
+static struct drgn_error drgn_line_wrap = {
+	.code = DRGN_ERROR_STOP,
+	.message = "needs line wrap",
+};
+
+struct initializer_iter {
+	struct drgn_error *(*next)(struct initializer_iter *,
+				   struct drgn_object *,
+				   enum drgn_format_object_flags *);
+	void (*reset)(struct initializer_iter *);
+	struct drgn_error *(*append_designation)(struct initializer_iter *,
+						 struct string_builder *);
+};
+
+static struct drgn_error *c_format_initializer(struct drgn_program *prog,
+					       struct initializer_iter *iter,
+					       size_t indent,
+					       size_t one_line_columns,
+					       size_t multi_line_columns,
+					       bool same_line,
+					       struct string_builder *sb)
 {
 	struct drgn_error *err;
-	struct drgn_type_member *members;
-	size_t num_members, i;
+	struct drgn_object obj;
+	enum drgn_format_object_flags initializer_flags;
+	size_t brace, remaining_columns, start_columns;
 
-	if (!drgn_type_has_members(type))
-		return NULL;
+	drgn_object_init(&obj, prog);
 
-	members = drgn_type_members(type);
-	num_members = drgn_type_num_members(type);
-	for (i = 0; i < num_members; i++) {
-		struct drgn_qualified_type member_type;
+	/* First, try to fit everything on one line. */
+	brace = sb->len;
+	if (!string_builder_appendc(sb, '{')) {
+		err = &drgn_enomem;
+		goto out;
+	}
+	if (__builtin_sub_overflow(one_line_columns, 1, &remaining_columns))
+		remaining_columns = 0;
+	for (;;) {
+		size_t initializer_start;
 
-		err = drgn_member_type(&members[i], &member_type);
+		err = iter->next(iter, &obj, &initializer_flags);
+		if (err && err->code == DRGN_ERROR_STOP)
+			break;
+		else if (err)
+			goto out;
+
+		if (!same_line) {
+			err = &drgn_line_wrap;
+			break;
+		} else if (sb->len == brace + 1) {
+			if (remaining_columns < 3) {
+				/*
+				 * The preceding space and closing space and
+				 * brace don't fit.
+				 */
+				err = &drgn_line_wrap;
+				break;
+			}
+			if (!string_builder_appendc(sb, ' ')) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			remaining_columns--;
+		} else {
+			if (remaining_columns < 4) {
+				/*
+				 * The preceding comma and space and closing
+				 * space and brace don't fit.
+				 */
+				err = &drgn_line_wrap;
+				break;
+			}
+			if (!string_builder_append(sb, ", ")) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			remaining_columns -= 2;
+		}
+
+		if (iter->append_designation) {
+			size_t designation_start = sb->len;
+
+			err = iter->append_designation(iter, sb);
+			if (err)
+				goto out;
+			if (__builtin_sub_overflow(remaining_columns,
+						   sb->len - designation_start,
+						   &remaining_columns)) {
+				err = &drgn_line_wrap;
+				break;
+			}
+		}
+
+		initializer_start = sb->len;
+		err = c_format_object_impl(&obj, indent + 1,
+					   remaining_columns - 2, 0,
+					   initializer_flags, sb);
+		if (err == &drgn_line_wrap)
+			break;
+		else if (err)
+			goto out;
+
+		if (__builtin_sub_overflow(remaining_columns,
+					   sb->len - initializer_start,
+					   &remaining_columns)) {
+			err = &drgn_line_wrap;
+			break;
+		}
+	}
+	if (err != &drgn_line_wrap) {
+		/* All of the initializers fit. */
+		if (sb->len == brace + 1) {
+			/* There were no initializers. */
+			if (string_builder_appendc(sb, '}'))
+				err = NULL;
+			else
+				err = &drgn_enomem;
+			goto out;
+		} else if (remaining_columns >= 2) {
+			if (string_builder_append(sb, " }"))
+				err = NULL;
+			else
+				err = &drgn_enomem;
+			goto out;
+		}
+		/* The final space and closing brace didn't fit. */
+	}
+
+	/* It didn't fit on one line. Try multiple lines. */
+
+	if (multi_line_columns == 0) {
+		/* We were asked to stay on one line. */
+		err = &drgn_line_wrap;
+		goto out;
+	}
+
+	sb->len = brace + 1;
+	if (__builtin_sub_overflow(multi_line_columns, 8 * (indent + 1),
+				   &start_columns))
+		start_columns = 0;
+	remaining_columns = 0;
+	iter->reset(iter);
+	for (;;) {
+		size_t newline, designation_start, line_columns;
+
+		err = iter->next(iter, &obj, &initializer_flags);
+		if (err && err->code == DRGN_ERROR_STOP)
+			break;
+		else if (err)
+			goto out;
+
+		newline = sb->len;
+		if (!string_builder_appendc(sb, '\n') ||
+		    !append_tabs(indent + 1, sb)) {
+			err = &drgn_enomem;
+			goto out;
+		}
+
+		designation_start = sb->len;
+		line_columns = start_columns;
+		if (iter->append_designation) {
+			err = iter->append_designation(iter, sb);
+			if (err)
+				goto out;
+			if (__builtin_sub_overflow(line_columns,
+						   sb->len - designation_start,
+						   &line_columns))
+				line_columns = 0;
+		}
+
+		if (line_columns > 1) {
+			size_t initializer_start = sb->len;
+
+			err = c_format_object_impl(&obj, 0, line_columns - 1,
+						   0, initializer_flags, sb);
+			if (!err) {
+				size_t len = sb->len - designation_start;
+
+				if (same_line && len + 2 <= remaining_columns) {
+					/*
+					 * It would've fit on the previous line.
+					 * Move it over.
+					 */
+					sb->str[newline] = ' ';
+					memmove(&sb->str[newline + 1],
+						&sb->str[designation_start],
+						len);
+					sb->len = newline + 1 + len;
+					if (!string_builder_appendc(sb, ',')) {
+						err = &drgn_enomem;
+						goto out;
+					}
+					remaining_columns -= len + 2;
+					continue;
+				}
+				if (len < start_columns) {
+					/* It fit on the new line. */
+					if (!string_builder_appendc(sb, ',')) {
+						err = &drgn_enomem;
+						goto out;
+					}
+					remaining_columns =
+						start_columns - len - 1;
+					continue;
+				}
+			} else if (err != &drgn_line_wrap) {
+				goto out;
+			}
+			/* It didn't fit. */
+			sb->len = initializer_start;
+		}
+
+		err = c_format_object_impl(&obj, indent + 1, 0,
+					   multi_line_columns,
+					   initializer_flags, sb);
+		if (err)
+			goto out;
+		if (!string_builder_appendc(sb, ',')) {
+			err = &drgn_enomem;
+			goto out;
+		}
+		remaining_columns = 0;
+	}
+
+	if (!string_builder_appendc(sb, '\n') || !append_tabs(indent, sb) ||
+	    !string_builder_appendc(sb, '}')) {
+		err = &drgn_enomem;
+		goto out;
+	}
+	err = NULL;
+out:
+	drgn_object_deinit(&obj);
+	return err;
+}
+
+struct compound_initializer_state {
+	struct drgn_type_member *member, *end;
+	uint64_t bit_offset;
+};
+
+DEFINE_VECTOR(compound_initializer_stack, struct compound_initializer_state)
+
+struct compound_initializer_iter {
+	struct initializer_iter iter;
+	const struct drgn_object *obj;
+	struct compound_initializer_stack stack;
+	enum drgn_format_object_flags flags, member_flags;
+};
+
+static struct drgn_error *
+compound_initializer_iter_next(struct initializer_iter *iter_,
+			       struct drgn_object *obj_ret,
+			       enum drgn_format_object_flags *flags_ret)
+{
+	struct drgn_error *err;
+	struct compound_initializer_iter *iter =
+		container_of(iter_, struct compound_initializer_iter, iter);
+	struct compound_initializer_state *top;
+	struct drgn_type_member *member;
+	struct drgn_qualified_type member_type;
+
+	for (;;) {
+		struct compound_initializer_state *new;
+
+		if (!iter->stack.size)
+			return &drgn_stop;
+
+		top = &iter->stack.data[iter->stack.size - 1];
+		if (top->member == top->end) {
+			iter->stack.size--;
+			continue;
+		}
+
+		member = top->member++;
+		err = drgn_member_type(member, &member_type);
 		if (err)
 			return err;
 
-		if (members[i].name) {
-			size_t member_start, remaining_columns;
-
-			if (multi_line_columns == 0)
-				return &drgn_stop;
-
-			if (!string_builder_appendc(sb, '\n') ||
-			    !append_tabs(indent + 1, sb))
-				return &drgn_enomem;
-
-			member_start = sb->len;
-			if (!string_builder_appendf(sb, ".%s = ",
-						    members[i].name))
-				return &drgn_enomem;
-
-			if (__builtin_sub_overflow(multi_line_columns,
-						   8 * (indent + 1) +
-						   sb->len - member_start + 1,
-						   &remaining_columns))
-				remaining_columns = 0;
-
-			err = drgn_object_slice(member, obj, member_type,
-						bit_offset + members[i].bit_offset,
-						members[i].bit_field_size);
+		/*
+		 * If the member is named or we are not including names, return
+		 * it. Otherwise, if it has members, descend into it. If it
+		 * doesn't, then this isn't valid C, but let's return it
+		 * anyways.
+		 */
+		if (member->name ||
+		    !(iter->flags & DRGN_FORMAT_OBJECT_MEMBER_NAMES) ||
+		    !drgn_type_has_members(member_type.type)) {
+			err = drgn_object_slice(obj_ret, iter->obj, member_type,
+						top->bit_offset + member->bit_offset,
+						member->bit_field_size);
 			if (err)
 				return err;
 
-			err = c_pretty_print_object_impl(member, true, false,
-							 indent + 1,
-							 remaining_columns,
-							 multi_line_columns,
-							 sb);
-			if (err)
-				return err;
-			if (!string_builder_appendc(sb, ','))
-				return &drgn_enomem;
-		} else {
-			err = c_pretty_print_members(obj, member,
-						     member_type.type,
-						     bit_offset + members[i].bit_offset,
-						     indent, multi_line_columns,
-						     sb);
-			if (err)
-				return err;
+			/* If we're including names, we can skip zeroes. */
+			if ((iter->flags & (DRGN_FORMAT_OBJECT_MEMBER_NAMES |
+					    DRGN_FORMAT_OBJECT_IMPLICIT_MEMBERS)) ==
+			     DRGN_FORMAT_OBJECT_MEMBER_NAMES) {
+				bool zero;
+
+				err = drgn_object_is_zero(obj_ret, &zero);
+				if (err)
+					return err;
+				if (zero)
+					continue;
+			}
+			break;
 		}
+
+		new = compound_initializer_stack_append_entry(&iter->stack);
+		if (!new)
+			return &drgn_enomem;
+		new->member = drgn_type_members(member_type.type);
+		new->end = new->member + drgn_type_num_members(member_type.type);
+		new->bit_offset = top->bit_offset + member->bit_offset;
 	}
+
+	*flags_ret = iter->member_flags;
+	return NULL;
+}
+
+static void compound_initializer_iter_reset(struct initializer_iter *iter_)
+{
+	struct compound_initializer_iter *iter =
+		container_of(iter_, struct compound_initializer_iter, iter);
+	struct drgn_type *underlying_type =
+		drgn_underlying_type(iter->obj->type);
+
+	iter->stack.size = 1;
+	iter->stack.data[0].member = drgn_type_members(underlying_type);
+}
+
+static struct drgn_error *
+compound_initializer_append_designation(struct initializer_iter *iter_,
+				       struct string_builder *sb)
+{
+	struct compound_initializer_iter *iter =
+		container_of(iter_, struct compound_initializer_iter, iter);
+	struct compound_initializer_state *top =
+		&iter->stack.data[iter->stack.size - 1];
+	const char *name = top->member[-1].name;
+
+	if (name && !string_builder_appendf(sb, ".%s = ", name))
+		return &drgn_enomem;
 	return NULL;
 }
 
 static struct drgn_error *
-c_pretty_print_compound_object(const struct drgn_object *obj,
-			       struct drgn_type *underlying_type,
-			       size_t indent, size_t multi_line_columns,
-			       struct string_builder *sb)
+c_format_compound_object(const struct drgn_object *obj,
+			 struct drgn_type *underlying_type, size_t indent,
+			 size_t one_line_columns, size_t multi_line_columns,
+			 enum drgn_format_object_flags flags,
+			 struct string_builder *sb)
 {
 	struct drgn_error *err;
-	size_t old_len;
-	struct drgn_object member;
+	struct compound_initializer_iter iter = {
+		.iter = {
+			.next = compound_initializer_iter_next,
+			.reset = compound_initializer_iter_reset,
+			.append_designation =
+				flags & DRGN_FORMAT_OBJECT_MEMBER_NAMES ?
+				compound_initializer_append_designation : NULL,
+		},
+		.obj = obj,
+		.flags = flags,
+		.member_flags = drgn_member_format_object_flags(flags),
+	};
+	struct compound_initializer_state *new;
 
 	if (!drgn_type_is_complete(underlying_type)) {
 		const char *keyword;
@@ -739,30 +1138,67 @@ c_pretty_print_compound_object(const struct drgn_object *obj,
 					 keyword);
 	}
 
-	if (!string_builder_appendc(sb, '{'))
-		return &drgn_enomem;
-	old_len = sb->len;
-
-	drgn_object_init(&member, obj->prog);
-	err = c_pretty_print_members(obj, &member, underlying_type, 0, indent,
-				     multi_line_columns, sb);
-	drgn_object_deinit(&member);
-	if (err)
-		return err;
-	if (sb->len != old_len) {
-		if (!string_builder_appendc(sb, '\n') ||
-		    !append_tabs(indent, sb))
-			return &drgn_enomem;
+	compound_initializer_stack_init(&iter.stack);
+	new = compound_initializer_stack_append_entry(&iter.stack);
+	if (!new) {
+		err = &drgn_enomem;
+		goto out;
 	}
-	if (!string_builder_appendc(sb, '}'))
-		return &drgn_enomem;
-	return NULL;
+	new->member = drgn_type_members(underlying_type);
+	new->end = new->member + drgn_type_num_members(underlying_type);
+	new->bit_offset = 0;
+
+	/*
+	 * If we don't want zero members, ignore any at the end. If we're
+	 * including member names, then we'll skip past zero members as we
+	 * iterate, so we don't need to do this.
+	 */
+	if (!(flags & (DRGN_FORMAT_OBJECT_MEMBER_NAMES |
+		       DRGN_FORMAT_OBJECT_IMPLICIT_MEMBERS)) &&
+	    new->member < new->end) {
+		struct drgn_object member;
+
+		drgn_object_init(&member, obj->prog);
+		do {
+			struct drgn_qualified_type member_type;
+			bool zero;
+
+			err = drgn_member_type(&new->end[-1], &member_type);
+			if (err)
+				break;
+
+			err = drgn_object_slice(&member, obj, member_type,
+						new->end[-1].bit_offset,
+						new->end[-1].bit_field_size);
+			if (err)
+				break;
+
+			err = drgn_object_is_zero(&member, &zero);
+			if (err)
+				break;
+			if (zero)
+				new->end--;
+			else
+				break;
+		} while (new->member < new->end);
+		drgn_object_deinit(&member);
+		if (err)
+			return err;
+	}
+
+	err = c_format_initializer(obj->prog, &iter.iter, indent,
+				   one_line_columns, multi_line_columns,
+				   flags & DRGN_FORMAT_OBJECT_MEMBERS_SAME_LINE,
+				   sb);
+out:
+	compound_initializer_stack_deinit(&iter.stack);
+	return err;
 }
 
 static struct drgn_error *
-c_pretty_print_enum_object(const struct drgn_object *obj,
-			   struct drgn_type *underlying_type,
-			   struct string_builder *sb)
+c_format_enum_object(const struct drgn_object *obj,
+		     struct drgn_type *underlying_type,
+		     struct string_builder *sb)
 {
 	struct drgn_error *err;
 	struct drgn_type_enumerator *enumerators;
@@ -812,145 +1248,73 @@ c_pretty_print_enum_object(const struct drgn_object *obj,
 	}
 }
 
-static bool is_character_type(struct drgn_type *type)
-{
-	switch (drgn_type_primitive(type)) {
-	case DRGN_C_TYPE_CHAR:
-	case DRGN_C_TYPE_SIGNED_CHAR:
-	case DRGN_C_TYPE_UNSIGNED_CHAR:
-		return true;
-	default:
-		return false;
-	}
-}
-
 static struct drgn_error *
-c_pretty_print_character(unsigned char c, struct string_builder *sb)
-{
-	bool ret;
-
-	switch (c) {
-	case '\a':
-		ret = string_builder_append(sb, "\\a");
-		break;
-	case '\b':
-		ret = string_builder_append(sb, "\\b");
-		break;
-	case '\t':
-		ret = string_builder_append(sb, "\\t");
-		break;
-	case '\n':
-		ret = string_builder_append(sb, "\\n");
-		break;
-	case '\v':
-		ret = string_builder_append(sb, "\\v");
-		break;
-	case '\f':
-		ret = string_builder_append(sb, "\\f");
-		break;
-	case '\r':
-		ret = string_builder_append(sb, "\\r");
-		break;
-	case '"':
-		ret = string_builder_append(sb, "\\\"");
-		break;
-	case '\\':
-		ret = string_builder_append(sb, "\\\\");
-		break;
-	default:
-		if (c <= '\x1f' || c >= '\x7f')
-			ret = string_builder_appendf(sb, "\\x%02x", c);
-		else
-			ret = string_builder_appendc(sb, c);
-		break;
-	}
-	return ret ? NULL : &drgn_enomem;
-}
-
-static struct drgn_error *
-c_pretty_print_string(struct drgn_memory_reader *reader, uint64_t address,
-		      uint64_t length, struct string_builder *sb)
+c_format_pointer_object(const struct drgn_object *obj,
+			struct drgn_type *underlying_type,
+			size_t indent, size_t one_line_columns,
+			size_t multi_line_columns,
+			enum drgn_format_object_flags flags,
+			struct string_builder *sb)
 {
 	struct drgn_error *err;
-
-	if (!string_builder_appendc(sb, '"'))
-		return &drgn_enomem;
-	while (length) {
-		unsigned char c;
-
-		err = drgn_memory_reader_read(reader, &c, address++, 1, false);
-		if (err)
-			return err;
-
-		if (c == '\0') {
-			break;
-		} else {
-			err = c_pretty_print_character(c, sb);
-			if (err)
-				return err;
-		}
-		length--;
-	}
-	if (!string_builder_appendc(sb, '"'))
-		return &drgn_enomem;
-	return NULL;
-}
-
-static struct drgn_error *
-c_pretty_print_pointer_object(const struct drgn_object *obj,
-			      struct drgn_type *underlying_type, bool cast,
-			      bool dereference, size_t indent,
-			      size_t one_line_columns,
-			      size_t multi_line_columns,
-			      struct string_builder *sb)
-{
-	struct drgn_error *err;
-	bool is_c_string;
+	enum drgn_format_object_flags passthrough_flags =
+		drgn_passthrough_format_object_flags(flags);
+	bool dereference = flags & DRGN_FORMAT_OBJECT_DEREFERENCE;
+	bool c_string =
+		((flags & DRGN_FORMAT_OBJECT_STRING) &&
+		 is_character_type(drgn_type_type(underlying_type).type));
+	bool have_symbol;
 	uint64_t uvalue;
-	size_t old_len, address_end;
+	struct drgn_symbol sym;
+	size_t start, type_start, type_end, value_start, value_end;
 
-	is_c_string = is_character_type(drgn_type_type(underlying_type).type);
-	/* Always dereference strings. */
-	if (is_c_string)
-		dereference = true;
-
-	old_len = sb->len;
-	if (dereference && !is_c_string) {
-		if (!string_builder_appendc(sb, '*'))
-			return &drgn_enomem;
-	}
-	if (cast) {
+	start = sb->len;
+	if (dereference && !c_string && !string_builder_appendc(sb, '*'))
+		return &drgn_enomem;
+	type_start = sb->len;
+	if (flags & DRGN_FORMAT_OBJECT_TYPE_NAME) {
 		if (!string_builder_appendc(sb, '('))
 			return &drgn_enomem;
-		err = c_pretty_print_type_name_impl(drgn_object_qualified_type(obj),
-						    sb);
+		err = c_format_type_name_impl(drgn_object_qualified_type(obj),
+					      sb);
 		if (err)
 			return err;
 		if (!string_builder_appendc(sb, ')'))
 			return &drgn_enomem;
 
 	}
+	type_end = sb->len;
 
 	err = drgn_object_read_unsigned(obj, &uvalue);
 	if (err)
 		return err;
 
+	have_symbol = ((flags & DRGN_FORMAT_OBJECT_SYMBOLIZE) &&
+		       drgn_program_find_symbol_internal(obj->prog, uvalue,
+							 NULL, &sym));
+	if (have_symbol && dereference && !c_string &&
+	    !string_builder_appendc(sb, '('))
+		return &drgn_enomem;
+	value_start = sb->len;
+	if (have_symbol &&
+	     !string_builder_appendf(sb, "%s+0x%" PRIx64 " = ", sym.name,
+				     uvalue - sym.address))
+		return &drgn_enomem;
+
 	if (!string_builder_appendf(sb, "0x%" PRIx64, uvalue))
 		return &drgn_enomem;
-	if (!dereference)
+	if (!dereference && !c_string)
 		return NULL;
-	address_end = sb->len;
+	value_end = sb->len;
 
-	if (!string_builder_append(sb, " = "))
+	if ((have_symbol && dereference && !c_string &&
+	     !string_builder_appendc(sb, ')')) ||
+	    !string_builder_append(sb, " = "))
 		return &drgn_enomem;
 
-	if (__builtin_sub_overflow(one_line_columns, sb->len - old_len,
-				   &one_line_columns))
-	    one_line_columns = 0;
-
-	if (is_c_string) {
-		err = c_pretty_print_string(&obj->prog->reader, uvalue,
-					    UINT64_MAX, sb);
+	if (c_string) {
+		err = c_format_string(&obj->prog->reader, uvalue, UINT64_MAX,
+				      sb);
 	} else {
 		struct drgn_object dereferenced;
 
@@ -962,9 +1326,12 @@ c_pretty_print_pointer_object(const struct drgn_object *obj,
 				goto no_dereference;
 			return err;
 		}
-		err = c_pretty_print_object_impl(&dereferenced, false, false,
-						 indent, one_line_columns,
-						 multi_line_columns, sb);
+		if (__builtin_sub_overflow(one_line_columns, sb->len - start,
+					   &one_line_columns))
+			one_line_columns = 0;
+		err = c_format_object_impl(&dereferenced, indent,
+					   one_line_columns, multi_line_columns,
+					   passthrough_flags, sb);
 		drgn_object_deinit(&dereferenced);
 	}
 	if (!err || err->code != DRGN_ERROR_FAULT) {
@@ -974,43 +1341,119 @@ c_pretty_print_pointer_object(const struct drgn_object *obj,
 
 no_dereference:
 	/*
-	 * We hit a non-fatal error. Delete the asterisk and truncate everything
-	 * after the address.
+	 * We hit a non-fatal error. Delete the asterisk and symbol parentheses
+	 * and truncate everything after the address.
 	 */
 	drgn_error_destroy(err);
-	sb->len = address_end;
-	if (!is_c_string) {
-		sb->len--;
-		memmove(&sb->str[old_len], &sb->str[old_len + 1],
-			sb->len - old_len);
+	if (type_start != start) {
+		memmove(&sb->str[start], &sb->str[type_start],
+			type_end - type_start);
 	}
+	if (start + type_end - type_start != value_start) {
+		memmove(&sb->str[start + type_end - type_start],
+			&sb->str[value_start], value_end - value_start);
+	}
+	sb->len = start + type_end - type_start + value_end - value_start;
+	return NULL;
+}
+
+struct array_initializer_iter {
+	struct initializer_iter iter;
+	const struct drgn_object *obj;
+	struct drgn_qualified_type element_type;
+	uint64_t element_bit_size;
+	uint64_t length, i;
+	enum drgn_format_object_flags flags, element_flags;
+};
+
+static struct drgn_error *
+array_initializer_iter_next(struct initializer_iter *iter_,
+			    struct drgn_object *obj_ret,
+			    enum drgn_format_object_flags *flags_ret)
+{
+	struct drgn_error *err;
+	struct array_initializer_iter *iter =
+		container_of(iter_, struct array_initializer_iter, iter);
+
+	for (;;) {
+		bool zero;
+
+		if (iter->i >= iter->length)
+			return &drgn_stop;
+		err = drgn_object_slice(obj_ret, iter->obj, iter->element_type,
+					iter->i * iter->element_bit_size, 0);
+		if (err)
+			return err;
+		iter->i++;
+
+		/* If we're including indices, we can skip zeroes. */
+		if ((iter->flags & (DRGN_FORMAT_OBJECT_ELEMENT_INDICES |
+				    DRGN_FORMAT_OBJECT_IMPLICIT_ELEMENTS)) !=
+		    DRGN_FORMAT_OBJECT_ELEMENT_INDICES)
+			break;
+
+		err = drgn_object_is_zero(obj_ret, &zero);
+		if (err)
+			return err;
+		if (!zero)
+			break;
+	}
+	*flags_ret = iter->element_flags;
+	return NULL;
+}
+
+static void array_initializer_iter_reset(struct initializer_iter *iter_)
+{
+	struct array_initializer_iter *iter =
+		container_of(iter_, struct array_initializer_iter, iter);
+
+	iter->i = 0;
+}
+
+static struct drgn_error *
+array_initializer_append_designation(struct initializer_iter *iter_,
+				     struct string_builder *sb)
+{
+	struct array_initializer_iter *iter =
+		container_of(iter_, struct array_initializer_iter, iter);
+
+	if (!string_builder_appendf(sb, "[%" PRIu64 "] = ", iter->i - 1))
+		return &drgn_enomem;
 	return NULL;
 }
 
 static struct drgn_error *
-c_pretty_print_array_object(const struct drgn_object *obj,
-			    struct drgn_type *underlying_type, size_t indent,
-			    size_t one_line_columns, size_t multi_line_columns,
-			    struct string_builder *sb)
+c_format_array_object(const struct drgn_object *obj,
+		      struct drgn_type *underlying_type, size_t indent,
+		      size_t one_line_columns, size_t multi_line_columns,
+		      enum drgn_format_object_flags flags,
+		      struct string_builder *sb)
 {
 	struct drgn_error *err;
-	struct drgn_qualified_type element_type;
-	uint64_t element_bit_size;
-	struct drgn_object element;
-	uint64_t length, i;
-	size_t old_len, remaining_columns, start_columns;
+	struct array_initializer_iter iter = {
+		.iter = {
+			.next = array_initializer_iter_next,
+			.reset = array_initializer_iter_reset,
+			.append_designation =
+				flags & DRGN_FORMAT_OBJECT_ELEMENT_INDICES ?
+				array_initializer_append_designation : NULL,
+		},
+		.obj = obj,
+		.element_type = drgn_type_type(underlying_type),
+		.length = drgn_type_length(underlying_type),
+		.flags = flags,
+		.element_flags = drgn_element_format_object_flags(flags),
+	};
 
-	length = drgn_type_length(underlying_type);
-	element_type = drgn_type_type(underlying_type);
-
-	if (length && is_character_type(element_type.type)) {
+	if ((flags & DRGN_FORMAT_OBJECT_STRING) && iter.length &&
+	    is_character_type(iter.element_type.type)) {
 		if (obj->is_reference) {
-			return c_pretty_print_string(&obj->prog->reader,
-						     obj->reference.address,
-						     length, sb);
+			return c_format_string(&obj->prog->reader,
+					       obj->reference.address,
+					       iter.length, sb);
 		} else {
 			const unsigned char *buf;
-			uint64_t size;
+			uint64_t size, i;
 
 			if (!string_builder_appendc(sb, '"'))
 				return &drgn_enomem;
@@ -1019,7 +1462,8 @@ c_pretty_print_array_object(const struct drgn_object *obj,
 			for (i = 0; i < size; i++) {
 				if (buf[i] == '\0')
 					break;
-				err = c_pretty_print_character(buf[i], sb);
+				err = c_format_character(buf[i], false, true,
+							 sb);
 				if (err)
 					return err;
 			}
@@ -1029,180 +1473,54 @@ c_pretty_print_array_object(const struct drgn_object *obj,
 		}
 	}
 
-	err = drgn_type_bit_size(element_type.type, &element_bit_size);
+	err = drgn_type_bit_size(iter.element_type.type,
+				 &iter.element_bit_size);
 	if (err)
 		return err;
 
-	drgn_object_init(&element, obj->prog);
-	while (length) {
-		bool truthy;
+	/*
+	 * If we don't want zero elements, ignore any at the end. If we're
+	 * including indices, then we'll skip past zeroes as we iterate, so we
+	 * don't need to do this.
+	 */
+	if (!(flags & (DRGN_FORMAT_OBJECT_ELEMENT_INDICES |
+		       DRGN_FORMAT_OBJECT_IMPLICIT_ELEMENTS)) &&
+	    iter.length) {
+		struct drgn_object element;
 
-		err = drgn_object_slice(&element, obj, element_type,
-					(length - 1) * element_bit_size, 0);
+		drgn_object_init(&element, obj->prog);
+		do {
+			bool zero;
+
+			err = drgn_object_slice(&element, obj,
+						iter.element_type,
+						(iter.length - 1) *
+						iter.element_bit_size,
+						0);
+			if (err)
+				break;
+
+			err = drgn_object_is_zero(&element, &zero);
+			if (err)
+				break;
+			if (zero)
+				iter.length--;
+			else
+				break;
+		} while (iter.length);
+		drgn_object_deinit(&element);
 		if (err)
-			goto out;
-
-		err = drgn_object_truthiness(&element, &truthy);
-		if (err)
-			goto out;
-		if (!truthy)
-			length--;
-		else
-			break;
+			return err;
 	}
-	if (!length) {
-		if (string_builder_append(sb, "{}"))
-			err = NULL;
-		else
-			err = &drgn_enomem;
-		goto out;
-	}
-
-	/* First, try to fit everything on one line. */
-	if (!string_builder_append(sb, "{ ")) {
-		err = &drgn_enomem;
-		goto out;
-	}
-	old_len = sb->len - 1; /* Minus one for the space. */
-	if (__builtin_sub_overflow(one_line_columns, 2, &remaining_columns))
-		remaining_columns = 0;
-	/* Stop if we can't fit the comma, space, and closing brace. */
-	for (i = 0; i < length && remaining_columns >= 3; i++) {
-		size_t element_start;
-
-		err = drgn_object_slice(&element, obj, element_type,
-					i * element_bit_size, 0);
-		if (err)
-			goto out;
-
-		element_start = sb->len;
-		err = c_pretty_print_object_impl(&element, false, false,
-						 indent + 1,
-						 remaining_columns - 3, 0, sb);
-		if (err && err->code == DRGN_ERROR_STOP)
-			break;
-		else if (err)
-			goto out;
-
-		if (!string_builder_append(sb, ", ")) {
-			err = &drgn_enomem;
-			goto out;
-		}
-
-		if (__builtin_sub_overflow(remaining_columns,
-					   sb->len - element_start,
-					   &remaining_columns))
-			break;
-	}
-	if (i >= length && remaining_columns >= 1) {
-		/* Everything fit. */
-		if (string_builder_appendc(sb, '}'))
-			err = NULL;
-		else
-			err = &drgn_enomem;
-		goto out;
-	}
-
-	if (multi_line_columns == 0) {
-		/* We were asked to fit on one line and we couldn't. */
-		return &drgn_stop;
-	}
-
-	/* Start over (truncate the string) and use multiple lines. */
-	sb->len = old_len;
-	if (__builtin_sub_overflow(multi_line_columns, 8 * (indent + 1),
-				   &start_columns))
-		start_columns = 0;
-	remaining_columns = 0;
-	for (i = 0; i < length; i++) {
-		size_t newline;
-
-		err = drgn_object_slice(&element, obj, element_type,
-					i * element_bit_size, 0);
-		if (err)
-			goto out;
-
-		newline = sb->len;
-		if (!string_builder_appendc(sb, '\n') ||
-		    !append_tabs(indent + 1, sb)) {
-			err = &drgn_enomem;
-			goto out;
-		}
-
-		if (start_columns > 1) {
-			size_t element_start = sb->len;
-
-			err = c_pretty_print_object_impl(&element, false, false,
-							 0, start_columns - 1,
-							 0, sb);
-			if (!err) {
-				size_t element_len = sb->len - element_start;
-
-				if (element_len +
-				    (remaining_columns == start_columns ? 1 : 2)
-				    <= remaining_columns) {
-					/*
-					 * It would've fit on the previous line.
-					 * Move it over.
-					 */
-					if (remaining_columns != start_columns) {
-						sb->str[newline++] = ' ';
-						remaining_columns--;
-					}
-					memmove(&sb->str[newline],
-						&sb->str[element_start],
-						element_len);
-					sb->len = newline + element_len;
-					if (!string_builder_appendc(sb, ',')) {
-						err = &drgn_enomem;
-						goto out;
-					}
-					remaining_columns -= element_len + 1;
-					continue;
-				}
-				if (element_len < start_columns) {
-					/* It fit on the new line. */
-					if (!string_builder_appendc(sb, ',')) {
-						err = &drgn_enomem;
-						goto out;
-					}
-					remaining_columns = (start_columns -
-							     element_len - 1);
-					continue;
-				}
-			} else if (err->code != DRGN_ERROR_STOP) {
-				goto out;
-			}
-			/* It didn't fit. */
-			sb->len = element_start;
-		}
-
-		err = c_pretty_print_object_impl(&element, false, false,
-						 indent + 1, 0,
-						 multi_line_columns, sb);
-		if (err)
-			goto out;
-		if (!string_builder_appendc(sb, ',')) {
-			err = &drgn_enomem;
-			goto out;
-		}
-		remaining_columns = 0;
-	}
-
-	if (!string_builder_appendc(sb, '\n') || !append_tabs(indent, sb) ||
-	    !string_builder_appendc(sb, '}')) {
-		err = &drgn_enomem;
-		goto out;
-	}
-	err = NULL;
-out:
-	drgn_object_deinit(&element);
-	return err;
+	return c_format_initializer(obj->prog, &iter.iter, indent,
+				    one_line_columns, multi_line_columns,
+				    flags & DRGN_FORMAT_OBJECT_ELEMENTS_SAME_LINE,
+				    sb);
 }
 
 static struct drgn_error *
-c_pretty_print_function_object(const struct drgn_object *obj,
-			       struct string_builder *sb)
+c_format_function_object(const struct drgn_object *obj,
+			 struct string_builder *sb)
 {
 	/* Function values currently aren't possible anyways. */
 	if (!obj->is_reference) {
@@ -1215,10 +1533,10 @@ c_pretty_print_function_object(const struct drgn_object *obj,
 }
 
 static struct drgn_error *
-c_pretty_print_object_impl(const struct drgn_object *obj, bool cast,
-			   bool dereference, size_t indent,
-			   size_t one_line_columns, size_t multi_line_columns,
-			   struct string_builder *sb)
+c_format_object_impl(const struct drgn_object *obj, size_t indent,
+		     size_t one_line_columns, size_t multi_line_columns,
+		     enum drgn_format_object_flags flags,
+		     struct string_builder *sb)
 {
 	struct drgn_error *err;
 	struct drgn_type *underlying_type = drgn_underlying_type(obj->type);
@@ -1228,19 +1546,18 @@ c_pretty_print_object_impl(const struct drgn_object *obj, bool cast,
 	 * we're dereferencing them.
 	 */
 	if (drgn_type_kind(underlying_type) == DRGN_TYPE_POINTER) {
-		return c_pretty_print_pointer_object(obj, underlying_type, cast,
-						     dereference, indent,
-						     one_line_columns,
-						     multi_line_columns, sb);
+		return c_format_pointer_object(obj, underlying_type, indent,
+					       one_line_columns,
+					       multi_line_columns, flags, sb);
 	}
 
-	if (cast) {
+	if (flags & DRGN_FORMAT_OBJECT_TYPE_NAME) {
 		size_t old_len = sb->len;
 
 		if (!string_builder_appendc(sb, '('))
 			return &drgn_enomem;
-		err = c_pretty_print_type_name_impl(drgn_object_qualified_type(obj),
-						    sb);
+		err = c_format_type_name_impl(drgn_object_qualified_type(obj),
+					      sb);
 		if (err)
 			return err;
 		if (!string_builder_appendc(sb, ')'))
@@ -1257,39 +1574,41 @@ c_pretty_print_object_impl(const struct drgn_object *obj, bool cast,
 					 "cannot format void object");
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
-		return c_pretty_print_int_object(obj, sb);
+		return c_format_int_object(obj, flags, sb);
 	case DRGN_TYPE_FLOAT:
-		return c_pretty_print_float_object(obj, sb);
+		return c_format_float_object(obj, sb);
 	case DRGN_TYPE_COMPLEX:
 		return drgn_error_format(DRGN_ERROR_TYPE,
 					 "complex object formatting is not implemented");
 	case DRGN_TYPE_STRUCT:
 	case DRGN_TYPE_UNION:
 	case DRGN_TYPE_CLASS:
-		return c_pretty_print_compound_object(obj, underlying_type,
-						      indent,
-						      multi_line_columns, sb);
+		return c_format_compound_object(obj, underlying_type, indent,
+						one_line_columns,
+						multi_line_columns, flags, sb);
 	case DRGN_TYPE_ENUM:
-		return c_pretty_print_enum_object(obj, underlying_type, sb);
+		return c_format_enum_object(obj, underlying_type, sb);
 	case DRGN_TYPE_ARRAY:
-		return c_pretty_print_array_object(obj, underlying_type, indent,
-						   one_line_columns,
-						   multi_line_columns, sb);
+		return c_format_array_object(obj, underlying_type, indent,
+					     one_line_columns,
+					     multi_line_columns, flags, sb);
 	case DRGN_TYPE_FUNCTION:
-		return c_pretty_print_function_object(obj, sb);
+		return c_format_function_object(obj, sb);
 	default:
 		DRGN_UNREACHABLE();
 	}
 }
 
-static struct drgn_error *c_pretty_print_object(const struct drgn_object *obj,
-						size_t columns, char **ret)
+static struct drgn_error *c_format_object(const struct drgn_object *obj,
+					  size_t columns,
+					  enum drgn_format_object_flags flags,
+					  char **ret)
 {
 	struct drgn_error *err;
 	struct string_builder sb = {};
 
-	err = c_pretty_print_object_impl(obj, true, true, 0, columns,
-					 max(columns, (size_t)1), &sb);
+	err = c_format_object_impl(obj, 0, columns, max(columns, (size_t)1),
+				   flags, &sb);
 	if (err) {
 		free(sb.str);
 		return err;
@@ -2896,6 +3215,7 @@ static bool c_pointers_similar(const struct drgn_object_type *lhs_type,
 
 static struct drgn_error *c_op_bool(const struct drgn_object *obj, bool *ret)
 {
+	struct drgn_error *err;
 	struct drgn_type *underlying_type;
 
 	underlying_type = drgn_underlying_type(obj->type);
@@ -2909,7 +3229,11 @@ static struct drgn_error *c_op_bool(const struct drgn_object *obj, bool *ret)
 						 drgn_object_qualified_type(obj));
 	}
 
-	return drgn_object_truthiness(obj, ret);
+	err = drgn_object_is_zero(obj, ret);
+	if (err)
+		return err;
+	*ret = !*ret;
+	return NULL;
 }
 
 static struct drgn_error *c_op_cmp(const struct drgn_object *lhs,
@@ -3134,9 +3458,9 @@ UNARY_OP(not, ~, integer)
 
 const struct drgn_language drgn_language_c = {
 	.name = "C",
-	.pretty_print_type = c_pretty_print_type,
-	.pretty_print_type_name = c_pretty_print_type_name,
-	.pretty_print_object = c_pretty_print_object,
+	.format_type = c_format_type,
+	.format_type_name = c_format_type_name,
+	.format_object = c_format_object,
 	.find_type = c_find_type,
 	.bit_offset = c_bit_offset,
 	.integer_literal = c_integer_literal,

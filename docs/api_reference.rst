@@ -530,18 +530,31 @@ Objects
     :func:`repr()` of an object returns a Python representation of the object:
 
     >>> print(repr(prog['jiffies']))
-    Object(prog, 'volatile long unsigned int', address=0xffffffffbf005000)
+    Object(prog, 'volatile unsigned long', address=0xffffffffbf005000)
 
-    :class:`str() <str>` returns a representation of the object in programming
-    language syntax:
+    :class:`str() <str>` returns a "pretty" representation of the object in
+    programming language syntax:
 
     >>> print(prog['jiffies'])
-    (volatile long unsigned int)4326237045
+    (volatile unsigned long)4326237045
 
-    Note that the drgn CLI is set up so that objects are displayed with
-    ``str()`` instead of ``repr()`` (the latter is the default behavior of
-    Python's interactive mode). This means that in the drgn CLI, the call to
-    ``print()`` in the second example above is not necessary.
+    The output format of ``str()`` can be modified by using the
+    :meth:`format_()` method instead:
+
+    >>> sysname = prog['init_uts_ns'].name.sysname
+    >>> print(sysname)
+    (char [65])"Linux"
+    >>> print(sysname.format_(type_name=False))
+    "Linux"
+    >>> print(sysname.format_(string=False))
+    (char [65]){ 76, 105, 110, 117, 120 }
+
+    .. note::
+
+        The drgn CLI is set up so that objects are displayed in the "pretty"
+        format instead of with ``repr()`` (which is the default behavior of
+        Python's interactive mode). Therefore, it's usually not necessary to
+        call ``print()`` in the drgn CLI.
 
     Objects support the following operators:
 
@@ -767,6 +780,78 @@ Objects
         :raises FaultError: if reading this object causes a bad memory access
         :raises TypeError: if this object has an unreadable type (e.g.,
             ``void``)
+
+    .. method:: format_(**options)
+
+        Format this object in programming language syntax.
+
+        Various format options can be passed (as keyword arguments) to control
+        the output. Options that aren't passed or are passed as ``None`` fall
+        back to a default. Specifically, ``obj.format_()`` (i.e., with no
+        passed options) is equivalent to ``str(obj)``.
+
+        >>> workqueues = prog['workqueues']
+        >>> print(workqueues)
+        (struct list_head){
+                .next = (struct list_head *)0xffff932ecfc0ae10,
+                .prev = (struct list_head *)0xffff932e3818fc10,
+        }
+        >>> print(workqueues.format_(type_name=False,
+        ...                          member_type_names=False,
+        ...                          member_names=False,
+        ...                          members_same_line=True))
+        { 0xffff932ecfc0ae10, 0xffff932e3818fc10 }
+
+        :param columns: Number of columns to limit output to when the
+            expression can be reasonably wrapped. Defaults to no limit.
+        :type columns: int or None
+        :param dereference: If this object is a pointer, include the
+            dereferenced value. This does not apply to structure, union, or
+            class members, or array elements, as dereferencing those could lead
+            to an infinite loop. Defaults to ``True``.
+        :type dereference: bool or None
+        :param symbolize: Include a symbol name and offset for pointer objects.
+            Defaults to ``True``.
+        :type symbolize: bool or None
+        :param string: Format the values of objects with string type as strings.
+            For C, this applies to pointers to and arrays of ``char``, ``signed
+            char``, and ``unsigned char``. Defaults to ``True``.
+        :type string: bool or None
+        :param char: Format objects with character type as character literals.
+            For C, this applies to ``char``, ``signed char``, and ``unsigned
+            char``. Defaults to ``False``.
+        :type char: bool or None
+        :param type_name: Include the type name of this object. Defaults to
+            ``True``.
+        :type type_name: bool or None
+        :param member_type_names: Include the type names of structure, union,
+            and class members. Defaults to ``True``.
+        :type member_type_names: bool or None
+        :param element_type_names: Include the type names of array elements.
+            Defaults to ``False``.
+        :type element_type_names: bool or None
+        :param members_same_line: Place multiple structure, union, and class
+            members on the same line if they fit within the specified
+            number of ``columns``. Defaults to ``False``.
+        :type members_same_line: bool or None
+        :param elements_same_line: Place multiple array elements on the same
+            line if they fit within the specified number of ``columns``.
+            Defaults to ``True``.
+        :type elements_same_line: bool or None
+        :param member_names: Include the names of structure, union, and class
+            members. Defaults to ``True``.
+        :type member_names: bool or None
+        :param element_indices: Include the indices of array elements. Defaults
+            to ``False``.
+        :type element_indices: bool or None
+        :param implicit_members: Include structure, union, and class members
+            which have an implicit value (i.e., for C, zero-initialized).
+            Defaults to ``True``.
+        :type implicit_members: bool or None
+        :param implicit_elements: Include array elements which have an implicit
+            value (i.e., for C, zero-initialized). Defaults to ``False``.
+        :type implicit_elements: bool or None
+        :rtype: str
 
 .. function:: NULL(prog, type)
 

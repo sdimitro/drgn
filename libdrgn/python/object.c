@@ -836,8 +836,8 @@ static PyObject *DrgnObject_repr(DrgnObject *self)
 	if (!parts)
 		return NULL;
 
-	err = drgn_pretty_print_type_name(drgn_object_qualified_type(&self->obj),
-					  &type_name);
+	err = drgn_format_type_name(drgn_object_qualified_type(&self->obj),
+				    &type_name);
 	if (err) {
 		set_drgn_error(err);
 		goto out;
@@ -934,7 +934,8 @@ static PyObject *DrgnObject_str(DrgnObject *self)
 	char *str;
 	PyObject *ret;
 
-	err = drgn_pretty_print_object(&self->obj, SIZE_MAX, &str);
+	err = drgn_format_object(&self->obj, SIZE_MAX,
+				 DRGN_FORMAT_OBJECT_PRETTY, &str);
 	if (err)
 		return set_drgn_error(err);
 
@@ -943,51 +944,94 @@ static PyObject *DrgnObject_str(DrgnObject *self)
 	return ret;
 }
 
-static PyObject *DrgnObject_format(DrgnObject *self, PyObject *arg)
+struct format_object_flag_arg {
+	enum drgn_format_object_flags *flags;
+	enum drgn_format_object_flags value;
+};
+
+static int format_object_flag_converter(PyObject *o, void *p)
 {
+	struct format_object_flag_arg *arg = p;
+	int ret;
+
+	if (o == Py_None)
+		return 1;
+	ret = PyObject_IsTrue(o);
+	if (ret == -1)
+		return 0;
+	if (ret)
+		*arg->flags |= arg->value;
+	else
+		*arg->flags &= ~arg->value;
+	return 1;
+}
+
+static PyObject *DrgnObject_format(DrgnObject *self, PyObject *args,
+				   PyObject *kwds)
+{
+#define FLAGS								\
+	X(dereference, DRGN_FORMAT_OBJECT_DEREFERENCE)			\
+	X(symbolize, DRGN_FORMAT_OBJECT_SYMBOLIZE)			\
+	X(string, DRGN_FORMAT_OBJECT_STRING)				\
+	X(char, DRGN_FORMAT_OBJECT_CHAR)				\
+	X(type_name, DRGN_FORMAT_OBJECT_TYPE_NAME)			\
+	X(member_type_names, DRGN_FORMAT_OBJECT_MEMBER_TYPE_NAMES)	\
+	X(element_type_names, DRGN_FORMAT_OBJECT_ELEMENT_TYPE_NAMES)	\
+	X(members_same_line, DRGN_FORMAT_OBJECT_MEMBERS_SAME_LINE)	\
+	X(elements_same_line, DRGN_FORMAT_OBJECT_ELEMENTS_SAME_LINE)	\
+	X(member_names, DRGN_FORMAT_OBJECT_MEMBER_NAMES)		\
+	X(element_indices, DRGN_FORMAT_OBJECT_ELEMENT_INDICES)		\
+	X(implicit_members, DRGN_FORMAT_OBJECT_IMPLICIT_MEMBERS)	\
+	X(implicit_elements, DRGN_FORMAT_OBJECT_IMPLICIT_ELEMENTS)
+
+	static char *keywords[] = {
+#define X(name, value) #name,
+		FLAGS
+#undef X
+		"columns",
+		NULL,
+	};
 	struct drgn_error *err;
-	const char *format_spec;
+	PyObject *columns_obj = Py_None;
 	size_t columns = SIZE_MAX;
-	char *end, *str;
+	enum drgn_format_object_flags flags = DRGN_FORMAT_OBJECT_PRETTY;
+#define X(name, value)	\
+	struct format_object_flag_arg name##_arg = { &flags, value };
+	FLAGS
+#undef X
+	char *str;
 	PyObject *ret;
 
-	format_spec = PyUnicode_AsUTF8(arg);
-	if (!format_spec)
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|$"
+#define X(name, value) "O&"
+					 FLAGS
+#undef X
+					 "O", keywords,
+#define X(name, value) format_object_flag_converter, &name##_arg,
+					 FLAGS
+#undef X
+					 &columns_obj))
 		return NULL;
 
-	if (format_spec[0] == '.') {
-		unsigned long tmp;
-
-		if (format_spec[1] == '-') {
-			PyErr_SetString(PyExc_ValueError,
-					"Format specifier precision must be non-negative");
+	if (columns_obj != Py_None) {
+		columns_obj = PyNumber_Index(columns_obj);
+		if (!columns_obj)
 			return NULL;
-		}
-
-		errno = 0;
-		tmp = strtoul(format_spec + 1, &end, 10);
-		if (tmp == ULONG_MAX && errno == ERANGE) {
-			PyErr_SetString(PyExc_OverflowError,
-					"Format specifier precision is too large");
+		columns = PyLong_AsSize_t(columns_obj);
+		Py_DECREF(columns_obj);
+		if (columns == (size_t)-1 && PyErr_Occurred())
 			return NULL;
-		}
-		columns = tmp;
-	} else {
-		end = (char *)format_spec;
-	}
-	if (*end) {
-		PyErr_SetString(PyExc_ValueError,
-				"Format specifier can only include precision");
-		return NULL;
 	}
 
-	err = drgn_pretty_print_object(&self->obj, columns, &str);
+	err = drgn_format_object(&self->obj, columns, flags, &str);
 	if (err)
 		return set_drgn_error(err);
 
 	ret = PyUnicode_FromString(str);
 	free(str);
 	return ret;
+
+#undef FLAGS
 }
 
 static Program *DrgnObject_get_prog(DrgnObject *self, void *arg)
@@ -1622,6 +1666,8 @@ static PyMethodDef DrgnObject_methods[] = {
 	 drgn_Object_address_of__DOC},
 	{"read_", (PyCFunction)DrgnObject_read, METH_NOARGS,
 	 drgn_Object_read__DOC},
+	{"format_", (PyCFunction)DrgnObject_format,
+	 METH_VARARGS | METH_KEYWORDS, drgn_Object_format__DOC},
 	{"__round__", (PyCFunction)DrgnObject_round,
 	 METH_VARARGS | METH_KEYWORDS},
 	{"__trunc__", (PyCFunction)DrgnObject_trunc, METH_NOARGS},
@@ -1629,8 +1675,6 @@ static PyMethodDef DrgnObject_methods[] = {
 	{"__ceil__", (PyCFunction)DrgnObject_ceil, METH_NOARGS},
 	{"__dir__", (PyCFunction)DrgnObject_dir, METH_NOARGS,
 "dir() implementation which includes structure, union, and class members."},
-	{"__format__", (PyCFunction)DrgnObject_format, METH_O,
-"Object formatter."},
 	{},
 };
 
