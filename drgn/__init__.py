@@ -1,4 +1,4 @@
-# Copyright 2018-2019 - Omar Sandoval
+# Copyright 2018-2020 - Omar Sandoval
 # SPDX-License-Identifier: GPL-3.0+
 
 """
@@ -92,70 +92,73 @@ from _drgn import (
 
 
 __all__ = [
-    'Architecture',
-    'FaultError',
-    'FindObjectFlags',
-    'MissingDebugInfoError',
-    'NULL',
-    'Object',
-    'Platform',
-    'PlatformFlags',
-    'PrimitiveType',
-    'Program',
-    'ProgramFlags',
-    'Qualifiers',
-    'Register',
-    'StackFrame',
-    'StackTrace',
-    'Symbol',
-    'Type',
-    'TypeKind',
-    'array_type',
-    'bool_type',
-    'cast',
-    'class_type',
-    'complex_type',
-    'container_of',
-    'enum_type',
-    'execscript',
-    'filename_matches',
-    'float_type',
-    'function_type',
-    'host_platform',
-    'int_type',
-    'pointer_type',
-    'program_from_core_dump',
-    'program_from_kernel',
-    'program_from_pid',
-    'reinterpret',
-    'sizeof',
-    'struct_type',
-    'typedef_type',
-    'union_type',
-    'void_type',
+    "Architecture",
+    "FaultError",
+    "FindObjectFlags",
+    "MissingDebugInfoError",
+    "NULL",
+    "Object",
+    "Platform",
+    "PlatformFlags",
+    "PrimitiveType",
+    "Program",
+    "ProgramFlags",
+    "Qualifiers",
+    "Register",
+    "StackFrame",
+    "StackTrace",
+    "Symbol",
+    "Type",
+    "TypeKind",
+    "array_type",
+    "bool_type",
+    "cast",
+    "class_type",
+    "complex_type",
+    "container_of",
+    "enum_type",
+    "execscript",
+    "filename_matches",
+    "float_type",
+    "function_type",
+    "host_platform",
+    "int_type",
+    "pointer_type",
+    "program_from_core_dump",
+    "program_from_kernel",
+    "program_from_pid",
+    "reinterpret",
+    "sizeof",
+    "struct_type",
+    "typedef_type",
+    "union_type",
+    "void_type",
 ]
 
 
 try:
     _open_code = io.open_code
 except AttributeError:
+
     def _open_code(path):
-        return open(path, 'rb')
+        return open(path, "rb")
 
 
 # From https://docs.python.org/3/reference/import.html#import-related-module-attributes.
-_special_globals = frozenset([
-    '__name__',
-    '__loader__',
-    '__package__',
-    '__spec__',
-    '__path__',
-    '__file__',
-    '__cached__',
-])
+_special_globals = frozenset(
+    [
+        "__name__",
+        "__loader__",
+        "__package__",
+        "__spec__",
+        "__path__",
+        "__file__",
+        "__cached__",
+    ]
+)
 
 
-def execscript(path, *args):
+def execscript(path: str, *args: str):
     """
     Execute a script.
 
@@ -199,21 +202,21 @@ def execscript(path, *args):
     >>> task_state_to_char(find_task(prog, 1))
     'S'
 
-    :param str path: File path of the script.
-    :param str \\*args: Zero or more additional arguments to pass to the script.
-        This is a :ref:`variable argument list <python:tut-arbitraryargs>`.
+    :param path: File path of the script.
+    :param args: Zero or more additional arguments to pass to the script. This
+        is a :ref:`variable argument list <python:tut-arbitraryargs>`.
     """
     # This is based on runpy.run_code, which we can't use because we want to
     # update globals even if the script throws an exception.
     saved_module = []
     try:
-        saved_module.append(sys.modules['__main__'])
+        saved_module.append(sys.modules["__main__"])
     except KeyError:
         pass
     saved_argv = sys.argv
     try:
-        module = types.ModuleType('__main__')
-        sys.modules['__main__'] = module
+        module = types.ModuleType("__main__")
+        sys.modules["__main__"] = module
         sys.argv = [path]
         sys.argv.extend(args)
 
@@ -221,14 +224,15 @@ def execscript(path, *args):
             code = pkgutil.read_code(f)
         if code is None:
             with _open_code(path) as f:
-                code = compile(f.read(), path, 'exec')
+                code = compile(f.read(), path, "exec")
         module.__spec__ = None
         module.__file__ = path
         module.__cached__ = None
 
         caller_globals = sys._getframe(1).f_globals
         caller_special_globals = {
-            name: caller_globals[name] for name in _special_globals
+            name: caller_globals[name]
+            for name in _special_globals
             if name in caller_globals
         }
         for name, value in caller_globals.items():
@@ -246,6 +250,6 @@ def execscript(path, *args):
     finally:
         sys.argv = saved_argv
         if saved_module:
-            sys.modules['__main__'] = saved_module[0]
+            sys.modules["__main__"] = saved_module[0]
         else:
-            del sys.modules['__main__']
+            del sys.modules["__main__"]

@@ -1,4 +1,4 @@
-# Copyright 2018-2019 - Omar Sandoval
+# Copyright 2018-2020 - Omar Sandoval
 # SPDX-License-Identifier: GPL-3.0+
 
 """
@@ -13,46 +13,105 @@ libstdc++.
 Parameter types and return types are :class:`drgn.Object` unless noted
 otherwise. Many helpers include a C function signature indicating the expected
 object types.
+
+Generic Helpers
+===============
+
+The top-level ``drgn.helpers`` module provides generic helpers that may be
+useful for scripts or for implementing other helpers.
 """
 
-from typing import Iterable
+import enum
+from typing import Container, Iterable
+
+from drgn import Type
 
 
-def escape_character(c: int, escape_single_quote: bool = False,
-                     escape_double_quote: bool = False,
-                     escape_backslash: bool = False) -> str:
+def escape_ascii_character(
+    c: int,
+    escape_single_quote: bool = False,
+    escape_double_quote: bool = False,
+    escape_backslash: bool = False,
+) -> str:
+    """
+    Format an ASCII byte value as a character, possibly escaping it.
+    Non-printable characters are always escaped. Non-printable characters other
+    than ``\\0``, ``\\a``, ``\\b``, ``\\t``, ``\\n``, ``\\v``, ``\\f``, and
+    ``\\r`` are escaped in hexadecimal format (e.g., ``\\x7f``). By default,
+    printable characters are never escaped.
+
+    :param c: The character to escape.
+    :param escape_single_quote: Whether to escape single quotes to ``\\'``.
+    :param escape_double_quote: Whether to escape double quotes to ``\\"``.
+    :param escape_backslash: Whether to escape backslashes to ``\\\\``.
+    """
     if c == 0:
-        return r'\0'
+        return r"\0"
     elif c == 7:
-        return r'\a'
+        return r"\a"
     elif c == 8:
-        return r'\b'
+        return r"\b"
     elif c == 9:
-        return r'\t'
+        return r"\t"
     elif c == 10:
-        return r'\n'
+        return r"\n"
     elif c == 11:
-        return r'\v'
+        return r"\v"
     elif c == 12:
-        return r'\f'
+        return r"\f"
     elif c == 13:
-        return r'\r'
+        return r"\r"
     elif escape_double_quote and c == 34:
-        return r'\"'
+        return r"\""
     elif escape_single_quote and c == 39:
         return r"\'"
     elif escape_backslash and c == 92:
-        return r'\\'
+        return r"\\"
     elif 32 <= c <= 126:
         return chr(c)
     else:
-        return f'\\x{c:02x}'
+        return f"\\x{c:02x}"
 
 
-def escape_string(buffer: Iterable[int], escape_single_quote: bool = False,
-                  escape_double_quote: bool = False,
-                  escape_backslash: bool = False) -> str:
-    return ''.join(escape_character(c, escape_single_quote=escape_single_quote,
-                                    escape_double_quote=escape_double_quote,
-                                    escape_backslash=escape_backslash)
-                   for c in buffer)
+def escape_ascii_string(
+    buffer: Iterable[int],
+    escape_single_quote: bool = False,
+    escape_double_quote: bool = False,
+    escape_backslash: bool = False,
+) -> str:
+    """
+    Escape an iterable of ASCII byte values (e.g., :class:`bytes` or
+    :class:`bytearray`). See :func:`escape_ascii_character()`.
+
+    :param buffer: The byte array.
+    """
+    return "".join(
+        escape_ascii_character(
+            c,
+            escape_single_quote=escape_single_quote,
+            escape_double_quote=escape_double_quote,
+            escape_backslash=escape_backslash,
+        )
+        for c in buffer
+    )
+
+
+def enum_type_to_class(
+    type: Type, name: str, exclude: Container[str] = (), prefix: str = ""
+) -> enum.IntEnum:
+    """
+    Get an :class:`enum.IntEnum` class from an enumerated :class:`drgn.Type`.
+
+    :param type: The enumerated type to convert.
+    :type type: :class:`drgn.Type`
+    :param name: The name of the ``IntEnum`` type to create.
+    :param exclude: Container (e.g., list or set) of enumerator names to
+        exclude from the created ``IntEnum``.
+    :param prefix: Prefix to strip from the beginning of enumerator names.
+    """
+    enumerators = [
+        (name[len(prefix) :] if name.startswith(prefix) else name, value)
+        for (name, value) in type.enumerators
+        if name not in exclude
+    ]
+    return enum.IntEnum(name, enumerators)

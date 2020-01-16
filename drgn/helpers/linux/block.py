@@ -1,4 +1,4 @@
-# Copyright 2018-2019 - Omar Sandoval
+# Copyright 2018-2020 - Omar Sandoval
 # SPDX-License-Identifier: GPL-3.0+
 
 """
@@ -11,19 +11,19 @@ Linux block layer, including disks (``struct gendisk``) and partitions
 """
 
 from drgn import container_of
-from drgn.helpers import escape_string
+from drgn.helpers import escape_ascii_string
 from drgn.helpers.linux.device import MAJOR, MINOR, MKDEV
 from drgn.helpers.linux.list import list_for_each_entry
 
 __all__ = [
-    'disk_devt',
-    'disk_name',
-    'for_each_disk',
-    'print_disks',
-    'part_devt',
-    'part_name',
-    'for_each_partition',
-    'print_partitions',
+    "disk_devt",
+    "disk_name",
+    "for_each_disk",
+    "print_disks",
+    "part_devt",
+    "part_name",
+    "for_each_partition",
+    "print_partitions",
 ]
 
 
@@ -49,20 +49,22 @@ def disk_name(disk):
 
 def _for_each_block_device(prog):
     try:
-        class_in_private = prog.cache['knode_class_in_device_private']
+        class_in_private = prog.cache["knode_class_in_device_private"]
     except KeyError:
         # We need a proper has_member(), but this is fine for now.
-        class_in_private = any(member[1] == 'knode_class' for member in
-                               prog.type('struct device_private').members)
-        prog.cache['knode_class_in_device_private'] = class_in_private
-    devices = prog['block_class'].p.klist_devices.k_list.address_of_()
+        class_in_private = any(
+            member[1] == "knode_class"
+            for member in prog.type("struct device_private").members
+        )
+        prog.cache["knode_class_in_device_private"] = class_in_private
+    devices = prog["block_class"].p.klist_devices.k_list.address_of_()
     if class_in_private:
-        for device_private in list_for_each_entry('struct device_private', devices,
-                                                  'knode_class.n_node'):
+        for device_private in list_for_each_entry(
+            "struct device_private", devices, "knode_class.n_node"
+        ):
             yield device_private.device
     else:
-        yield from list_for_each_entry('struct device', devices,
-                                       'knode_class.n_node')
+        yield from list_for_each_entry("struct device", devices, "knode_class.n_node")
 
 
 def for_each_disk(prog):
@@ -71,10 +73,10 @@ def for_each_disk(prog):
 
     :return: Iterator of ``struct gendisk *`` objects.
     """
-    disk_type = prog['disk_type'].address_of_()
+    disk_type = prog["disk_type"].address_of_()
     for device in _for_each_block_device(prog):
         if device.type == disk_type:
-            yield container_of(device, 'struct gendisk', 'part0.__dev')
+            yield container_of(device, "struct gendisk", "part0.__dev")
 
 
 def print_disks(prog):
@@ -82,8 +84,8 @@ def print_disks(prog):
     for disk in for_each_disk(prog):
         major = disk.major.value_()
         minor = disk.first_minor.value_()
-        name = escape_string(disk_name(disk), escape_backslash=True)
-        print(f'{major}:{minor} {name} ({disk.type_.type_name()})0x{disk.value_():x}')
+        name = escape_ascii_string(disk_name(disk), escape_backslash=True)
+        print(f"{major}:{minor} {name} ({disk.type_.type_name()})0x{disk.value_():x}")
 
 
 def part_devt(part):
@@ -113,12 +115,14 @@ def for_each_partition(prog):
     :return: Iterator of ``struct hd_struct *`` objects.
     """
     for device in _for_each_block_device(prog):
-        yield container_of(device, 'struct hd_struct', '__dev')
+        yield container_of(device, "struct hd_struct", "__dev")
 
 
 def print_partitions(prog):
     """Print all of the partitions in the system."""
     for part in for_each_partition(prog):
         devt = part_devt(part).value_()
-        name = escape_string(part_name(part), escape_backslash=True)
-        print(f'{MAJOR(devt)}:{MINOR(devt)} {name} ({part.type_.type_name()})0x{part.value_():x}')
+        name = escape_ascii_string(part_name(part), escape_backslash=True)
+        print(
+            f"{MAJOR(devt)}:{MINOR(devt)} {name} ({part.type_.type_name()})0x{part.value_():x}"
+        )
