@@ -2,6 +2,7 @@
 
 import contextlib
 from distutils import log
+from distutils.command.build import build as _build
 from distutils.dir_util import mkpath
 from distutils.file_util import copy_file
 import os
@@ -9,14 +10,22 @@ import os.path
 import re
 import pkg_resources
 from setuptools import setup, find_packages
-from setuptools.command.build_ext import build_ext
-from setuptools.command.egg_info import egg_info
+from setuptools.command.build_ext import build_ext as _build_ext
+from setuptools.command.egg_info import egg_info as _egg_info
 from setuptools.extension import Extension
+import shlex
 import subprocess
 import sys
 
 
-class my_build_ext(build_ext):
+class build(_build):
+    def finalize_options(self):
+        super().finalize_options()
+        if self.parallel is None:
+            self.parallel = len(os.sched_getaffinity(0)) + 1
+
+
+class build_ext(_build_ext):
     user_options = [
         ("inplace", "i", "put compiled extension into the source directory"),
         ("parallel=", "j", "number of parallel build jobs"),
@@ -45,6 +54,10 @@ class my_build_ext(build_ext):
                 "--disable-static",
                 "--with-python=" + sys.executable,
             ]
+            try:
+                args.extend(shlex.split(os.environ["CONFIGURE_FLAGS"]))
+            except KeyError:
+                pass
             try:
                 subprocess.check_call(args, cwd=self.build_temp)
             except Exception:
@@ -88,7 +101,7 @@ class my_build_ext(build_ext):
 
 
 # Work around pypa/setuptools#436.
-class my_egg_info(egg_info):
+class egg_info(_egg_info):
     def run(self):
         if os.path.exists(".git"):
             try:
@@ -149,11 +162,11 @@ with open("README.rst", "r") as f:
 setup(
     name="drgn",
     version=get_version(),
-    packages=find_packages(exclude=["examples", "scripts", "tests"]),
+    packages=find_packages(exclude=["examples", "scripts", "tests", "tests.*"]),
     # This is here so that setuptools knows that we have an extension; it's
     # actually built using autotools/make.
     ext_modules=[Extension(name="_drgn", sources=[])],
-    cmdclass={"build_ext": my_build_ext, "egg_info": my_egg_info,},
+    cmdclass={"build": build, "build_ext": build_ext, "egg_info": egg_info},
     entry_points={"console_scripts": ["drgn=drgn.internal.cli:main"],},
     python_requires=">=3.6",
     author="Omar Sandoval",
