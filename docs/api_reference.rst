@@ -1454,7 +1454,7 @@ can be used just like types obtained from :meth:`Program.type()`.
 Miscellaneous
 -------------
 
-.. function:: sizeof(type_or_obj)
+.. function:: sizeof(type_or_obj, /)
 
     Get the size of a :class:`Type` or :class:`Object` in bytes.
 
@@ -1479,7 +1479,7 @@ Exceptions
     This error is raised when one or more files in a program do not have debug
     information.
 
-..exception:: OutOfBoundsError
+.. exception:: OutOfBoundsError
 
     This error is raised when attempting to access beyond the bounds of
     a value object.
