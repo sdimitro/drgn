@@ -15,16 +15,16 @@ from drgn.helpers import escape_ascii_string
 from drgn.helpers.linux.device import MAJOR, MINOR, MKDEV
 from drgn.helpers.linux.list import list_for_each_entry
 
-__all__ = [
+__all__ = (
     "disk_devt",
     "disk_name",
     "for_each_disk",
-    "print_disks",
+    "for_each_partition",
     "part_devt",
     "part_name",
-    "for_each_partition",
+    "print_disks",
     "print_partitions",
-]
+)
 
 
 def disk_devt(disk):
@@ -53,7 +53,7 @@ def _for_each_block_device(prog):
     except KeyError:
         # We need a proper has_member(), but this is fine for now.
         class_in_private = any(
-            member[1] == "knode_class"
+            member.name == "knode_class"
             for member in prog.type("struct device_private").members
         )
         prog.cache["knode_class_in_device_private"] = class_in_private

@@ -10,7 +10,9 @@ from drgn import (
     PlatformFlags,
     Program,
     Type,
+    TypeEnumerator,
     TypeKind,
+    TypeMember,
     class_type,
     enum_type,
     float_type,
@@ -25,24 +27,34 @@ coord_type = class_type(
     "coord",
     12,
     (
-        (int_type("int", 4, True), "x", 0),
-        (int_type("int", 4, True), "y", 32),
-        (int_type("int", 4, True), "z", 64),
+        TypeMember(int_type("int", 4, True), "x", 0),
+        TypeMember(int_type("int", 4, True), "y", 32),
+        TypeMember(int_type("int", 4, True), "z", 64),
     ),
 )
 point_type = struct_type(
     "point",
     8,
-    ((int_type("int", 4, True), "x", 0), (int_type("int", 4, True), "y", 32),),
+    (
+        TypeMember(int_type("int", 4, True), "x", 0),
+        TypeMember(int_type("int", 4, True), "y", 32),
+    ),
 )
 line_segment_type = struct_type(
-    "line_segment", 16, ((point_type, "a"), (point_type, "b", 64),)
+    "line_segment", 16, (TypeMember(point_type, "a"), TypeMember(point_type, "b", 64))
 )
 option_type = union_type(
-    "option", 4, ((int_type("int", 4, True), "i"), (float_type("float", 4), "f"),)
+    "option",
+    4,
+    (
+        TypeMember(int_type("int", 4, True), "i"),
+        TypeMember(float_type("float", 4), "f"),
+    ),
 )
 color_type = enum_type(
-    "color", int_type("unsigned int", 4, False), (("RED", 0), ("GREEN", 1), ("BLUE", 2))
+    "color",
+    int_type("unsigned int", 4, False),
+    (TypeEnumerator("RED", 0), TypeEnumerator("GREEN", 1), TypeEnumerator("BLUE", 2)),
 )
 pid_type = typedef_type("pid_t", int_type("int", 4, True))
 

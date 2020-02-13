@@ -64,7 +64,10 @@ from _drgn import (
     StackTrace,
     Symbol,
     Type,
+    TypeEnumerator,
     TypeKind,
+    TypeMember,
+    TypeParameter,
     _with_libkdumpfile,
     array_type,
     bool_type,
@@ -91,7 +94,7 @@ from _drgn import (
 )
 
 
-__all__ = [
+__all__ = (
     "Architecture",
     "FaultError",
     "FindObjectFlags",
@@ -110,7 +113,10 @@ __all__ = [
     "StackTrace",
     "Symbol",
     "Type",
+    "TypeEnumerator",
     "TypeKind",
+    "TypeMember",
+    "TypeParameter",
     "array_type",
     "bool_type",
     "cast",
@@ -134,7 +140,7 @@ __all__ = [
     "typedef_type",
     "union_type",
     "void_type",
-]
+)
 
 
 try:

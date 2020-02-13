@@ -906,9 +906,10 @@ drgn_program_find_object(struct drgn_program *prog, const char *name,
 				      ret);
 }
 
-bool drgn_program_find_symbol_internal(struct drgn_program *prog,
-				       uint64_t address, Dwfl_Module *module,
-				       struct drgn_symbol *ret)
+bool drgn_program_find_symbol_by_address_internal(struct drgn_program *prog,
+						  uint64_t address,
+						  Dwfl_Module *module,
+						  struct drgn_symbol *ret)
 {
 	const char *name;
 	GElf_Off offset;
@@ -943,20 +944,85 @@ struct drgn_error *drgn_error_symbol_not_found(uint64_t address)
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
-drgn_program_find_symbol(struct drgn_program *prog, uint64_t address,
-			 struct drgn_symbol **ret)
+drgn_program_find_symbol_by_address(struct drgn_program *prog, uint64_t address,
+				    struct drgn_symbol **ret)
 {
 	struct drgn_symbol *sym;
 
 	sym = malloc(sizeof(*sym));
 	if (!sym)
 		return &drgn_enomem;
-	if (!drgn_program_find_symbol_internal(prog, address, NULL, sym)) {
+	if (!drgn_program_find_symbol_by_address_internal(prog, address, NULL,
+							  sym)) {
 		free(sym);
 		return drgn_error_symbol_not_found(address);
 	}
 	*ret = sym;
 	return NULL;
+}
+
+struct find_symbol_by_name_arg {
+	const char *name;
+	struct drgn_symbol **ret;
+	struct drgn_error *err;
+	bool bad_symtabs;
+};
+
+static int find_symbol_by_name_cb(Dwfl_Module *dwfl_module, void **userdatap,
+				  const char *module_name, Dwarf_Addr base,
+				  void *cb_arg)
+{
+	struct find_symbol_by_name_arg *arg = cb_arg;
+	int symtab_len, i;
+
+	symtab_len = dwfl_module_getsymtab(dwfl_module);
+	i = dwfl_module_getsymtab_first_global(dwfl_module);
+	if (symtab_len == -1 || i == -1) {
+		arg->bad_symtabs = true;
+		return DWARF_CB_OK;
+	}
+	for (; i < symtab_len; i++) {
+		GElf_Sym elf_sym;
+		GElf_Addr elf_addr;
+		const char *name;
+
+		name = dwfl_module_getsym_info(dwfl_module, i, &elf_sym,
+					       &elf_addr, NULL, NULL, NULL);
+		if (name && strcmp(arg->name, name) == 0) {
+			struct drgn_symbol *sym;
+
+			sym = malloc(sizeof(*sym));
+			if (sym) {
+				sym->name = name;
+				sym->address = elf_addr;
+				sym->size = elf_sym.st_size;
+				*arg->ret = sym;
+			} else {
+				arg->err = &drgn_enomem;
+			}
+			return DWARF_CB_ABORT;
+		}
+	}
+	return DWARF_CB_OK;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_program_find_symbol_by_name(struct drgn_program *prog,
+			const char *name, struct drgn_symbol **ret)
+{
+	struct find_symbol_by_name_arg arg = {
+		.name = name,
+		.ret = ret,
+	};
+
+	if (prog->_dicache &&
+	    dwfl_getmodules(prog->_dicache->dindex.dwfl, find_symbol_by_name_cb,
+			    &arg, 0))
+		return arg.err;
+	return drgn_error_format(DRGN_ERROR_LOOKUP,
+				 "could not find symbol with name '%s'%s", name,
+				 arg.bad_symtabs ?
+				 " (could not get some symbol tables)" : "");
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
