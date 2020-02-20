@@ -227,7 +227,7 @@ out:
 	return err;
 }
 
-static struct drgn_error *
+struct drgn_error *
 vmcoreinfo_object_find(const char *name, size_t name_len, const char *filename,
 		       enum drgn_find_object_flags flags, void *arg,
 		       struct drgn_object *ret)
@@ -268,6 +268,27 @@ vmcoreinfo_object_find(const char *name, size_t name_len, const char *filename,
 			return drgn_object_set_unsigned(ret, qualified_type,
 							~(prog->vmcoreinfo.page_size - 1),
 							0);
+		} else if (name_len == strlen("UTS_RELEASE") &&
+			   memcmp(name, "UTS_RELEASE", name_len) == 0) {
+			size_t len;
+
+			err = drgn_type_index_find_primitive(&prog->tindex,
+							     DRGN_C_TYPE_CHAR,
+							     &qualified_type.type);
+			if (err)
+				return err;
+			qualified_type.qualifiers = DRGN_QUALIFIER_CONST;
+			len = strlen(prog->vmcoreinfo.osrelease);
+			err = drgn_type_index_array_type(&prog->tindex, len + 1,
+							 qualified_type,
+							 &qualified_type.type);
+			if (err)
+				return err;
+			qualified_type.qualifiers = 0;
+			return drgn_object_set_buffer(ret, qualified_type,
+						      prog->vmcoreinfo.osrelease,
+						      0, 0,
+						      DRGN_PROGRAM_ENDIAN);
 		}
 	}
 	return &drgn_not_found;
@@ -1410,15 +1431,6 @@ linux_kernel_report_debug_info(struct drgn_program *prog,
 	size_t i, num_kmods = 0;
 	bool need_module_definition = false;
 	bool vmlinux_is_pending = false;
-
-	if (report_main && !prog->added_vmcoreinfo_object_finder) {
-		err = drgn_program_add_object_finder(prog,
-						     vmcoreinfo_object_find,
-						     prog);
-		if (err)
-			return err;
-		prog->added_vmcoreinfo_object_finder = true;
-	}
 
 	if (n) {
 		kmods = malloc_array(n, sizeof(*kmods));
