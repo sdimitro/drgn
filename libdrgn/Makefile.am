@@ -27,6 +27,7 @@ libdrgnimpl_la_SOURCES = $(ARCH_INS:.c.in=.c) \
 			 hash_table.h \
 			 internal.c \
 			 internal.h \
+			 language.c \
 			 language.h \
 			 language_c.c \
 			 lexer.c \
@@ -98,6 +99,7 @@ _drgn_la_SOURCES = python/docstrings.h \
 		   python/drgnpy.h \
 		   python/error.c \
 		   python/helpers.c \
+		   python/language.c \
 		   python/module.c \
 		   python/object.c \
 		   python/platform.c \
