@@ -1,4 +1,5 @@
-#!/usr/bin/env python3
+# Copyright 2020 - Omar Sandoval
+# SPDX-License-Identifier: GPL-3.0+
 
 import aiohttp
 import argparse
@@ -8,14 +9,30 @@ import getpass
 import io
 import json
 import logging
-import multiprocessing
 import os
 import os.path
 import re
 import shlex
+import shutil
 import sys
 import time
+from typing import (
+    Any,
+    AsyncGenerator,
+    BinaryIO,
+    Dict,
+    List,
+    Optional,
+    Set,
+    SupportsFloat,
+    SupportsRound,
+    TextIO,
+    Tuple,
+)
 import urllib.parse
+from yarl import URL
+
+from util import nproc
 
 
 logger = logging.getLogger("asyncio")
@@ -24,58 +41,11 @@ logger = logging.getLogger("asyncio")
 KERNEL_ORG_JSON = "https://www.kernel.org/releases.json"
 
 
-DEFCONFIG = """\
-# Minimal configuration for booting into the root filesystem image and building
-# and testing drgn on a live kernel.
-
-CONFIG_SMP=y
-
-# No modules to simplify installing the kernel into the root filesystem image.
-CONFIG_MODULES=n
-
-# We run the tests in KVM.
-CONFIG_HYPERVISOR_GUEST=y
-CONFIG_KVM_GUEST=y
-CONFIG_PARAVIRT=y
-CONFIG_PARAVIRT_SPINLOCKS=y
-
-# Minimum requirements for booting up.
-CONFIG_DEVTMPFS=y
-CONFIG_EXT4_FS=y
-CONFIG_PCI=y
-CONFIG_PROC_FS=y
-CONFIG_SERIAL_8250=y
-CONFIG_SERIAL_8250_CONSOLE=y
-CONFIG_SYSFS=y
-CONFIG_VIRTIO_BLK=y
-CONFIG_VIRTIO_PCI=y
-
-# drgn needs /proc/kcore for live debugging.
-CONFIG_PROC_KCORE=y
-# In some cases, it also needs /proc/kallsyms.
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-
-# drgn needs debug info.
-CONFIG_DEBUG_KERNEL=y
-CONFIG_DEBUG_INFO=y
-CONFIG_DEBUG_INFO_DWARF4=y
-
-# Some important information in VMCOREINFO is initialized in the kexec code for
-# some reason.
-CONFIG_KEXEC=y
-
-# In case we need to refer to the kernel config in the future.
-CONFIG_IKCONFIG=y
-CONFIG_IKCONFIG_PROC=y
-"""
-
-
 DROPBOX_API_URL = "https://api.dropboxapi.com"
 CONTENT_API_URL = "https://content.dropboxapi.com"
 
 
-def humanize_size(n, precision=1):
+def humanize_size(n: SupportsFloat, precision: int = 1) -> str:
     n = float(n)
     for unit in ["", "Ki", "Mi", "Gi", "Ti", "Pi", "Ei", "Zi"]:
         if abs(n) < 1024:
@@ -88,19 +58,23 @@ def humanize_size(n, precision=1):
     return f"{n:.{precision}f}{unit}B"
 
 
-def humanize_duration(seconds):
+def humanize_duration(seconds: SupportsRound[Any]) -> str:
     seconds = round(seconds)
     return f"{seconds // 60}m{seconds % 60}s"
 
 
-# Like aiohttp.ClientResponse.raise_for_status(), but includes the response
-# body.
-async def raise_for_status_body(resp):
+async def raise_for_status_body(resp: aiohttp.ClientResponse) -> None:
+    """
+    Like aiohttp.ClientResponse.raise_for_status(), but includes the response
+    body.
+    """
     if resp.status >= 400:
-        message = resp.reason
+        message = resp.reason or ""
         body = await resp.text()
         if body:
-            message += ": " + body
+            if message:
+                message += ": "
+            message += body
         raise aiohttp.ClientResponseError(
             resp.request_info,
             resp.history,
@@ -110,11 +84,17 @@ async def raise_for_status_body(resp):
         )
 
 
-async def get_kernel_org_releases(http_client):
+def get_current_localversion() -> str:
+    with open(os.path.join(os.path.dirname(__file__), "config"), "r") as f:
+        match = re.search(r'^CONFIG_LOCALVERSION="([^"]*)"', f.read(), re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+async def get_kernel_org_versions(http_client: aiohttp.ClientSession) -> List[str]:
     async with http_client.get(KERNEL_ORG_JSON, raise_for_status=True) as resp:
         releases = (await resp.json())["releases"]
         return [
-            "v" + release["version"]
+            release["version"]
             for release in releases
             if release["moniker"] in {"mainline", "stable", "longterm"}
             # 3.16 seems to be missing "x86/build/64: Force the linker to use
@@ -125,28 +105,27 @@ async def get_kernel_org_releases(http_client):
         ]
 
 
-async def get_available_kernel_releases(http_client, token):
+async def get_available_kernel_releases(
+    http_client: aiohttp.ClientSession, token: str
+) -> Set[str]:
     headers = {"Authorization": "Bearer " + token}
     params = {"path": "/Public/x86_64"}
     url = DROPBOX_API_URL + "/2/files/list_folder"
     available = set()
     while True:
         async with http_client.post(url, headers=headers, json=params) as resp:
+            if resp.status == 409 and (await resp.json())["error_summary"].startswith(
+                "path/not_found/"
+            ):
+                break
+            await raise_for_status_body(resp)
             obj = await resp.json()
         for entry in obj["entries"]:
             if entry[".tag"] != "file":
                 continue
-            match = re.fullmatch(
-                r"vmlinux-(\d+)\.(\d+)\.(\d+)(-rc\d+)?\.zst", entry["name"]
-            )
-            if not match:
-                continue
-            version = f"v{match.group(1)}.{match.group(2)}"
-            if match.group(3) != "0":
-                version += "." + match.group(3)
-            if match.group(4):
-                version += match.group(4)
-            available.add(version)
+            match = re.fullmatch(r"vmlinux-(.*)\.zst", entry["name"])
+            if match:
+                available.add(match.group(1))
         if not obj["has_more"]:
             break
         url = DROPBOX_API_URL + "/2/files/list_folder/continue"
@@ -154,7 +133,7 @@ async def get_available_kernel_releases(http_client, token):
     return available
 
 
-async def check_call(*args, **kwds):
+async def check_call(*args: Any, **kwds: Any) -> None:
     proc = await asyncio.create_subprocess_exec(*args, **kwds)
     returncode = await proc.wait()
     if returncode != 0:
@@ -164,10 +143,9 @@ async def check_call(*args, **kwds):
         )
 
 
-async def check_output(*args, **kwds):
-    proc = await asyncio.create_subprocess_exec(
-        *args, **kwds, stdout=asyncio.subprocess.PIPE
-    )
+async def check_output(*args: Any, **kwds: Any) -> bytes:
+    kwds["stdout"] = asyncio.subprocess.PIPE
+    proc = await asyncio.create_subprocess_exec(*args, **kwds)
     stdout = (await proc.communicate())[0]
     if proc.returncode != 0:
         command = " ".join(shlex.quote(arg) for arg in args)
@@ -177,17 +155,27 @@ async def check_output(*args, **kwds):
     return stdout
 
 
-async def compress_file(in_path, out_path, *args, **kwds):
+async def compress_file(in_path: str, out_path: str, **kwds: Any) -> None:
     logger.info("compressing %r", in_path)
     start = time.monotonic()
-    await check_call("zstd", "-T0", "-19", "-q", in_path, "-o", out_path, *args, **kwds)
+    await check_call("zstd", "-T0", "-19", "-q", in_path, "-o", out_path, **kwds)
     elapsed = time.monotonic() - start
     logger.info("compressed %r in %s", in_path, humanize_duration(elapsed))
 
 
-def getpwd():
-    # This is how GCC determines the working directory. See
-    # https://gcc.gnu.org/git/?p=gcc.git;a=blob;f=libiberty/getpwd.c;hb=HEAD
+async def post_process_vmlinux(vmlinux: str, **kwds: Any) -> None:
+    logger.info("removing relocations from %r", vmlinux)
+    await check_call(
+        "objcopy", "--remove-relocations=*", vmlinux, vmlinux + ".norel", **kwds
+    )
+    await compress_file(vmlinux + ".norel", vmlinux + ".zst")
+
+
+def getpwd() -> str:
+    """
+    Get the current working directory in the same way that GCC does. See
+    https://gcc.gnu.org/git/?p=gcc.git;a=blob;f=libiberty/getpwd.c;hb=HEAD.
+    """
     try:
         pwd = os.environ["PWD"]
         if pwd.startswith("/"):
@@ -200,13 +188,21 @@ def getpwd():
     return os.getcwd()
 
 
-async def build_kernel(commit, build_dir, log_file):
+async def build_kernel(
+    commit: str, build_dir: str, log_file: TextIO
+) -> Tuple[str, str]:
+    """
+    Returns built kernel release (i.e., `uname -r`) and image name (e.g.,
+    `arch/x86/boot/bzImage`).
+    """
     await check_call(
         "git", "checkout", commit, stdout=log_file, stderr=asyncio.subprocess.STDOUT
     )
 
-    with open(os.path.join(build_dir, ".config"), "w") as config_file:
-        config_file.write(DEFCONFIG)
+    shutil.copy(
+        os.path.join(os.path.dirname(__file__), "config"),
+        os.path.join(build_dir, ".config"),
+    )
 
     logger.info("building %s", commit)
     start = time.monotonic()
@@ -218,7 +214,7 @@ async def build_kernel(commit, build_dir, log_file):
         "KCFLAGS=" + cflags,
         "O=" + build_dir,
         "-j",
-        str(multiprocessing.cpu_count()),
+        str(nproc()),
     ]
     await check_call(
         "make",
@@ -234,20 +230,21 @@ async def build_kernel(commit, build_dir, log_file):
     vmlinux = os.path.join(build_dir, "vmlinux")
     release, image_name = (
         await asyncio.gather(
-            compress_file(
-                vmlinux,
-                vmlinux + ".zst",
-                stdout=log_file,
-                stderr=asyncio.subprocess.STDOUT,
+            post_process_vmlinux(
+                vmlinux, stdout=log_file, stderr=asyncio.subprocess.STDOUT
             ),
             check_output("make", *kbuild_args, "-s", "kernelrelease", stderr=log_file),
             check_output("make", *kbuild_args, "-s", "image_name", stderr=log_file),
         )
     )[1:]
-    return build_dir, release.decode().strip(), image_name.decode().strip()
+    return release.decode().strip(), image_name.decode().strip()
 
 
-async def try_build_kernel(commit):
+async def try_build_kernel(commit: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Returns build directory, kernel release, and image name on success, None on
+    error.
+    """
     proc = await asyncio.create_subprocess_exec(
         "git",
         "rev-parse",
@@ -267,7 +264,8 @@ async def try_build_kernel(commit):
         os.mkdir(build_dir, 0o755)
         with open(log_path, "w") as log_file:
             try:
-                return await build_kernel(commit, build_dir, log_file)
+                release, image_name = await build_kernel(commit, build_dir, log_file)
+                return build_dir, release, image_name
             except Exception:
                 logger.exception("building %s failed; see %r", commit, log_path)
                 return None
@@ -279,12 +277,12 @@ async def try_build_kernel(commit):
 class Uploader:
     CHUNK_SIZE = 8 * 1024 * 1024
 
-    def __init__(self, http_client, token):
+    def __init__(self, http_client: aiohttp.ClientSession, token: str) -> None:
         self._http_client = http_client
         self._token = token
-        self._pending = []
+        self._pending: List[Tuple[str, asyncio.Task[bool]]] = []
 
-    async def _upload_file_obj(self, file, commit):
+    async def _upload_file_obj(self, file: BinaryIO, commit: Dict[str, Any]) -> None:
         headers = {
             "Authorization": "Bearer " + self._token,
             "Content-Type": "application/octet-stream",
@@ -320,7 +318,9 @@ class Uploader:
             if last:
                 break
 
-    async def _try_upload_file_obj(self, file, commit):
+    async def _try_upload_file_obj(
+        self, file: BinaryIO, commit: Dict[str, Any]
+    ) -> bool:
         try:
             logger.info("uploading %r", commit["path"])
             start = time.monotonic()
@@ -332,7 +332,7 @@ class Uploader:
             logger.exception("uploading %r failed", commit["path"])
             return False
 
-    async def _try_upload_file(self, path, commit):
+    async def _try_upload_file(self, path: str, commit: Dict[str, Any]) -> bool:
         try:
             logger.info("uploading %r to %r", path, commit["path"])
             start = time.monotonic()
@@ -351,25 +351,31 @@ class Uploader:
             return False
 
     @staticmethod
-    def _make_commit(dst_path, *, mode=None, autorename=None):
-        commit = {"path": dst_path}
+    def _make_commit(
+        dst_path: str, *, mode: Optional[str] = None, autorename: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        commit: Dict[str, Any] = {"path": dst_path}
         if mode is not None:
             commit["mode"] = mode
         if autorename is not None:
             commit["autorename"] = autorename
         return commit
 
-    def queue_file_obj(self, file, *args, **kwds):
+    def queue_file_obj(self, file: BinaryIO, *args: Any, **kwds: Any) -> None:
         commit = self._make_commit(*args, **kwds)
         task = asyncio.create_task(self._try_upload_file_obj(file, commit))
         self._pending.append((commit["path"], task))
 
-    def queue_file(self, src_path, *args, **kwds):
+    def queue_file(self, src_path: str, *args: Any, **kwds: Any) -> None:
         commit = self._make_commit(*args, **kwds)
         task = asyncio.create_task(self._try_upload_file(src_path, commit))
         self._pending.append((commit["path"], task))
 
-    async def wait(self):
+    async def wait(self) -> Tuple[List[str], List[str]]:
+        """
+        Returns list of successfully uploaded paths and list of paths that
+        failed to upload.
+        """
         succeeded = []
         failed = []
         for path, task in self._pending:
@@ -381,10 +387,16 @@ class Uploader:
         return succeeded, failed
 
 
-# The Dropbox API doesn't provide a way to get the links for entries inside of
-# a shared folder, so we're forced to scrape them from the webpage and XHR
-# endpoint.
-async def list_shared_folder(http_client, url):
+async def list_shared_folder(
+    http_client: aiohttp.ClientSession, url: str
+) -> AsyncGenerator[Tuple[str, bool, str], None]:
+    """
+    List a Dropbox shared folder. The Dropbox API doesn't provide a way to get
+    the links for entries inside of a shared folder, so we're forced to scrape
+    them from the webpage and XHR endpoint.
+
+    Generates filename, whether it is a directory, and its shared link.
+    """
     method = "GET"
     data = None
     while True:
@@ -394,6 +406,7 @@ async def list_shared_folder(http_client, url):
                 match = re.search(
                     r'"\{\\"shared_link_infos\\".*[^\\]\}"', (await resp.text())
                 )
+                assert match
                 obj = json.loads(json.loads(match.group()))
             else:
                 await raise_for_status_body(resp)
@@ -406,16 +419,23 @@ async def list_shared_folder(http_client, url):
             method = "POST"
             url = "https://www.dropbox.com/list_shared_link_folder_entries"
             data = {
-                "t": http_client.cookie_jar.filter_cookies(url)["t"].value,
+                "t": http_client.cookie_jar.filter_cookies(URL(url))["t"].value,
                 "link_key": obj["folder_share_token"]["linkKey"],
                 "link_type": obj["folder_share_token"]["linkType"],
                 "secure_hash": obj["folder_share_token"]["secureHash"],
                 "sub_path": obj["folder_share_token"]["subPath"],
             }
+        assert data is not None
         data["voucher"] = obj["next_request_voucher"]
 
 
-async def walk_shared_folder(http_client, url):
+async def walk_shared_folder(
+    http_client: aiohttp.ClientSession, url: str
+) -> AsyncGenerator[Tuple[str, List[Tuple[str, str]], List[Tuple[str, str]]], None]:
+    """
+    Walk a Dropbox shared folder, similar to os.walk(). Generates path, list of
+    files and their shared links, and list of folders and their shared links.
+    """
     stack = [("", url)]
     while stack:
         path, url = stack.pop()
@@ -432,7 +452,7 @@ async def walk_shared_folder(http_client, url):
         stack.extend((path + filename, href) for filename, href in dirs)
 
 
-def make_download_url(url):
+def make_download_url(url: str) -> str:
     parsed = urllib.parse.urlsplit(url)
     query = [
         (name, value)
@@ -443,7 +463,9 @@ def make_download_url(url):
     return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query)))
 
 
-async def update_index(http_client, token, uploader):
+async def update_index(
+    http_client: aiohttp.ClientSession, token: str, uploader: Uploader
+) -> bool:
     try:
         logger.info("finding shared folder link")
         headers = {"Authorization": "Bearer " + token}
@@ -505,7 +527,7 @@ async def update_index(http_client, token, uploader):
         return False
 
 
-async def main():
+async def main() -> None:
     logging.basicConfig(
         format="%(asctime)s:%(levelname)s:%(name)s:%(message)s", level=logging.INFO
     )
@@ -551,7 +573,7 @@ async def main():
     ):
         sys.exit("-b/-k must be run from linux.git")
 
-    if args.upload or args.upload_files or args.index:
+    if args.build_kernel_org or args.upload or args.upload_files or args.index:
         if os.isatty(sys.stdin.fileno()):
             dropbox_token = getpass.getpass("Enter Dropbox app API token: ")
         else:
@@ -564,21 +586,37 @@ async def main():
 
     async with aiohttp.ClientSession(trust_env=True) as http_client:
         # dict rather than set to preserve insertion order.
-        to_build = {build: True for build in (args.build or ())}
+        to_build = dict.fromkeys(args.build or ())
         if args.build_kernel_org:
+            localversion = get_current_localversion()
+            logger.info("current localversion: %s", localversion)
             try:
+                # In this context, "version" is a tag name without the "v"
+                # prefix and "release" is a uname release string.
                 logger.info(
-                    "getting list of kernel.org releases and available releases"
+                    "getting list of kernel.org versions and available releases"
                 )
                 kernel_org, available = await asyncio.gather(
-                    get_kernel_org_releases(http_client),
+                    get_kernel_org_versions(http_client),
                     get_available_kernel_releases(http_client, dropbox_token),
                 )
-                logger.info("kernel.org releases: %s", ", ".join(kernel_org))
+                logger.info("kernel.org versions: %s", ", ".join(kernel_org))
                 logger.info("available releases: %s", ", ".join(sorted(available)))
-                for kernel in kernel_org:
-                    if kernel not in available:
-                        to_build[kernel] = True
+                for version in kernel_org:
+                    match = re.fullmatch(r"(\d+\.\d+)(\.\d+)?(-rc\d+)?", version)
+                    if not match:
+                        logger.error("couldn't parse kernel.org version %r", version)
+                        sys.exit(1)
+                    release = "".join(
+                        [
+                            match.group(1),
+                            match.group(2) or ".0",
+                            match.group(3) or "",
+                            localversion,
+                        ]
+                    )
+                    if release not in available:
+                        to_build["v" + version] = None
             except Exception:
                 logger.exception(
                     "failed to get kernel.org releases and/or available releases"
