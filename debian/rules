@@ -2,3 +2,17 @@
 
 %:
 	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_test:
+	#
+	# Don't run drgn's tests during the build step; The repo comes
+	# with its own testing that takes place elsewhere ->
+	# https://travis-ci.org/github/delphix/drgn/branches
+	#
+	# Ideally it wouldn't hurt having them run here too but due to
+	# drgn's testing setup, we'd have to override pybuild's default
+	# behavior. Since drgn is not a project that is owned by us,
+	# disabling tests here makes even more sense as we won't have
+	# to adjust the setup here every time a change in the test
+	# framework of drgn is applied upstream.
+	#
