@@ -1,4 +1,4 @@
-// Copyright 2018-2019 - Omar Sandoval
+// Copyright 2018-2020 - Omar Sandoval
 // SPDX-License-Identifier: GPL-3.0+
 
 #include <dirent.h>
@@ -58,6 +58,7 @@ struct drgn_error *parse_vmcoreinfo(const char *desc, size_t descsz,
 	ret->osrelease[0] = '\0';
 	ret->page_size = 0;
 	ret->kaslr_offset = 0;
+	ret->pgtable_l5_enabled = false;
 	while (line < end) {
 		const char *newline;
 
@@ -82,6 +83,13 @@ struct drgn_error *parse_vmcoreinfo(const char *desc, size_t descsz,
 					  &ret->kaslr_offset);
 			if (err)
 				return err;
+		} else if (linematch(&line, "NUMBER(pgtable_l5_enabled)=")) {
+			uint64_t tmp;
+
+			err = line_to_u64(line, newline, 0, &tmp);
+			if (err)
+				return err;
+			ret->pgtable_l5_enabled = tmp;
 		}
 		line = newline + 1;
 	}
@@ -93,7 +101,7 @@ struct drgn_error *parse_vmcoreinfo(const char *desc, size_t descsz,
 		return drgn_error_create(DRGN_ERROR_OTHER,
 					 "VMCOREINFO does not contain valid PAGESIZE");
 	}
-	/* KERNELOFFSET is optional. */
+	/* KERNELOFFSET and pgtable_l5_enabled are optional. */
 	return NULL;
 }
 
@@ -227,10 +235,10 @@ out:
 	return err;
 }
 
-struct drgn_error *
-vmcoreinfo_object_find(const char *name, size_t name_len, const char *filename,
-		       enum drgn_find_object_flags flags, void *arg,
-		       struct drgn_object *ret)
+struct drgn_error *linux_kernel_object_find(const char *name, size_t name_len,
+					    const char *filename,
+					    enum drgn_find_object_flags flags,
+					    void *arg, struct drgn_object *ret)
 {
 	struct drgn_error *err;
 	struct drgn_program *prog = arg;
@@ -238,8 +246,29 @@ vmcoreinfo_object_find(const char *name, size_t name_len, const char *filename,
 	if (!filename && (flags & DRGN_FIND_OBJECT_CONSTANT)) {
 		struct drgn_qualified_type qualified_type = {};
 
-		if (name_len == strlen("PAGE_SHIFT") &&
-		    memcmp(name, "PAGE_SHIFT", name_len) == 0) {
+		if (name_len == strlen("PAGE_OFFSET") &&
+		    memcmp(name, "PAGE_OFFSET", name_len) == 0) {
+			if (!prog->page_offset) {
+				if (!prog->has_platform ||
+				    !prog->platform.arch->linux_kernel_get_page_offset)
+					return &drgn_not_found;
+				err = prog->platform.arch->linux_kernel_get_page_offset(prog,
+											&prog->page_offset);
+				if (err) {
+					prog->page_offset = 0;
+					return err;
+				}
+			}
+
+			err = drgn_type_index_find_primitive(&prog->tindex,
+							     DRGN_C_TYPE_UNSIGNED_LONG,
+							     &qualified_type.type);
+			if (err)
+				return err;
+			return drgn_object_set_unsigned(ret, qualified_type,
+							prog->page_offset, 0);
+		} else if (name_len == strlen("PAGE_SHIFT") &&
+			   memcmp(name, "PAGE_SHIFT", name_len) == 0) {
 			err = drgn_type_index_find_primitive(&prog->tindex,
 							     DRGN_C_TYPE_INT,
 							     &qualified_type.type);
@@ -289,6 +318,26 @@ vmcoreinfo_object_find(const char *name, size_t name_len, const char *filename,
 						      prog->vmcoreinfo.osrelease,
 						      0, 0,
 						      DRGN_PROGRAM_ENDIAN);
+		} else if (name_len == strlen("vmemmap") &&
+			   memcmp(name, "vmemmap", name_len) == 0) {
+			if (!prog->vmemmap) {
+				if (!prog->has_platform ||
+				    !prog->platform.arch->linux_kernel_get_vmemmap)
+					return &drgn_not_found;
+				err = prog->platform.arch->linux_kernel_get_vmemmap(prog,
+										    &prog->vmemmap);
+				if (err) {
+					prog->vmemmap = 0;
+					return err;
+				}
+			}
+
+			err = drgn_program_find_type(prog, "struct page *",
+						     NULL, &qualified_type);
+			if (err)
+				return err;
+			return drgn_object_set_unsigned(ret, qualified_type,
+							prog->vmemmap, 0);
 		}
 	}
 	return &drgn_not_found;

@@ -1,4 +1,4 @@
-# Copyright 2018-2019 - Omar Sandoval
+# Copyright 2018-2020 - Omar Sandoval
 # SPDX-License-Identifier: GPL-3.0+
 
 """
@@ -10,10 +10,12 @@ Linux memory management (MM) subsystem. Only x86-64 support is currently
 implemented.
 """
 
+from _drgn import _linux_helper_pgtable_l5_enabled
 from drgn import Object, cast
 
 
 __all__ = (
+    "pgtable_l5_enabled",
     "for_each_page",
     "page_to_pfn",
     "page_to_virt",
@@ -24,22 +26,13 @@ __all__ = (
 )
 
 
-def _vmemmap(prog):
-    try:
-        # KASAN
-        return cast("struct page *", prog["vmemmap_base"])
-    except KeyError:
-        # x86-64
-        return Object(prog, "struct page *", value=0xFFFFEA0000000000)
+def pgtable_l5_enabled(prog):
+    """
+    .. c:function:: bool pgtable_l5_enabled(void)
 
-
-def _page_offset(prog):
-    try:
-        # KASAN
-        return prog["page_offset_base"].value_()
-    except KeyError:
-        # x86-64
-        return 0xFFFF880000000000
+    Return whether 5-level paging is enabled.
+    """
+    return _linux_helper_pgtable_l5_enabled(prog)
 
 
 def for_each_page(prog):
@@ -48,7 +41,7 @@ def for_each_page(prog):
 
     :return: Iterator of ``struct page *`` objects.
     """
-    vmemmap = _vmemmap(prog)
+    vmemmap = prog["vmemmap"]
     for i in range(prog["max_pfn"]):
         yield vmemmap + i
 
@@ -59,7 +52,7 @@ def page_to_pfn(page):
 
     Get the page frame number (PFN) of a page.
     """
-    return cast("unsigned long", page - _vmemmap(page.prog_))
+    return cast("unsigned long", page - page.prog_["vmemmap"])
 
 
 def pfn_to_page(prog_or_pfn, pfn=None):
@@ -74,7 +67,7 @@ def pfn_to_page(prog_or_pfn, pfn=None):
         pfn = prog_or_pfn
     else:
         prog = prog_or_pfn
-    return _vmemmap(prog) + pfn
+    return prog["vmemmap"] + pfn
 
 
 def virt_to_pfn(prog_or_addr, addr=None):
@@ -90,7 +83,7 @@ def virt_to_pfn(prog_or_addr, addr=None):
         addr = prog_or_addr.value_()
     else:
         prog = prog_or_addr
-    return Object(prog, "unsigned long", value=(addr - _page_offset(prog)) >> 12)
+    return Object(prog, "unsigned long", value=(addr - prog["PAGE_OFFSET"]) >> 12)
 
 
 def pfn_to_virt(prog_or_pfn, pfn=None):
@@ -106,7 +99,7 @@ def pfn_to_virt(prog_or_pfn, pfn=None):
         pfn = prog_or_pfn.value_()
     else:
         prog = prog_or_pfn
-    return Object(prog, "void *", value=(pfn << 12) + _page_offset(prog))
+    return Object(prog, "void *", value=(pfn << 12) + prog["PAGE_OFFSET"])
 
 
 def page_to_virt(page):
