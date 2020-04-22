@@ -203,7 +203,7 @@ class Program:
         ...
     def pointer_type(
         self,
-        type: Type,
+        type: Union[str, Type],
         qualifiers: Optional[Qualifiers] = None,
         *,
         language: Optional[Language] = None,
@@ -679,7 +679,7 @@ class Object:
         :param name: Attribute name.
         """
         ...
-    def __getitem__(self, idx: int) -> Object:
+    def __getitem__(self, idx: Union[int, Object]) -> Object:
         """
         Implement ``self[idx]``. Get the array element at the given index.
 
@@ -961,7 +961,6 @@ def container_of(ptr: Object, type: Union[str, Type], member: str) -> Object:
 
     :param ptr: The pointer.
     :param type: The type of the containing object.
-    :type type: str or Type
     :param member: The name of the member in ``type``.
     :raises TypeError: if the object is not a pointer or the type is not a
         structure, union, or class type
