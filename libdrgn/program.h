@@ -62,7 +62,6 @@ struct drgn_program {
 	struct drgn_type_index tindex;
 	struct drgn_object_index oindex;
 	struct drgn_memory_file_segment *file_segments;
-	size_t num_file_segments;
 	/* Default language of the program. */
 	const struct drgn_language *lang;
 	/*
@@ -142,6 +141,16 @@ static inline bool drgn_program_is_little_endian(struct drgn_program *prog)
 {
 	assert(prog->has_platform);
 	return prog->platform.flags & DRGN_PLATFORM_IS_LITTLE_ENDIAN;
+}
+
+/**
+ * Return whether a @ref drgn_program has a different endianness than the host
+ * system.
+ */
+static inline bool drgn_program_bswap(struct drgn_program *prog)
+{
+	return (drgn_program_is_little_endian(prog) !=
+		(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__));
 }
 
 static inline bool drgn_program_is_64_bit(struct drgn_program *prog)

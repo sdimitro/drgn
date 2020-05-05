@@ -189,9 +189,8 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 	struct drgn_platform platform;
 	bool is_64_bit, is_kdump;
 	size_t phnum, i;
-	size_t num_file_segments;
+	size_t num_file_segments, j;
 	bool have_non_zero_phys_addr = false;
-	struct drgn_memory_file_segment *current_file_segment;
 	const char *vmcoreinfo_note = NULL;
 	size_t vmcoreinfo_size = 0;
 	bool have_nt_taskstruct = false, is_proc_kcore;
@@ -339,11 +338,9 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 		err = &drgn_enomem;
 		goto out_elf;
 	}
-	prog->num_file_segments = num_file_segments;
-	current_file_segment = prog->file_segments;
 
 	/* Second pass: add the segments. */
-	for (i = 0; i < phnum; i++) {
+	for (i = 0, j = 0; i < phnum && j < num_file_segments; i++) {
 		GElf_Phdr phdr_mem, *phdr;
 
 		phdr = gelf_getphdr(prog->core, i, &phdr_mem);
@@ -352,41 +349,32 @@ drgn_program_set_core_dump(struct drgn_program *prog, const char *path)
 			goto out_segments;
 		}
 
-		if (phdr->p_type == PT_LOAD) {
-			/*
-			 * If this happens, then the number of segments changed
-			 * since the first pass. That's probably impossible, but
-			 * skip it just in case.
-			 */
-			if (current_file_segment ==
-			    prog->file_segments + prog->num_file_segments)
-				continue;
-			current_file_segment->file_offset = phdr->p_offset;
-			current_file_segment->file_size = phdr->p_filesz;
-			current_file_segment->fd = prog->core_fd;
-			current_file_segment->eio_is_fault = false;
+		if (phdr->p_type != PT_LOAD)
+			continue;
+
+		prog->file_segments[j].file_offset = phdr->p_offset;
+		prog->file_segments[j].file_size = phdr->p_filesz;
+		prog->file_segments[j].fd = prog->core_fd;
+		prog->file_segments[j].eio_is_fault = false;
+		err = drgn_program_add_memory_segment(prog, phdr->p_vaddr,
+						      phdr->p_memsz,
+						      drgn_read_memory_file,
+						      &prog->file_segments[j],
+						      false);
+		if (err)
+			goto out_segments;
+		if (have_non_zero_phys_addr &&
+		    phdr->p_paddr != (is_64_bit ? UINT64_MAX : UINT32_MAX)) {
 			err = drgn_program_add_memory_segment(prog,
-							      phdr->p_vaddr,
+							      phdr->p_paddr,
 							      phdr->p_memsz,
 							      drgn_read_memory_file,
-							      current_file_segment,
-							      false);
+							      &prog->file_segments[j],
+							      true);
 			if (err)
 				goto out_segments;
-			if (have_non_zero_phys_addr &&
-			    phdr->p_paddr !=
-			    (is_64_bit ? UINT64_MAX : UINT32_MAX)) {
-				err = drgn_program_add_memory_segment(prog,
-								      phdr->p_paddr,
-								      phdr->p_memsz,
-								      drgn_read_memory_file,
-								      current_file_segment,
-								      true);
-				if (err)
-					goto out_segments;
-			}
-			current_file_segment++;
 		}
+		j++;
 	}
 	if (vmcoreinfo_note) {
 		err = parse_vmcoreinfo(vmcoreinfo_note, vmcoreinfo_size,
@@ -428,7 +416,6 @@ out_segments:
 	drgn_memory_reader_init(&prog->reader);
 	free(prog->file_segments);
 	prog->file_segments = NULL;
-	prog->num_file_segments = 0;
 out_elf:
 	elf_end(prog->core);
 	prog->core = NULL;
@@ -468,7 +455,6 @@ drgn_program_set_pid(struct drgn_program *prog, pid_t pid)
 	prog->file_segments[0].file_size = UINT64_MAX;
 	prog->file_segments[0].fd = prog->core_fd;
 	prog->file_segments[0].eio_is_fault = true;
-	prog->num_file_segments = 1;
 	err = drgn_program_add_memory_segment(prog, 0, UINT64_MAX,
 					      drgn_read_memory_file,
 					      prog->file_segments, false);
@@ -485,7 +471,6 @@ out_segments:
 	drgn_memory_reader_init(&prog->reader);
 	free(prog->file_segments);
 	prog->file_segments = NULL;
-	prog->num_file_segments = 0;
 out_fd:
 	close(prog->core_fd);
 	prog->core_fd = -1;
@@ -700,17 +685,14 @@ struct drgn_error *drgn_program_cache_prstatus_entry(struct drgn_program *prog,
 	struct drgn_prstatus_map_entry entry;
 	size_t pr_pid_offset;
 	uint32_t pr_pid;
-	bool bswap;
 
 	pr_pid_offset = drgn_program_is_64_bit(prog) ? 32 : 24;
-	bswap = (drgn_program_is_little_endian(prog) !=
-		 (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__));
 
 	if (size < pr_pid_offset + sizeof(pr_pid))
 		return NULL;
 
 	memcpy(&pr_pid, data + pr_pid_offset, sizeof(pr_pid));
-	if (bswap)
+	if (drgn_program_bswap(prog))
 		pr_pid = bswap_32(pr_pid);
 	if (!pr_pid)
 		return NULL;
@@ -954,6 +936,73 @@ drgn_program_read_c_string(struct drgn_program *prog, uint64_t address,
 	}
 	char_vector_shrink_to_fit(&str);
 	*ret = str.data;
+	return NULL;
+}
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_program_read_u8(struct drgn_program *prog, uint64_t address, bool physical,
+		     uint8_t *ret)
+{
+	return drgn_memory_reader_read(&prog->reader, ret, address,
+				       sizeof(*ret), physical);
+}
+
+#define DEFINE_PROGRAM_READ_U(n)						\
+LIBDRGN_PUBLIC struct drgn_error *						\
+drgn_program_read_u##n(struct drgn_program *prog, uint64_t address,		\
+		       bool physical, uint##n##_t *ret)				\
+{										\
+	struct drgn_error *err;							\
+	uint##n##_t tmp;							\
+										\
+	if (!prog->has_platform) {						\
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,		\
+					 "program byte order is not known");	\
+	}									\
+	err = drgn_memory_reader_read(&prog->reader, &tmp, address,		\
+				      sizeof(tmp), physical);			\
+	if (err)								\
+		return err;							\
+	if (drgn_program_bswap(prog))						\
+		tmp = bswap_##n(tmp);						\
+	*ret = tmp;								\
+	return NULL;								\
+}
+
+DEFINE_PROGRAM_READ_U(16)
+DEFINE_PROGRAM_READ_U(32)
+DEFINE_PROGRAM_READ_U(64)
+#undef DEFINE_PROGRAM_READ_U
+
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_program_read_word(struct drgn_program *prog, uint64_t address,
+		       bool physical, uint64_t *ret)
+{
+	struct drgn_error *err;
+
+	if (!prog->has_platform) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "program word size is not known");
+	}
+	if (drgn_program_is_64_bit(prog)) {
+		uint64_t tmp;
+		err = drgn_memory_reader_read(&prog->reader, &tmp, address,
+					      sizeof(tmp), physical);
+		if (err)
+			return err;
+		if (drgn_program_bswap(prog))
+			tmp = bswap_64(tmp);
+		*ret = tmp;
+	} else {
+		uint32_t tmp;
+		err = drgn_memory_reader_read(&prog->reader, &tmp, address,
+					      sizeof(tmp), physical);
+		if (err)
+			return err;
+		if (drgn_program_bswap(prog))
+			tmp = bswap_32(tmp);
+		*ret = tmp;
+	}
 	return NULL;
 }
 
