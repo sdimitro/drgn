@@ -268,7 +268,7 @@ static void drgn_value_deserialize(union drgn_value *value, const char *buf,
 		value->fvalue = bit_size == 32 ? tmp.fvalue32 : tmp.fvalue64;
 		break;
 	default:
-		DRGN_UNREACHABLE();
+		UNREACHABLE();
 	}
 }
 
@@ -2236,7 +2236,7 @@ INTEGER_BINARY_OP(xor, ^)
 	uint64_t _bit_size = (bit_size);					\
 	union {									\
 		int64_t svalue;							\
-		int64_t uvalue;							\
+		uint64_t uvalue;						\
 	} tmp;									\
 										\
 	_err = drgn_object_convert_signed((obj), _bit_size, &tmp.svalue);	\

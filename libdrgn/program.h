@@ -47,7 +47,9 @@ struct vmcoreinfo {
 	 * is enabled.
 	 */
 	uint64_t kaslr_offset;
-	/* Whether 5-level paging was enabled. */
+	/** Kernel page table. */
+	uint64_t swapper_pg_dir;
+	/** Whether 5-level paging was enabled. */
 	bool pgtable_l5_enabled;
 };
 
@@ -99,7 +101,14 @@ struct drgn_program {
 	bool has_platform;
 	bool attached_dwfl_state;
 	bool prstatus_cached;
+	/*
+	 * Whether @ref drgn_program::pgtable_it is currently being used. Used
+	 * to prevent address translation from recursing.
+	 */
+	bool pgtable_it_in_use;
 
+	/* Page table iterator for linux_helper_read_vm(). */
+	struct pgtable_iterator *pgtable_it;
 	/* Cache for @ref linux_helper_task_state_to_char(). */
 	char *task_state_chars;
 	uint64_t task_report;

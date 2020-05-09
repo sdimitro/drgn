@@ -14,9 +14,19 @@
 
 #include "internal.h"
 #include "dwarf_index.h"
+#include "helpers.h"
 #include "linux_kernel.h"
 #include "program.h"
 #include "read.h"
+
+struct drgn_error *read_memory_via_pgtable(void *buf, uint64_t address,
+					   size_t count, uint64_t offset,
+					   void *arg, bool physical)
+{
+	struct drgn_program *prog = arg;
+	return linux_helper_read_vm(prog, prog->vmcoreinfo.swapper_pg_dir,
+				    address, buf, count);
+}
 
 static inline bool linematch(const char **line, const char *prefix)
 {
@@ -83,6 +93,11 @@ struct drgn_error *parse_vmcoreinfo(const char *desc, size_t descsz,
 					  &ret->kaslr_offset);
 			if (err)
 				return err;
+		} else if (linematch(&line, "SYMBOL(swapper_pg_dir)=")) {
+			err = line_to_u64(line, newline, 16,
+					  &ret->swapper_pg_dir);
+			if (err)
+				return err;
 		} else if (linematch(&line, "NUMBER(pgtable_l5_enabled)=")) {
 			uint64_t tmp;
 
@@ -100,6 +115,10 @@ struct drgn_error *parse_vmcoreinfo(const char *desc, size_t descsz,
 	if (!ret->page_size) {
 		return drgn_error_create(DRGN_ERROR_OTHER,
 					 "VMCOREINFO does not contain valid PAGESIZE");
+	}
+	if (!ret->swapper_pg_dir) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "VMCOREINFO does not contain valid swapper_pg_dir");
 	}
 	/* KERNELOFFSET and pgtable_l5_enabled are optional. */
 	return NULL;
