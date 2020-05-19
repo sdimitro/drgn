@@ -42,16 +42,6 @@ from tests import (
 
 
 class TestInit(ObjectTestCase):
-    def test_reinit(self):
-        obj = Object(self.prog, "int", value=1)
-        self.assertEqual(obj.value_(), 1)
-        obj.__init__(self.prog, value=2)
-        self.assertEqual(obj.value_(), 2)
-        prog = mock_program()
-        self.assertRaisesRegex(
-            ValueError, "cannot change object program", obj.__init__, prog, value=3
-        )
-
     def test_type_stays_alive(self):
         obj = Object(self.prog, int_type("int", 4, True), value=0)
         self.assertEqual(obj.type_, int_type("int", 4, True))
@@ -79,6 +69,15 @@ class TestInit(ObjectTestCase):
             Object,
             self.prog,
             "int",
+        )
+        self.assertRaisesRegex(
+            ValueError,
+            "object cannot have address and value",
+            Object,
+            self.prog,
+            "int",
+            0,
+            address=0,
         )
         self.assertRaisesRegex(
             ValueError,
@@ -373,6 +372,9 @@ class TestReference(ObjectTestCase):
 
 
 class TestValue(ObjectTestCase):
+    def test_positional(self):
+        self.assertEqual(Object(self.prog, "int", 1), Object(self.prog, "int", value=1))
+
     def test_signed(self):
         obj = Object(self.prog, "int", value=-4)
         self.assertIs(obj.prog_, self.prog)
