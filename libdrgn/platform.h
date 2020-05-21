@@ -13,17 +13,6 @@ struct drgn_register {
 	enum drgn_register_number number;
 };
 
-/* Register in NT_PRSTATUS note or struct pt_regs used for stack unwinding. */
-struct drgn_frame_register {
-	enum drgn_register_number number;
-	size_t size;
-	size_t prstatus_offset;
-	/* Name used in the kernel. */
-	const char *pt_regs_name;
-	/* Name used for the UAPI, if different from above. */
-	const char *pt_regs_name2;
-};
-
 /* Page table iterator. */
 struct pgtable_iterator {
 	struct drgn_program *prog;
@@ -69,10 +58,42 @@ struct drgn_architecture_info {
 	const struct drgn_register *registers;
 	size_t num_registers;
 	const struct drgn_register *(*register_by_name)(const char *name);
-	const struct drgn_frame_register *frame_registers;
-	size_t num_frame_registers;
+	/* Given pt_regs as a value buffer object. */
+	struct drgn_error *(*pt_regs_set_initial_registers)(Dwfl_Thread *,
+							    const struct drgn_object *);
+	struct drgn_error *(*prstatus_set_initial_registers)(struct drgn_program *,
+							     Dwfl_Thread *,
+							     const void *,
+							     size_t);
+	/*
+	 * Get a task's registers from the task_struct or PRSTATUS note as
+	 * appropriate.
+	 *
+	 * The given PRSTATUS note is for the CPU that the task is assigned to,
+	 * which may or may not be for the given task. This callback must
+	 * determine that (typically by checking whether the stack pointer in
+	 * PRSTATUS lies within the task's stack).
+	 *
+	 * We find the PRSTATUS note by CPU rather than by PID for two reasons:
+	 *
+	 * 1. The PID is populated by the kernel from "current" (the current
+	 *    task) via a non-maskable interrupt (NMI). During a context switch,
+	 *    the stack pointer and current are not updated atomically, so if
+	 *    the NMI arrives in the middle of a context switch, the stack
+	 *    pointer may not actually be that of current. Therefore, the stack
+	 *    pointer in PRSTATUS may not actually be for the PID in PRSTATUS.
+	 *
+	 *    We go through all of this trouble because blindly trusting the PID
+	 *    could result in a stack trace for the wrong task, which we want to
+	 *    avoid at all costs.
+	 *
+	 * 2. There is an idle task with PID 0 for each CPU, so for an idle task
+	 *    we have no choice but to find the note by CPU.
+	 */
 	struct drgn_error *(*linux_kernel_set_initial_registers)(Dwfl_Thread *,
-								 const struct drgn_object *);
+								 const struct drgn_object *,
+								 const void *prstatus,
+								 size_t prstatus_size);
 	struct drgn_error *(*linux_kernel_get_page_offset)(struct drgn_program *,
 							   uint64_t *);
 	struct drgn_error *(*linux_kernel_get_vmemmap)(struct drgn_program *,
