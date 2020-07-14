@@ -104,7 +104,7 @@ drgn_object_set_common(struct drgn_qualified_type qualified_type,
 	return drgn_object_type_kind_and_size(type_ret, kind_ret, bit_size_ret);
 }
 
-static struct drgn_error *
+struct drgn_error *
 drgn_object_set_signed_internal(struct drgn_object *res,
 				const struct drgn_object_type *type,
 				uint64_t bit_size, int64_t svalue)
@@ -140,7 +140,7 @@ drgn_object_set_signed(struct drgn_object *res,
 	return drgn_object_set_signed_internal(res, &type, bit_size, svalue);
 }
 
-static struct drgn_error *
+struct drgn_error *
 drgn_object_set_unsigned_internal(struct drgn_object *res,
 				  const struct drgn_object_type *type,
 				  uint64_t bit_size, uint64_t uvalue)
@@ -244,7 +244,7 @@ struct drgn_error *sanity_check_object(enum drgn_object_kind kind,
 	}
 }
 
-static void drgn_value_deserialize(union drgn_value *value, const char *buf,
+static void drgn_value_deserialize(union drgn_value *value, const void *buf,
 				   uint8_t bit_offset,
 				   enum drgn_object_kind kind,
 				   uint64_t bit_size, bool little_endian)
@@ -296,11 +296,11 @@ drgn_byte_order_to_little_endian(struct drgn_program *prog,
 	}
 }
 
-static struct drgn_error *
+struct drgn_error *
 drgn_object_set_buffer_internal(struct drgn_object *res,
 				const struct drgn_object_type *type,
 				enum drgn_object_kind kind, uint64_t bit_size,
-				const char *buf, uint8_t bit_offset,
+				const void *buf, uint8_t bit_offset,
 				bool little_endian)
 {
 	struct drgn_error *err;
@@ -352,7 +352,7 @@ drgn_object_set_buffer_internal(struct drgn_object *res,
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_object_set_buffer(struct drgn_object *res,
 		       struct drgn_qualified_type qualified_type,
-		       const char *buf, uint8_t bit_offset,
+		       const void *buf, uint8_t bit_offset,
 		       uint64_t bit_field_size, enum drgn_byte_order byte_order)
 {
 	struct drgn_error *err;
