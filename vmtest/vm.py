@@ -4,6 +4,7 @@
 import errno
 import os
 import os.path
+import re
 import shlex
 import shutil
 import socket
@@ -11,7 +12,6 @@ import subprocess
 import tempfile
 
 from util import nproc, out_of_date
-
 
 # Script run as init in the virtual machine. This only depends on busybox. We
 # don't assume that any regular commands are built in (not even echo or test),
@@ -141,20 +141,23 @@ class LostVMError(Exception):
 
 
 def run_in_vm(command: str, *, vmlinuz: str, build_dir: str) -> int:
-    # multidevs was added in QEMU 4.2.0.
-    if (
-        "multidevs"
-        in subprocess.run(
-            ["qemu-system-x86_64", "-help"],
-            stdout=subprocess.PIPE,
-            universal_newlines=True,
-        ).stdout
-    ):
-        multidevs = ",multidevs=remap"
-    else:
-        multidevs = ""
+    match = re.search(
+        "QEMU emulator version ([0-9]+(?:\.[0-9]+)*)",
+        subprocess.check_output(
+            ["qemu-system-x86_64", "-version"], universal_newlines=True
+        ),
+    )
+    if not match:
+        raise Exception("could not determine QEMU version")
+    qemu_version = tuple(int(x) for x in match.group(1).split("."))
 
-    onoatimehack = _build_onoatimehack(build_dir)
+    # multidevs was added in QEMU 4.2.0.
+    multidevs = ",multidevs=remap" if qemu_version >= (4, 2) else ""
+    # QEMU's 9pfs O_NOATIME handling was fixed in 5.1.0.
+    env = os.environ.copy()
+    if qemu_version < (5, 1):
+        onoatimehack_so = _build_onoatimehack(build_dir)
+        env["LD_PRELOAD"] = f"{onoatimehack_so}:{env.get('LD_PRELOAD', '')}"
 
     with tempfile.TemporaryDirectory(prefix="drgn-vmtest-") as temp_dir, socket.socket(
         socket.AF_UNIX
@@ -200,10 +203,7 @@ def run_in_vm(command: str, *, vmlinuz: str, build_dir: str) -> int:
                 f"rootfstype=9p rootflags=trans=virtio,cache=loose ro console=0,115200 panic=-1 init={init}",
                 # fmt: on
             ],
-            env={
-                **os.environ,
-                "LD_PRELOAD": f"{onoatimehack}:{os.getenv('LD_PRELOAD', '')}",
-            },
+            env=env,
         ) as qemu:
             server_sock.settimeout(5)
             try:

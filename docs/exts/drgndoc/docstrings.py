@@ -5,13 +5,12 @@
 import argparse
 import functools
 import sys
-from typing import cast
+from typing import Union, cast
 
 from drgndoc.format import Formatter
 from drgndoc.namespace import Namespace, ResolvedNode
 from drgndoc.parse import Class, DocumentedNode, Node, parse_paths
 from drgndoc.util import dot_join
-
 
 escapes = []
 for c in range(256):
@@ -42,7 +41,7 @@ for c in range(256):
     escapes.append(e)
 
 
-def escape_string(s):
+def escape_string(s: str) -> str:
     return "".join([escapes[c] for c in s.encode("utf-8")])
 
 
@@ -91,21 +90,18 @@ if __name__ == "__main__":
 
     def aux(resolved: ResolvedNode[Node], name: str) -> None:
         node = resolved.node
-        if hasattr(node, "docstring"):
+        if node.has_docstring():
             var_name = name.replace(".", "_") + "_DOC"
             if args.header:
                 output_file.write("extern ")
             output_file.write(f"const char {var_name}[]")
             if not args.header:
                 output_file.write(" =")
-                signature, lines = formatter.format(
-                    cast(ResolvedNode[DocumentedNode], resolved), rst=False
+                lines = formatter.format(
+                    cast(ResolvedNode[DocumentedNode], resolved),
+                    name.rpartition(".")[2],
+                    rst=False,
                 )
-                if signature:
-                    lines[0:0] = [
-                        name.rpartition(".")[2] + signature,
-                        "",
-                    ]
                 if lines:
                     for i, line in enumerate(lines):
                         output_file.write(f'\n\t"{escape_string(line)}')

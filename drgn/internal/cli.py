@@ -9,11 +9,12 @@ import code
 import importlib
 import os
 import os.path
-import pkg_resources
 import runpy
 import shutil
 import sys
 from typing import Any, Dict
+
+import pkg_resources
 
 import drgn
 
@@ -155,7 +156,7 @@ def main() -> None:
             if not isinstance(e, FileNotFoundError) and not args.quiet:
                 print("could not read history:", str(e), file=sys.stderr)
 
-        def write_history_file():
+        def write_history_file() -> None:
             try:
                 readline.write_history_file(histfile)
             except OSError as e:

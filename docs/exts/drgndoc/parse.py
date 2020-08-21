@@ -24,28 +24,40 @@ from drgndoc.visitor import NodeVisitor
 
 class _PreTransformer(ast.NodeTransformer):
     # Replace string forward references with the parsed expression.
-    def _visit_annotation(self, node):
+    @overload
+    def _visit_annotation(self, node: ast.expr) -> ast.expr:
+        ...
+
+    @overload
+    def _visit_annotation(self, node: None) -> None:
+        ...
+
+    def _visit_annotation(self, node: Optional[ast.expr]) -> Optional[ast.expr]:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            node = self.visit(ast.parse(node.value, "<string>", "eval"))
+            node = self.visit(
+                cast(ast.Expression, ast.parse(node.value, "<string>", "eval")).body
+            )
         return node
 
-    def visit_arg(self, node):
-        node = self.generic_visit(node)
+    def visit_arg(self, node: ast.arg) -> ast.arg:
+        node = cast(ast.arg, self.generic_visit(node))
         node.annotation = self._visit_annotation(node.annotation)
         return node
 
-    def visit_FunctionDef(self, node):
-        node = self.generic_visit(node)
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        node = cast(ast.FunctionDef, self.generic_visit(node))
         node.returns = self._visit_annotation(node.returns)
         return node
 
-    def visit_AsyncFunctionDef(self, node):
-        node = self.generic_visit(node)
+    def visit_AsyncFunctionDef(
+        self, node: ast.AsyncFunctionDef
+    ) -> ast.AsyncFunctionDef:
+        node = cast(ast.AsyncFunctionDef, self.generic_visit(node))
         node.returns = self._visit_annotation(node.returns)
         return node
 
-    def visit_AnnAssign(self, node):
-        node = self.generic_visit(node)
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+        node = cast(ast.AnnAssign, self.generic_visit(node))
         node.annotation = self._visit_annotation(node.annotation)
         return node
 
@@ -79,6 +91,9 @@ class Module:
         self.docstring = docstring
         self.attrs = attrs
 
+    def has_docstring(self) -> bool:
+        return self.docstring is not None
+
 
 class Class:
     def __init__(
@@ -91,27 +106,37 @@ class Class:
         self.docstring = docstring
         self.attrs = attrs
 
+    def has_docstring(self) -> bool:
+        return self.docstring is not None
 
-class Function:
+
+class FunctionSignature:
     def __init__(
         self,
         args: ast.arguments,
-        decorator_list: Sequence[ast.expr],
         returns: Optional[ast.expr],
-        async_: bool,
+        decorator_list: Sequence[ast.expr],
         docstring: Optional[str],
     ) -> None:
         self.args = args
-        self.decorator_list = decorator_list
         self.returns = returns
-        self.async_ = async_
+        self.decorator_list = decorator_list
         self.docstring = docstring
 
-    def have_decorator(self, name: str) -> bool:
+    def has_decorator(self, name: str) -> bool:
         return any(
             isinstance(decorator, ast.Name) and decorator.id == name
             for decorator in self.decorator_list
         )
+
+
+class Function:
+    def __init__(self, async_: bool, signatures: Sequence[FunctionSignature]) -> None:
+        self.async_ = async_
+        self.signatures = signatures
+
+    def has_docstring(self) -> bool:
+        return any(signature.docstring is not None for signature in self.signatures)
 
 
 class Variable:
@@ -121,17 +146,30 @@ class Variable:
         self.annotation = annotation
         self.docstring = docstring
 
+    def has_docstring(self) -> bool:
+        return self.docstring is not None
+
 
 class Import:
-    def __init__(self, module: str) -> None:
+    def __init__(self, module: str, aliased: bool) -> None:
         self.module = module
+        self.aliased = aliased
+
+    def has_docstring(self) -> bool:
+        return False
 
 
 class ImportFrom:
-    def __init__(self, name: str, module: Optional[str], level: int) -> None:
+    def __init__(
+        self, name: str, module: Optional[str], level: int, aliased: bool
+    ) -> None:
         self.name = name
         self.module = module
         self.level = level
+        self.aliased = aliased
+
+    def has_docstring(self) -> bool:
+        return False
 
 
 Node = Union[Module, Class, Function, Variable, Import, ImportFrom]
@@ -176,27 +214,34 @@ class _ModuleVisitor(NodeVisitor):
         self._attrs = attrs
         self._attrs[node.name] = class_node
 
-    def visit_FunctionDef(
+    def _visit_function(
         self,
-        node: ast.FunctionDef,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
         parent: Optional[ast.AST],
         sibling: Optional[ast.AST],
     ) -> None:
-        self._attrs[node.name] = Function(
-            node.args, node.decorator_list, node.returns, False, ast.get_docstring(node)
+        signature = FunctionSignature(
+            node.args, node.returns, node.decorator_list, ast.get_docstring(node)
         )
+        async_ = isinstance(node, ast.AsyncFunctionDef)
+        func = self._attrs.get(node.name)
+        # If we have a previous overload definition, we can add to it.
+        # Otherwise, we replace it.
+        if (
+            func
+            and isinstance(func, Function)
+            and func.async_ == async_
+            and func.signatures[-1].has_decorator("overload")
+        ):
+            signatures = list(func.signatures)
+            signatures.append(signature)
+        else:
+            signatures = [signature]
+        self._attrs[node.name] = Function(async_, signatures)
         # NB: we intentionally don't visit the function body.
 
-    def visit_AsyncFunctionDef(
-        self,
-        node: ast.AsyncFunctionDef,
-        parent: Optional[ast.AST],
-        sibling: Optional[ast.AST],
-    ) -> None:
-        self._attrs[node.name] = Function(
-            node.args, node.decorator_list, node.returns, True, ast.get_docstring(node)
-        )
-        # NB: we intentionally don't visit the function body.
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
 
     def _add_assign(
         self,
@@ -258,7 +303,7 @@ class _ModuleVisitor(NodeVisitor):
             else:
                 name = alias.asname
                 module_name = alias.name
-            self._attrs[name] = Import(module_name)
+            self._attrs[name] = Import(module_name, alias.asname is not None)
 
     def visit_ImportFrom(
         self,
@@ -268,7 +313,9 @@ class _ModuleVisitor(NodeVisitor):
     ) -> None:
         for alias in node.names:
             name = alias.name if alias.asname is None else alias.asname
-            self._attrs[name] = ImportFrom(alias.name, node.module, node.level)
+            self._attrs[name] = ImportFrom(
+                alias.name, node.module, node.level, alias.asname is not None
+            )
 
 
 def parse_source(

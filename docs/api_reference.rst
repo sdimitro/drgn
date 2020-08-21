@@ -7,7 +7,6 @@ Programs
 --------
 
 .. drgndoc:: Program
-    :include: __getitem__
 .. drgndoc:: ProgramFlags
 .. drgndoc:: FindObjectFlags
 
@@ -57,7 +56,6 @@ Objects
 -------
 
 .. drgndoc:: Object
-    :include: __getattribute__|__getitem__|__len__
 .. drgndoc:: NULL
 .. drgndoc:: cast
 .. drgndoc:: reinterpret
@@ -116,6 +114,8 @@ Miscellaneous
 
 .. drgndoc:: sizeof
 .. drgndoc:: execscript
+.. drgndoc:: IntegerLike
+.. drgndoc:: Path
 
 Exceptions
 ----------

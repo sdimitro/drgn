@@ -9,9 +9,10 @@ The ``drgn.helpers.linux.radixtree`` module provides helpers for working with
 radix trees from :linux:`include/linux/radix-tree.h`.
 """
 
-from drgn import Object, cast
-from _drgn import _linux_helper_radix_tree_lookup
+from typing import Iterator, Tuple
 
+from _drgn import _linux_helper_radix_tree_lookup as radix_tree_lookup
+from drgn import Object, cast
 
 __all__ = (
     "radix_tree_for_each",
@@ -21,15 +22,15 @@ __all__ = (
 _RADIX_TREE_ENTRY_MASK = 3
 
 
-def _is_internal_node(node, internal_node):
+def _is_internal_node(node: Object, internal_node: int) -> bool:
     return (node.value_() & _RADIX_TREE_ENTRY_MASK) == internal_node
 
 
-def _entry_to_node(node, internal_node):
+def _entry_to_node(node: Object, internal_node: int) -> Object:
     return Object(node.prog_, node.type_, value=node.value_() & ~internal_node)
 
 
-def _radix_tree_root_node(root):
+def _radix_tree_root_node(root: Object) -> Tuple[Object, int]:
     try:
         node = root.xa_head
     except AttributeError:
@@ -38,28 +39,16 @@ def _radix_tree_root_node(root):
         return cast("struct xa_node *", node).read_(), 2
 
 
-def radix_tree_lookup(root, index):
+def radix_tree_for_each(root: Object) -> Iterator[Tuple[int, Object]]:
     """
-    .. c:function:: void *radix_tree_lookup(struct radix_tree_root *root, unsigned long index)
-
-    Look up the entry at a given index in a radix tree. If it is not found,
-    this returns a ``NULL`` object.
-    """
-    return _linux_helper_radix_tree_lookup(root, index)
-
-
-def radix_tree_for_each(root):
-    """
-    .. c:function:: radix_tree_for_each(struct radix_tree_root *root)
-
     Iterate over all of the entries in a radix tree.
 
+    :param root: ``struct radix_tree_root *``
     :return: Iterator of (index, ``void *``) tuples.
-    :rtype: Iterator[tuple[int, Object]]
     """
     node, RADIX_TREE_INTERNAL_NODE = _radix_tree_root_node(root)
 
-    def aux(node, index):
+    def aux(node: Object, index: int) -> Iterator[Tuple[int, Object]]:
         if _is_internal_node(node, RADIX_TREE_INTERNAL_NODE):
             parent = _entry_to_node(node, RADIX_TREE_INTERNAL_NODE)
             for i, slot in enumerate(parent.slots):

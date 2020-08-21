@@ -9,14 +9,16 @@ The ``drgn.helpers.linux.pid`` module provides helpers for looking up process
 IDs and processes.
 """
 
-from drgn import NULL, Program, cast, container_of
+from typing import Iterator, Union
+
+from _drgn import (
+    _linux_helper_find_pid as find_pid,
+    _linux_helper_find_task as find_task,
+    _linux_helper_pid_task as pid_task,
+)
+from drgn import NULL, Object, Program, cast, container_of
 from drgn.helpers.linux.idr import idr_find, idr_for_each
 from drgn.helpers.linux.list import hlist_for_each_entry
-from _drgn import (
-    _linux_helper_find_pid,
-    _linux_helper_find_task,
-    _linux_helper_pid_task,
-)
 
 __all__ = (
     "find_pid",
@@ -27,24 +29,12 @@ __all__ = (
 )
 
 
-def find_pid(prog_or_ns, nr):
+def for_each_pid(prog_or_ns: Union[Program, Object]) -> Iterator[Object]:
     """
-    .. c:function:: struct pid *find_pid(struct pid_namespace *ns, int nr)
+    Iterate over all PIDs in a namespace.
 
-    Return the ``struct pid *`` for the given PID number in the given
-    namespace. If given a :class:`Program` instead, the initial PID namespace
-    is used.
-    """
-    return _linux_helper_find_pid(prog_or_ns, nr)
-
-
-def for_each_pid(prog_or_ns):
-    """
-    .. c:function:: for_each_pid(struct pid_namespace *ns)
-
-    Iterate over all of the PIDs in the given namespace. If given a
-    :class:`Program` instead, the initial PID namespace is used.
-
+    :param prog_or_ns: ``struct pid_namespace *`` to iterate over, or
+        :class:`Program` to iterate over initial PID namespace.
     :return: Iterator of ``struct pid *`` objects.
     """
     if isinstance(prog_or_ns, Program):
@@ -66,33 +56,12 @@ def for_each_pid(prog_or_ns):
                     yield container_of(upid, "struct pid", f"numbers[{int(ns.level)}]")
 
 
-def pid_task(pid, pid_type):
+def for_each_task(prog_or_ns: Union[Program, Object]) -> Iterator[Object]:
     """
-    .. c:function:: struct task_struct *pid_task(struct pid *pid, enum pid_type pid_type)
+    Iterate over all of the tasks visible in a namespace.
 
-    Return the ``struct task_struct *`` containing the given ``struct pid *``
-    of the given type.
-    """
-    return _linux_helper_pid_task(pid, pid_type)
-
-
-def find_task(prog_or_ns, pid):
-    """
-    .. c:function:: struct task_struct *find_task(struct pid_namespace *ns, int pid)
-
-    Return the task with the given PID in the given namespace. If given a
-    :class:`Program` instead, the initial PID namespace is used.
-    """
-    return _linux_helper_find_task(prog_or_ns, pid)
-
-
-def for_each_task(prog_or_ns):
-    """
-    .. c:function:: for_each_task(struct pid_namespace *ns)
-
-    Iterate over all of the tasks visible in the given namespace. If given a
-    :class:`Program` instead, the initial PID namespace is used.
-
+    :param prog_or_ns: ``struct pid_namespace *`` to iterate over, or
+        :class:`Program` to iterate over initial PID namespace.
     :return: Iterator of ``struct task_struct *`` objects.
     """
     if isinstance(prog_or_ns, Program):

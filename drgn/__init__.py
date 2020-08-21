@@ -46,14 +46,16 @@ import sys
 import types
 
 from _drgn import (
+    NULL,
     Architecture,
     FaultError,
     FindObjectFlags,
+    IntegerLike,
     Language,
     MissingDebugInfoError,
-    NULL,
     Object,
     OutOfBoundsError,
+    Path,
     Platform,
     PlatformFlags,
     PrimitiveType,
@@ -69,7 +71,7 @@ from _drgn import (
     TypeKind,
     TypeMember,
     TypeParameter,
-    _with_libkdumpfile,
+    _with_libkdumpfile as _with_libkdumpfile,
     array_type,
     bool_type,
     cast,
@@ -94,16 +96,17 @@ from _drgn import (
     void_type,
 )
 
-
 __all__ = (
     "Architecture",
     "FaultError",
     "FindObjectFlags",
+    "IntegerLike",
     "Language",
     "MissingDebugInfoError",
     "NULL",
     "Object",
     "OutOfBoundsError",
+    "Path",
     "Platform",
     "PlatformFlags",
     "PrimitiveType",
@@ -145,11 +148,12 @@ __all__ = (
 )
 
 
-try:
+if sys.version_info >= (3, 8):
     _open_code = io.open_code
-except AttributeError:
+else:
+    from typing import BinaryIO
 
-    def _open_code(path):
+    def _open_code(path: str) -> BinaryIO:
         return open(path, "rb")
 
 

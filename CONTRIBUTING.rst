@@ -71,11 +71,15 @@ drgn assumes some `implementation-defined behavior
 Python
 ^^^^^^
 
-Python code in drgn is formatted with `black <https://github.com/psf/black>`_.
-Code should be compatible with Python 3.6 and newer.
+Python code in drgn should be compatible with Python 3.6 and newer.
 
-Type hints should be provided for all public interfaces other than helpers
-(including the C extension) and most private interfaces.
+Python code should be formatted with `black <https://github.com/psf/black>`_
+and `isort <https://github.com/timothycrosley/isort>`_::
+
+    $ isort . && black .
+
+Type hints should be provided for all interfaces (including helpers and the C
+extension).
 
 Submitting PRs
 --------------

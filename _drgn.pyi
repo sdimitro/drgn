@@ -9,6 +9,7 @@ Don't use this module directly. Instead, use the drgn package.
 
 import enum
 import os
+import sys
 from typing import (
     Any,
     Callable,
@@ -21,6 +22,32 @@ from typing import (
     overload,
 )
 
+if sys.version_info < (3, 8):
+    from typing_extensions import Protocol
+else:
+    from typing import Protocol
+
+# This is effectively typing.SupportsIndex without @typing.runtime_checkable
+# (both of which are only available since Python 3.8), with a more
+# self-explanatory name.
+class IntegerLike(Protocol):
+    """
+    An :class:`int` or integer-like object.
+
+    Parameters annotated with this type expect an integer which may be given as
+    a Python :class:`int` or an :class:`Object` with integer type.
+    """
+
+    def __index__(self) -> int: ...
+
+Path = Union[str, bytes, os.PathLike[str], os.PathLike[bytes]]
+"""
+Filesystem path.
+
+Parameters annotated with this type accept a filesystem path as :class:`str`,
+:class:`bytes`, or :class:`os.PathLike`.
+"""
+
 class Program:
     """
     A ``Program`` represents a crashed or running program. It can be used to
@@ -29,15 +56,18 @@ class Program:
     The main functionality of a ``Program`` is looking up objects (i.e.,
     variables, constants, or functions). This is usually done with the
     :meth:`[] <.__getitem__>` operator.
-
-    This class can be constructed directly, but it is usually more convenient
-    to use one of the :ref:`api-program-constructors`.
-
-    :param platform: The platform of the program, or ``None`` if it should be
-        determined automatically when a core dump or symbol file is added.
     """
 
-    def __init__(self, platform: Optional[Platform] = None) -> None: ...
+    def __init__(self, platform: Optional[Platform] = None) -> None:
+        """
+        This class can be constructed directly, but it is usually more
+        convenient to use one of the :ref:`api-program-constructors`.
+
+        :param platform: The platform of the program, or ``None`` if it should
+            be determined automatically when a core dump or symbol file is
+            added.
+        """
+        ...
     flags: ProgramFlags
     """Flags which apply to this program."""
 
@@ -152,7 +182,7 @@ class Program:
         """
         ...
     # address_or_name is positional-only.
-    def symbol(self, address_or_name: Union[int, str]) -> Symbol:
+    def symbol(self, address_or_name: Union[IntegerLike, str]) -> Symbol:
         """
         Get the symbol containing the given address, or the global symbol with
         the given name.
@@ -162,7 +192,12 @@ class Program:
             the given name
         """
         ...
-    def stack_trace(self, thread: Union[Object, int]) -> StackTrace:
+    def stack_trace(
+        self,
+        # Object is already IntegerLike, but this explicitly documents that it
+        # can take non-integer Objects.
+        thread: Union[Object, IntegerLike],
+    ) -> StackTrace:
         """
         Get the stack trace for the given thread in the program.
 
@@ -216,7 +251,9 @@ class Program:
         :param lang: :attr:`Type.language`
         """
         ...
-    def read(self, address: int, size: int, physical: bool = False) -> bytes:
+    def read(
+        self, address: IntegerLike, size: IntegerLike, physical: bool = False
+    ) -> bytes:
         """
         Read *size* bytes of memory starting at *address* in the program. The
         address may be virtual (the default) or physical if the program
@@ -236,11 +273,19 @@ class Program:
         :raises ValueError: if *size* is negative
         """
         ...
-    def read_u8(self, address: int, physical: bool = False) -> int: ...
-    def read_u16(self, address: int, physical: bool = False) -> int: ...
-    def read_u32(self, address: int, physical: bool = False) -> int: ...
-    def read_u64(self, address: int, physical: bool = False) -> int: ...
-    def read_word(self, address: int, physical: bool = False) -> int:
+    def read_u8(self, address: IntegerLike, physical: bool = False) -> int:
+        ""
+        ...
+    def read_u16(self, address: IntegerLike, physical: bool = False) -> int:
+        ""
+        ...
+    def read_u32(self, address: IntegerLike, physical: bool = False) -> int:
+        ""
+        ...
+    def read_u64(self, address: IntegerLike, physical: bool = False) -> int:
+        ""
+        ...
+    def read_word(self, address: IntegerLike, physical: bool = False) -> int:
         """
         Read an unsigned integer from the program's memory in the program's
         byte order.
@@ -262,8 +307,8 @@ class Program:
         ...
     def add_memory_segment(
         self,
-        address: int,
-        size: int,
+        address: IntegerLike,
+        size: IntegerLike,
         read_fn: Callable[[int, int, int, bool], bytes],
         physical: bool = False,
     ) -> None:
@@ -316,7 +361,7 @@ class Program:
             return an :class:`Object`.
         """
         ...
-    def set_core_dump(self, path: Union[str, bytes, os.PathLike]) -> None:
+    def set_core_dump(self, path: Path) -> None:
         """
         Set the program to a core dump.
 
@@ -349,7 +394,7 @@ class Program:
         ...
     def load_debug_info(
         self,
-        paths: Optional[Iterable[Union[str, bytes, os.PathLike]]] = None,
+        paths: Optional[Iterable[Path]] = None,
         default: bool = False,
         main: bool = False,
     ) -> None:
@@ -388,7 +433,7 @@ class Program:
         This is equivalent to ``load_debug_info(None, True)``.
         """
         ...
-    cache: dict
+    cache: Dict[Any, Any]
     """
     Dictionary for caching program metadata.
 
@@ -433,9 +478,13 @@ class FindObjectFlags(enum.Flag):
     """
 
     CONSTANT = ...
+    ""
     FUNCTION = ...
+    ""
     VARIABLE = ...
+    ""
     ANY = ...
+    ""
 
 def filename_matches(haystack: Optional[str], needle: Optional[str]) -> bool:
     """
@@ -454,7 +503,7 @@ def filename_matches(haystack: Optional[str], needle: Optional[str]) -> bool:
     """
     ...
 
-def program_from_core_dump(path: Union[str, bytes, os.PathLike]) -> Program:
+def program_from_core_dump(path: Path) -> Program:
     """
     Create a :class:`Program` from a core dump file. The type of program (e.g.,
     userspace or kernel) is determined automatically.
@@ -484,15 +533,17 @@ class Platform:
     """
     A ``Platform`` represents the environment (i.e., architecture and ABI) that
     a program runs on.
-
-    :param arch: :attr:`Platform.arch`
-    :param flags: :attr:`Platform.flags`; if ``None``, default flags for the
-        architecture are used.
     """
 
     def __init__(
         self, arch: Architecture, flags: Optional[PlatformFlags] = None
-    ) -> None: ...
+    ) -> None:
+        """
+        :param arch: :attr:`Platform.arch`
+        :param flags: :attr:`Platform.flags`; if ``None``, default flags for
+            the architecture are used.
+        """
+        ...
     arch: Architecture
     """Instruction set architecture of this platform."""
 
@@ -632,25 +683,6 @@ class Object:
     conflicting with structure, union, or class members. The attributes and
     methods always take precedence; use :meth:`member_()` if there is a
     conflict.
-
-    Objects are usually obtained directly from a :class:`Program`, but they can
-    be constructed manually, as well (for example, if you got a variable
-    address from a log file).
-
-    :param prog: The program to create this object in.
-    :param type: The type of the object. If omitted, this is deduced from
-        *value* according to the language's rules for literals.
-    :param value: The value of this object. See :meth:`value_()`.
-    :param address: The address of this object in the program. Either this or
-        *value* must be given, but not both.
-    :param byteorder: Byte order of the object. This should be ``'little'`` or
-        ``'big'``. The default is ``None``, which indicates the program byte
-        order. This must be ``None`` for primitive values.
-    :param bit_offset: Offset in bits from the object's address to the
-        beginning of the object. The default is ``None``, which means no
-        offset. This must be ``None`` for primitive values.
-    :param bit_field_size: Size in bits of this object if it is a bit field.
-        The default is ``None``, which means the object is not a bit field.
     """
 
     def __init__(
@@ -659,11 +691,33 @@ class Object:
         type: Union[str, Type, None] = None,
         value: Any = None,
         *,
-        address: Optional[int] = None,
+        address: Optional[IntegerLike] = None,
         byteorder: Optional[str] = None,
-        bit_offset: Optional[int] = None,
-        bit_field_size: Optional[int] = None,
-    ) -> None: ...
+        bit_offset: Optional[IntegerLike] = None,
+        bit_field_size: Optional[IntegerLike] = None,
+    ) -> None:
+        """
+        Objects are usually obtained directly from a :class:`Program`, but they
+        can be constructed manually, as well (for example, if you got a
+        variable address from a log file).
+
+        :param prog: The program to create this object in.
+        :param type: The type of the object. If omitted, this is deduced from
+            *value* according to the language's rules for literals.
+        :param value: The value of this object. See :meth:`value_()`.
+        :param address: The address of this object in the program. Either this
+            or *value* must be given, but not both.
+        :param byteorder: Byte order of the object. This should be ``'little'``
+            or ``'big'``. The default is ``None``, which indicates the program
+            byte order. This must be ``None`` for primitive values.
+        :param bit_offset: Offset in bits from the object's address to the
+            beginning of the object. The default is ``None``, which means no
+            offset. This must be ``None`` for primitive values.
+        :param bit_field_size: Size in bits of this object if it is a bit
+            field. The default is ``None``, which means the object is not a bit
+            field.
+        """
+        ...
     prog_: Program
     """Program that this object is from."""
 
@@ -703,7 +757,7 @@ class Object:
         :param name: Attribute name.
         """
         ...
-    def __getitem__(self, idx: Union[int, Object]) -> Object:
+    def __getitem__(self, idx: IntegerLike) -> Object:
         """
         Implement ``self[idx]``. Get the array element at the given index.
 
@@ -817,7 +871,7 @@ class Object:
     def format_(
         self,
         *,
-        columns: Optional[int] = None,
+        columns: Optional[IntegerLike] = None,
         dereference: Optional[bool] = None,
         symbolize: Optional[bool] = None,
         string: Optional[bool] = None,
@@ -1040,7 +1094,7 @@ class StackTrace:
     default.
     """
 
-    def __getitem__(self, idx: int) -> StackFrame: ...
+    def __getitem__(self, idx: IntegerLike) -> StackFrame: ...
 
 class StackFrame:
     """
@@ -1066,7 +1120,7 @@ class StackFrame:
         instruction instead of the return address.
         """
         ...
-    def register(self, reg: Union[str, int, Register]) -> int:
+    def register(self, reg: Union[str, IntegerLike, Register]) -> int:
         """
         Get the value of the given register at this stack frame. The register
         can be specified by name (e.g., ``'rax'``), number (see
@@ -1223,15 +1277,6 @@ class Type:
 class TypeMember:
     """
     A ``TypeMember`` represents a member of a structure, union, or class type.
-
-    :param type: Type of the member. This may be a :class:`Type` or a callable
-        that takes no arguments and returns a :class:`Type`.
-    :param name: Name of the member. This may be ``None`` if the member is
-        unnamed.
-    :param bit_offset: Offset of the member from the beginning of the type
-        in bits.
-    :param bit_field_size: Size in bits of this member if it is a bit field,
-        zero otherwise.
     """
 
     def __init__(
@@ -1240,12 +1285,23 @@ class TypeMember:
         name: Optional[str] = None,
         bit_offset: int = 0,
         bit_field_size: int = 0,
-    ) -> None: ...
+    ) -> None:
+        """
+        :param type: :attr:`TypeMember.type`; may also be a callable that
+            takes no arguments and returns a :class:`Type`.
+        :param name: :attr:`TypeMember.name`
+        :param bit_offset: :attr:`TypeMember.bit_offset`
+        :param bit_field_size: :attr:`TypeMember.bit_field_size`
+        """
+        ...
     type: Type
+    """Member type."""
 
     name: Optional[str]
+    """Member name, or ``None`` if the member is unnamed."""
 
     bit_offset: int
+    """Offset of the member from the beginning of the type in bits."""
 
     offset: int
     """
@@ -1254,6 +1310,7 @@ class TypeMember:
     """
 
     bit_field_size: int
+    """Size in bits of this member if it is a bit field, zero otherwise."""
 
 class TypeEnumerator:
     """
@@ -1266,15 +1323,19 @@ class TypeEnumerator:
     >>> name, value = prog.type('enum pid_type').enumerators[0]
     >>> value
     0
-
-    :param name: Enumerator name.
-    :param value: Enumerator value.
     """
 
-    def __init__(self, name: str, value: int) -> None: ...
+    def __init__(self, name: str, value: int) -> None:
+        """
+        :param name: :attr:`TypeEnumerator.name`
+        :param value: :attr:`TypeEnumerator.value`
+        """
+        ...
     name: str
+    "Enumerator name."
 
     value: int
+    "Enumerator value."
     def __len__(self) -> int: ...
     def __getitem__(self, idx: int) -> Any: ...
     def __iter__(self) -> Iterator[Any]: ...
@@ -1282,19 +1343,22 @@ class TypeEnumerator:
 class TypeParameter:
     """
     A ``TypeParameter`` represents a parameter of a function type.
-
-    :param type: Type of the parameter. This may be a :class:`Type` or a callable
-        that takes no arguments and returns a :class:`Type`.
-    :param name: Name of the parameter. This may be ``None`` if the parameter is
-        unnamed.
     """
 
     def __init__(
         self, type: Union[Type, Callable[[], Type]], name: Optional[str] = None
-    ) -> None: ...
+    ) -> None:
+        """
+        :param type: :attr:`TypeParameter.type`; may also be a callable that
+            takes no arguments and returns a :class:`Type`.
+        :param name: :attr:`TypeParameter.name`
+        """
+        ...
     type: Type
+    """Parameter type."""
 
     name: Optional[str]
+    """Parameter name, or ``None`` if the parameter is unnamed."""
 
 class TypeKind(enum.Enum):
     """A ``TypeKind`` represents a kind of type."""
@@ -1342,23 +1406,41 @@ class PrimitiveType(enum.Enum):
     """A ``PrimitiveType`` represents a primitive type known to drgn."""
 
     C_VOID = ...
+    ""
     C_CHAR = ...
+    ""
     C_SIGNED_CHAR = ...
+    ""
     C_UNSIGNED_CHAR = ...
+    ""
     C_SHORT = ...
+    ""
     C_UNSIGNED_SHORT = ...
+    ""
     C_INT = ...
+    ""
     C_UNSIGNED_INT = ...
+    ""
     C_LONG = ...
+    ""
     C_UNSIGNED_LONG = ...
+    ""
     C_LONG_LONG = ...
+    ""
     C_UNSIGNED_LONG_LONG = ...
+    ""
     C_BOOL = ...
+    ""
     C_FLOAT = ...
+    ""
     C_DOUBLE = ...
+    ""
     C_LONG_DOUBLE = ...
+    ""
     C_SIZE_T = ...
+    ""
     C_PTRDIFF_T = ...
+    ""
 
 class Qualifiers(enum.Flag):
     """``Qualifiers`` are modifiers on types."""
@@ -1611,12 +1693,15 @@ class FaultError(Exception):
     """
     This error is raised when a bad memory access is attempted (i.e., when
     accessing a memory address which is not valid in a program).
-
-    :param address: Address that couldn't be accessed.
     """
 
-    def __init__(self, address: int) -> None: ...
+    def __init__(self, address: int) -> None:
+        """
+        :param address: :attr:`FaultError.address`
+        """
+        ...
     address: int
+    """Address that couldn't be accessed."""
 
 class MissingDebugInfoError(Exception):
     """
@@ -1636,12 +1721,82 @@ class OutOfBoundsError(Exception):
 
 _with_libkdumpfile: bool
 
-def _linux_helper_read_vm(prog, pgtable, address, size): ...
-def _linux_helper_radix_tree_lookup(root, index): ...
-def _linux_helper_idr_find(idr, id): ...
-def _linux_helper_find_pid(ns, pid): ...
-def _linux_helper_pid_task(pid, pid_type): ...
-def _linux_helper_find_task(ns, pid): ...
-def _linux_helper_task_state_to_char(task): ...
-def _linux_helper_kaslr_offset(prog): ...
-def _linux_helper_pgtable_l5_enabled(prog): ...
+def _linux_helper_read_vm(
+    prog: Program, pgtable: Object, address: IntegerLike, size: IntegerLike
+) -> bytes: ...
+def _linux_helper_radix_tree_lookup(root: Object, index: IntegerLike) -> Object:
+    """
+    Look up the entry at a given index in a radix tree.
+
+    :param root: ``struct radix_tree_root *``
+    :param index: Entry index.
+    :return: ``void *`` found entry, or ``NULL`` if not found.
+    """
+    ...
+
+def _linux_helper_idr_find(idr: Object, id: IntegerLike) -> Object:
+    """
+    Look up the entry with the given ID in an IDR.
+
+    :param idr: ``struct idr *``
+    :param id: Entry ID.
+    :return: ``void *`` found entry, or ``NULL`` if not found.
+    """
+    ...
+
+def _linux_helper_find_pid(
+    prog_or_ns: Union[Program, Object], pid: IntegerLike
+) -> Object:
+    """
+    Return the ``struct pid *`` for the given PID number.
+
+    :param prog_or_ns: ``struct pid_namespace *`` object, or :class:`Program`
+        to use initial PID namespace.
+    :return: ``struct pid *``
+    """
+    ...
+
+def _linux_helper_pid_task(pid: Object, pid_type: IntegerLike) -> Object:
+    """
+    Return the ``struct task_struct *`` containing the given ``struct pid *``
+    of the given type.
+
+    :param pid: ``struct pid *``
+    :param pid_type: ``enum pid_type``
+    :return: ``struct task_struct *``
+    """
+    ...
+
+def _linux_helper_find_task(
+    prog_or_ns: Union[Program, Object], pid: IntegerLike
+) -> Object:
+    """
+    Return the task with the given PID.
+
+    :param prog_or_ns: ``struct pid_namespace *`` object, or :class:`Program`
+        to use initial PID namespace.
+    :return: ``struct task_struct *``
+    """
+    ...
+
+def _linux_helper_task_state_to_char(task: Object) -> str:
+    """
+    Get the state of the task as a character (e.g., ``'R'`` for running). See
+    `ps(1)
+    <http://man7.org/linux/man-pages/man1/ps.1.html#PROCESS_STATE_CODES>`_ for
+    a description of the process state codes.
+
+    :param task: ``struct task_struct *``
+    """
+    ...
+
+def _linux_helper_kaslr_offset(prog: Program) -> int:
+    """
+    Get the kernel address space layout randomization offset (zero if it is
+    disabled).
+    """
+    ...
+
+def _linux_helper_pgtable_l5_enabled(prog: Program) -> bool:
+    """Return whether 5-level paging is enabled."""
+    ...
