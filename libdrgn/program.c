@@ -25,7 +25,6 @@
 #include "read.h"
 #include "string_builder.h"
 #include "symbol.h"
-#include "type_index.h"
 #include "vector.h"
 
 DEFINE_VECTOR_FUNCTIONS(drgn_prstatus_vector)
@@ -63,8 +62,6 @@ void drgn_program_set_platform(struct drgn_program *prog,
 	if (!prog->has_platform) {
 		prog->platform = *platform;
 		prog->has_platform = true;
-		prog->tindex.word_size =
-			platform->flags & DRGN_PLATFORM_IS_64_BIT ? 8 : 4;
 	}
 }
 
@@ -73,7 +70,7 @@ void drgn_program_init(struct drgn_program *prog,
 {
 	memset(prog, 0, sizeof(*prog));
 	drgn_memory_reader_init(&prog->reader);
-	drgn_type_index_init(&prog->tindex);
+	drgn_program_init_types(prog);
 	drgn_object_index_init(&prog->oindex);
 	prog->core_fd = -1;
 	if (platform)
@@ -82,7 +79,6 @@ void drgn_program_init(struct drgn_program *prog,
 
 void drgn_program_deinit(struct drgn_program *prog)
 {
-	free(prog->task_state_chars);
 	if (prog->prstatus_cached) {
 		if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL)
 			drgn_prstatus_vector_deinit(&prog->prstatus_vector);
@@ -92,7 +88,7 @@ void drgn_program_deinit(struct drgn_program *prog)
 	free(prog->pgtable_it);
 
 	drgn_object_index_deinit(&prog->oindex);
-	drgn_type_index_deinit(&prog->tindex);
+	drgn_program_deinit_types(prog);
 	drgn_memory_reader_deinit(&prog->reader);
 
 	free(prog->file_segments);
@@ -137,13 +133,6 @@ drgn_program_add_memory_segment(struct drgn_program *prog, uint64_t address,
 {
 	return drgn_memory_reader_add_segment(&prog->reader, address, size,
 					      read_fn, arg, physical);
-}
-
-LIBDRGN_PUBLIC struct drgn_error *
-drgn_program_add_type_finder(struct drgn_program *prog, drgn_type_find_fn fn,
-			     void *arg)
-{
-	return drgn_type_index_add_finder(&prog->tindex, fn, arg);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -552,21 +541,21 @@ static struct drgn_error *drgn_program_get_dindex(struct drgn_program *prog,
 		else
 			dwfl_callbacks = &drgn_userspace_core_dump_dwfl_callbacks;
 
-		err = drgn_dwarf_info_cache_create(&prog->tindex,
-						   dwfl_callbacks, &dicache);
+		err = drgn_dwarf_info_cache_create(prog, dwfl_callbacks,
+						   &dicache);
 		if (err)
 			return err;
-		err = drgn_program_add_type_finder(prog, drgn_dwarf_type_find,
-						   dicache);
-		if (err) {
-			drgn_dwarf_info_cache_destroy(dicache);
-			return err;
-		}
 		err = drgn_program_add_object_finder(prog,
 						     drgn_dwarf_object_find,
 						     dicache);
 		if (err) {
-			drgn_type_index_remove_finder(&prog->tindex);
+			drgn_dwarf_info_cache_destroy(dicache);
+			return err;
+		}
+		err = drgn_program_add_type_finder(prog, drgn_dwarf_type_find,
+						   dicache);
+		if (err) {
+			drgn_object_index_remove_finder(&prog->oindex);
 			drgn_dwarf_info_cache_destroy(dicache);
 			return err;
 		}
@@ -738,25 +727,34 @@ drgn_program_load_debug_info(struct drgn_program *prog, const char **paths,
 	return err;
 }
 
-static uint32_t get_prstatus_pid(struct drgn_program *prog, const char *data,
-				 size_t size)
+static struct drgn_error *get_prstatus_pid(struct drgn_program *prog, const char *data,
+					   size_t size, uint32_t *ret)
 {
+	bool is_64_bit, bswap;
+	struct drgn_error *err = drgn_program_is_64_bit(prog, &is_64_bit);
+	if (err)
+		return err;
+	err = drgn_program_bswap(prog, &bswap);
+	if (err)
+		return err;
+
+	size_t offset = is_64_bit ? 32 : 24;
 	uint32_t pr_pid;
-	memcpy(&pr_pid, data + (drgn_program_is_64_bit(prog) ? 32 : 24),
-	       sizeof(pr_pid));
-	if (drgn_program_bswap(prog))
+	if (size < offset + sizeof(pr_pid)) {
+		return drgn_error_create(DRGN_ERROR_OTHER,
+					 "NT_PRSTATUS is truncated");
+	}
+	memcpy(&pr_pid, data + offset, sizeof(pr_pid));
+	if (bswap)
 		pr_pid = bswap_32(pr_pid);
-	return pr_pid;
+	*ret = pr_pid;
+	return NULL;
 }
 
 struct drgn_error *drgn_program_cache_prstatus_entry(struct drgn_program *prog,
 						     const char *data,
 						     size_t size)
 {
-	if (size < (drgn_program_is_64_bit(prog) ? 36 : 28)) {
-		return drgn_error_create(DRGN_ERROR_OTHER,
-					 "NT_PRSTATUS is truncated");
-	}
 	if (prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL) {
 		struct string *entry =
 			drgn_prstatus_vector_append_entry(&prog->prstatus_vector);
@@ -766,9 +764,12 @@ struct drgn_error *drgn_program_cache_prstatus_entry(struct drgn_program *prog,
 		entry->len = size;
 	} else {
 		struct drgn_prstatus_map_entry entry = {
-			.key = get_prstatus_pid(prog, data, size),
 			.value = { data, size },
 		};
+		struct drgn_error *err = get_prstatus_pid(prog, data, size,
+							  &entry.key);
+		if (err)
+			return err;
 		if (drgn_prstatus_map_insert(&prog->prstatus_map, &entry,
 					     NULL) == -1)
 			return &drgn_enomem;
@@ -863,21 +864,19 @@ struct drgn_error *drgn_program_find_prstatus_by_cpu(struct drgn_program *prog,
 						     struct string *ret,
 						     uint32_t *tid_ret)
 {
-	struct drgn_error *err;
-
 	assert(prog->flags & DRGN_PROGRAM_IS_LINUX_KERNEL);
-	err = drgn_program_cache_prstatus(prog);
+	struct drgn_error *err = drgn_program_cache_prstatus(prog);
 	if (err)
 		return err;
 
 	if (cpu < prog->prstatus_vector.size) {
 		*ret = prog->prstatus_vector.data[cpu];
-		*tid_ret = get_prstatus_pid(prog, ret->str, ret->len);
+		return get_prstatus_pid(prog, ret->str, ret->len, tid_ret);
 	} else {
 		ret->str = NULL;
 		ret->len = 0;
+		return NULL;
 	}
-	return NULL;
 }
 
 struct drgn_error *drgn_program_find_prstatus_by_tid(struct drgn_program *prog,
@@ -1069,18 +1068,16 @@ LIBDRGN_PUBLIC struct drgn_error *						\
 drgn_program_read_u##n(struct drgn_program *prog, uint64_t address,		\
 		       bool physical, uint##n##_t *ret)				\
 {										\
-	struct drgn_error *err;							\
+	bool bswap;								\
+	struct drgn_error *err = drgn_program_bswap(prog, &bswap);		\
+	if (err)								\
+		return err;							\
 	uint##n##_t tmp;							\
-										\
-	if (!prog->has_platform) {						\
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,		\
-					 "program byte order is not known");	\
-	}									\
 	err = drgn_memory_reader_read(&prog->reader, &tmp, address,		\
 				      sizeof(tmp), physical);			\
 	if (err)								\
 		return err;							\
-	if (drgn_program_bswap(prog))						\
+	if (bswap)								\
 		tmp = bswap_##n(tmp);						\
 	*ret = tmp;								\
 	return NULL;								\
@@ -1095,19 +1092,20 @@ LIBDRGN_PUBLIC struct drgn_error *
 drgn_program_read_word(struct drgn_program *prog, uint64_t address,
 		       bool physical, uint64_t *ret)
 {
-	struct drgn_error *err;
-
-	if (!prog->has_platform) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "program word size is not known");
-	}
-	if (drgn_program_is_64_bit(prog)) {
+	bool is_64_bit, bswap;
+	struct drgn_error *err = drgn_program_is_64_bit(prog, &is_64_bit);
+	if (err)
+		return err;
+	err = drgn_program_bswap(prog, &bswap);
+	if (err)
+		return err;
+	if (is_64_bit) {
 		uint64_t tmp;
 		err = drgn_memory_reader_read(&prog->reader, &tmp, address,
 					      sizeof(tmp), physical);
 		if (err)
 			return err;
-		if (drgn_program_bswap(prog))
+		if (bswap)
 			tmp = bswap_64(tmp);
 		*ret = tmp;
 	} else {
@@ -1116,19 +1114,11 @@ drgn_program_read_word(struct drgn_program *prog, uint64_t address,
 					      sizeof(tmp), physical);
 		if (err)
 			return err;
-		if (drgn_program_bswap(prog))
+		if (bswap)
 			tmp = bswap_32(tmp);
 		*ret = tmp;
 	}
 	return NULL;
-}
-
-LIBDRGN_PUBLIC struct drgn_error *
-drgn_program_find_type(struct drgn_program *prog, const char *name,
-		       const char *filename, struct drgn_qualified_type *ret)
-{
-	return drgn_type_index_find(&prog->tindex, name, filename,
-				    drgn_program_language(prog), ret);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -1137,7 +1127,7 @@ drgn_program_find_object(struct drgn_program *prog, const char *name,
 			 enum drgn_find_object_flags flags,
 			 struct drgn_object *ret)
 {
-	if (ret && ret->prog != prog) {
+	if (ret && drgn_object_program(ret) != prog) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "object is from wrong program");
 	}
@@ -1288,8 +1278,8 @@ drgn_program_member_info(struct drgn_program *prog, struct drgn_type *type,
 	struct drgn_error *err;
 	struct drgn_member_value *member;
 
-	err = drgn_type_index_find_member(&prog->tindex, type, member_name,
-					  strlen(member_name), &member);
+	err = drgn_program_find_member(prog, type, member_name,
+				       strlen(member_name), &member);
 	if (err)
 		return err;
 

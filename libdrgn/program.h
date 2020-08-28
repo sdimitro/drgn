@@ -20,8 +20,9 @@
 #include "hash_table.h"
 #include "memory_reader.h"
 #include "object_index.h"
+#include "language.h"
 #include "platform.h"
-#include "type_index.h"
+#include "type.h"
 #include "vector.h"
 
 /**
@@ -54,46 +55,83 @@ struct vmcoreinfo {
 	bool pgtable_l5_enabled;
 };
 
+DEFINE_VECTOR_TYPE(drgn_typep_vector, struct drgn_type *)
 DEFINE_VECTOR_TYPE(drgn_prstatus_vector, struct string)
 DEFINE_HASH_MAP_TYPE(drgn_prstatus_map, uint32_t, struct string)
 
 struct drgn_dwarf_info_cache;
-struct drgn_dwarf_index;
 
 struct drgn_program {
 	/** @privatesection */
-	struct drgn_memory_reader reader;
-	struct drgn_type_index tindex;
-	struct drgn_object_index oindex;
-	struct drgn_memory_file_segment *file_segments;
-	/* Default language of the program. */
-	const struct drgn_language *lang;
+
 	/*
-	 * Valid iff <tt>flags & DRGN_PROGRAM_IS_LINUX_KERNEL</tt>.
+	 * Memory/core dump.
 	 */
-	struct vmcoreinfo vmcoreinfo;
-	/* Cached PAGE_OFFSET. */
-	uint64_t page_offset;
-	/* Cached vmemmap. */
-	uint64_t vmemmap;
-	/* Cached THREAD_SIZE. */
-	uint64_t thread_size;
+	struct drgn_memory_reader reader;
+	/* Elf core dump or /proc/pid/mem file segments. */
+	struct drgn_memory_file_segment *file_segments;
+	/* Elf core dump. Not valid for live programs or kdump files. */
+	Elf *core;
+	/* File descriptor for ELF core dump, kdump file, or /proc/pid/mem. */
+	int core_fd;
+	/* PID of live userspace program. */
+	pid_t pid;
 #ifdef WITH_LIBKDUMPFILE
 	kdump_ctx_t *kdump_ctx;
 #endif
+
 	/*
-	 * Valid iff <tt>!(flags & DRGN_PROGRAM_IS_LIVE)</tt>, unless the file
-	 * was a kdump file.
+	 * Types.
 	 */
-	Elf *core;
-	int core_fd;
-	 /*
-	  * Valid iff
-	  * <tt>(flags & (DRGN_PROGRAM_IS_LINUX_KERNEL | DRGN_PROGRAM_IS_LIVE)) ==
-	  * DRGN_PROGRAM_IS_LIVE</tt>.
-	  */
-	pid_t pid;
+	/** Callbacks for finding types. */
+	struct drgn_type_finder *type_finders;
+	/** Void type for each language. */
+	struct drgn_type void_types[DRGN_NUM_LANGUAGES];
+	/** Cache of primitive types. */
+	struct drgn_type *primitive_types[DRGN_PRIMITIVE_TYPE_NUM];
+	/** Cache of deduplicated types. */
+	struct drgn_dedupe_type_set dedupe_types;
+	/**
+	 * List of created types that cannot be deduplicated.
+	 *
+	 * Complete structure, union, and class types, as well as function
+	 * types, refer to lazily-evaluated types, so they cannot be easily
+	 * deduplicated.
+	 *
+	 * Complete enumerated types could be deduplicated, but it's probably
+	 * not worth the effort of hashing and comparing long lists of
+	 * enumerators.
+	 *
+	 * All other types, including incomplete structure, union, class, and
+	 * enumerated types, are deduplicated.
+	 */
+	struct drgn_typep_vector created_types;
+	/** Cache for @ref drgn_program_find_member(). */
+	struct drgn_member_map members;
+	/**
+	 * Set of types which have been already cached in @ref
+	 * drgn_program::members.
+	 */
+	struct drgn_type_set members_cached;
+
+	/*
+	 * Debugging information.
+	 */
+	struct drgn_object_index oindex;
 	struct drgn_dwarf_info_cache *_dicache;
+
+	/*
+	 * Program information.
+	 */
+	/* Default language of the program. */
+	const struct drgn_language *lang;
+	struct drgn_platform platform;
+	bool has_platform;
+	enum drgn_program_flags flags;
+
+	/*
+	 * Stack traces.
+	 */
 	union {
 		/*
 		 * For the Linux kernel, PRSTATUS notes indexed by CPU. See @ref
@@ -109,22 +147,26 @@ struct drgn_program {
 	/* See @ref drgn_object_stack_trace_next_thread(). */
 	const struct drgn_object *stack_trace_obj;
 	uint32_t stack_trace_tid;
-	enum drgn_program_flags flags;
-	struct drgn_platform platform;
-	bool has_platform;
-	bool attached_dwfl_state;
 	bool prstatus_cached;
+	bool attached_dwfl_state;
+
+	/*
+	 * Linux kernel-specific.
+	 */
+	struct vmcoreinfo vmcoreinfo;
+	/* Cached PAGE_OFFSET. */
+	uint64_t page_offset;
+	/* Cached vmemmap. */
+	uint64_t vmemmap;
+	/* Cached THREAD_SIZE. */
+	uint64_t thread_size;
+	/* Page table iterator for linux_helper_read_vm(). */
+	struct pgtable_iterator *pgtable_it;
 	/*
 	 * Whether @ref drgn_program::pgtable_it is currently being used. Used
 	 * to prevent address translation from recursing.
 	 */
 	bool pgtable_it_in_use;
-
-	/* Page table iterator for linux_helper_read_vm(). */
-	struct pgtable_iterator *pgtable_it;
-	/* Cache for @ref linux_helper_task_state_to_char(). */
-	char *task_state_chars;
-	uint64_t task_report;
 };
 
 /** Initialize a @ref drgn_program. */
@@ -159,26 +201,53 @@ struct drgn_error *drgn_program_init_kernel(struct drgn_program *prog);
  */
 struct drgn_error *drgn_program_init_pid(struct drgn_program *prog, pid_t pid);
 
-static inline bool drgn_program_is_little_endian(struct drgn_program *prog)
+static inline struct drgn_error *
+drgn_program_is_little_endian(struct drgn_program *prog, bool *ret)
 {
-	assert(prog->has_platform);
-	return prog->platform.flags & DRGN_PLATFORM_IS_LITTLE_ENDIAN;
+	if (!prog->has_platform) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "program byte order is not known");
+	}
+	*ret = prog->platform.flags & DRGN_PLATFORM_IS_LITTLE_ENDIAN;
+	return NULL;
 }
 
 /**
  * Return whether a @ref drgn_program has a different endianness than the host
  * system.
  */
-static inline bool drgn_program_bswap(struct drgn_program *prog)
+static inline struct drgn_error *
+drgn_program_bswap(struct drgn_program *prog, bool *ret)
 {
-	return (drgn_program_is_little_endian(prog) !=
-		(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__));
+	bool is_little_endian;
+	struct drgn_error *err = drgn_program_is_little_endian(prog,
+							       &is_little_endian);
+	if (err)
+		return err;
+	*ret = is_little_endian != (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__);
+	return NULL;
 }
 
-static inline bool drgn_program_is_64_bit(struct drgn_program *prog)
+static inline struct drgn_error *
+drgn_program_is_64_bit(struct drgn_program *prog, bool *ret)
 {
-	assert(prog->has_platform);
-	return prog->platform.flags & DRGN_PLATFORM_IS_64_BIT;
+	if (!prog->has_platform) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "program word size is not known");
+	}
+	*ret = prog->platform.flags & DRGN_PLATFORM_IS_64_BIT;
+	return NULL;
+}
+
+static inline struct drgn_error *
+drgn_program_word_size(struct drgn_program *prog, uint8_t *ret)
+{
+	bool is_64_bit;
+	struct drgn_error *err = drgn_program_is_64_bit(prog, &is_64_bit);
+	if (err)
+		return err;
+	*ret = is_64_bit ? 8 : 4;
+	return NULL;
 }
 
 struct drgn_error *drgn_program_get_dwfl(struct drgn_program *prog, Dwfl **ret);

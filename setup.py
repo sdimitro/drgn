@@ -128,7 +128,7 @@ class egg_info(_egg_info):
 class test(Command):
     description = "run unit tests after in-place build"
 
-    KERNELS = ["5.8", "5.7", "5.6", "5.5", "5.4", "4.19", "4.14", "4.9", "4.4"]
+    KERNELS = ["5.9", "5.8", "5.7", "5.6", "5.5", "5.4", "4.19", "4.14", "4.9", "4.4"]
 
     user_options = [
         (
@@ -304,7 +304,7 @@ setup(
         "egg_info": egg_info,
         "test": test,
     },
-    entry_points={"console_scripts": ["drgn=drgn.internal.cli:main"],},
+    entry_points={"console_scripts": ["drgn=drgn.internal.cli:main"]},
     python_requires=">=3.6",
     author="Omar Sandoval",
     author_email="osandov@osandov.com",

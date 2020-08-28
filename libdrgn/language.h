@@ -12,8 +12,9 @@
 #ifndef DRGN_LANGUAGE_H
 #define DRGN_LANGUAGE_H
 
-#include "drgn.h"
 #include <dwarf.h>
+
+#include "drgn.h"
 
 /**
  * @ingroup Internals
@@ -28,15 +29,13 @@
  * @{
  */
 
-struct drgn_type_index;
-
 typedef struct drgn_error *drgn_format_type_fn(struct drgn_qualified_type,
 					       char **);
 typedef struct drgn_error *drgn_format_object_fn(const struct drgn_object *,
 						 size_t,
 						 enum drgn_format_object_flags,
 						 char **);
-typedef struct drgn_error *drgn_find_type_fn(struct drgn_type_index *tindex,
+typedef struct drgn_error *drgn_find_type_fn(struct drgn_program *prog,
 					     const char *name,
 					     const char *filename,
 					     struct drgn_qualified_type *ret);
@@ -69,8 +68,6 @@ typedef struct drgn_error *drgn_cmp_op(const struct drgn_object *lhs,
 struct drgn_language {
 	/** Name of this programming language. */
 	const char *name;
-	/** Void type for this language. See @ref drgn_void_type(). */
-	struct drgn_type void_type;
 	/** Implement @ref drgn_format_type_name(). */
 	drgn_format_type_fn *format_type_name;
 	/** Implement @ref drgn_format_type(). */
@@ -78,10 +75,10 @@ struct drgn_language {
 	/** Implement @ref drgn_format_object(). */
 	drgn_format_object_fn *format_object;
 	/**
-	 * Implement @ref drgn_type_index_find().
+	 * Implement @ref drgn_program_find_type().
 	 *
 	 * This should parse @p name and call @ref
-	 * drgn_type_index_find_parsed().
+	 * drgn_program_find_type_impl().
 	 */
 	drgn_find_type_fn *find_type;
 	/**
@@ -164,8 +161,8 @@ enum {
 
 extern const struct drgn_language drgn_languages[DRGN_NUM_LANGUAGES];
 
-#define drgn_language_cpp drgn_languages[DRGN_LANGUAGE_CPP]
 #define drgn_language_c drgn_languages[DRGN_LANGUAGE_C]
+#define drgn_language_cpp drgn_languages[DRGN_LANGUAGE_CPP]
 
 /**
  * Return flags that should be passed through when formatting an object
