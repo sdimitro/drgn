@@ -22,7 +22,6 @@
 #include "memory_reader.h"
 #include "object_index.h"
 #include "program.h"
-#include "read.h"
 #include "string_builder.h"
 #include "symbol.h"
 #include "vector.h"
@@ -635,26 +634,28 @@ static void drgn_program_set_language_from_main(struct drgn_program *prog,
 	struct drgn_dwarf_index_iterator it;
 	static const uint64_t tags[] = { DW_TAG_subprogram };
 
-	drgn_dwarf_index_iterator_init(&it, dindex, "main", strlen("main"),
-				       tags, ARRAY_SIZE(tags));
-	for (;;) {
+	err = drgn_dwarf_index_iterator_init(&it, &dindex->global, "main",
+					     strlen("main"), tags,
+					     ARRAY_SIZE(tags));
+	if (err) {
+		drgn_error_destroy(err);
+		return;
+	}
+	struct drgn_dwarf_index_die *index_die;
+	while ((index_die = drgn_dwarf_index_iterator_next(&it))) {
 		Dwarf_Die die;
-		const struct drgn_language *lang;
-
-		err = drgn_dwarf_index_iterator_next(&it, &die, NULL);
-		if (err == &drgn_stop) {
-			break;
-		} else if (err) {
-			drgn_error_destroy(err);
-			continue;
-		}
-
-		err = drgn_language_from_die(&die, &lang);
+		err = drgn_dwarf_index_get_die(index_die, &die, NULL);
 		if (err) {
 			drgn_error_destroy(err);
 			continue;
 		}
 
+		const struct drgn_language *lang;
+		err = drgn_language_from_die(&die, &lang);
+		if (err) {
+			drgn_error_destroy(err);
+			continue;
+		}
 		if (lang) {
 			prog->lang = lang;
 			break;
