@@ -7,7 +7,7 @@ SUBDIRS = elfutils include
 
 .DELETE_ON_ERROR:
 
-AM_CPPFLAGS = -Iinclude -D_GNU_SOURCE
+AM_CPPFLAGS = -isystem include -D_GNU_SOURCE
 
 include_HEADERS = drgn.h
 
@@ -20,16 +20,14 @@ ARCH_INS = arch_x86_64.c.in
 libdrgnimpl_la_SOURCES = $(ARCH_INS:.c.in=.c) \
 			 binary_search_tree.h \
 			 cityhash.h \
+			 debug_info.c \
+			 debug_info.h \
 			 dwarf_index.c \
 			 dwarf_index.h \
-			 dwarf_info_cache.c \
-			 dwarf_info_cache.h \
 			 error.c \
 			 error.h \
 			 hash_table.c \
 			 hash_table.h \
-			 internal.c \
-			 internal.h \
 			 language.c \
 			 language.h \
 			 language_c.c \
@@ -46,6 +44,7 @@ libdrgnimpl_la_SOURCES = $(ARCH_INS:.c.in=.c) \
 			 object_index.c \
 			 object_index.h \
 			 path.c \
+			 path.h \
 			 platform.c \
 			 platform.h \
 			 program.c \

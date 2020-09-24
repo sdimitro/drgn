@@ -1,18 +1,25 @@
 // Copyright (c) Facebook, Inc. and its affiliates.
 // SPDX-License-Identifier: GPL-3.0+
 
-#include <byteswap.h>
-#include <dwarf.h>
+#include <assert.h>
+#include <elfutils/libdw.h>
 #include <elfutils/libdwfl.h>
-#include <endian.h>
 #include <inttypes.h>
 #include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
 
-#include "internal.h"
+#include "debug_info.h"
+#include "drgn.h"
+#include "error.h"
+#include "hash_table.h"
 #include "helpers.h"
+#include "platform.h"
 #include "program.h"
 #include "string_builder.h"
 #include "symbol.h"
+#include "type.h"
+#include "util.h"
 
 struct drgn_stack_trace {
 	struct drgn_program *prog;
@@ -453,9 +460,6 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 					       struct drgn_stack_trace **ret)
 {
 	struct drgn_error *err;
-	Dwfl *dwfl;
-	Dwfl_Thread *thread;
-	struct drgn_stack_trace *trace;
 
 	if (!prog->has_platform) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
@@ -467,11 +471,12 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 					 "stack unwinding is not yet supported for live processes");
 	}
 
-	err = drgn_program_get_dwfl(prog, &dwfl);
+	struct drgn_debug_info *dbinfo;
+	err = drgn_program_get_dbinfo(prog, &dbinfo);
 	if (err)
 		return err;
 	if (!prog->attached_dwfl_state) {
-		if (!dwfl_attach_state(dwfl, NULL, 0,
+		if (!dwfl_attach_state(dbinfo->dwfl, NULL, 0,
 				       &drgn_linux_kernel_thread_callbacks,
 				       prog))
 			return drgn_error_libdwfl();
@@ -480,7 +485,8 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 
 	prog->stack_trace_tid = tid;
 	prog->stack_trace_obj = obj;
-	thread = dwfl_attach_thread(dwfl, STACK_TRACE_OBJ_TID);
+	Dwfl_Thread *thread = dwfl_attach_thread(dbinfo->dwfl,
+						 STACK_TRACE_OBJ_TID);
 	prog->stack_trace_obj = NULL;
 	prog->stack_trace_tid = 0;
 	if (prog->stack_trace_err)
@@ -490,7 +496,8 @@ static struct drgn_error *drgn_get_stack_trace(struct drgn_program *prog,
 		goto err;
 	}
 
-	trace = malloc(sizeof(*trace) + sizeof(trace->frames[0]));
+	struct drgn_stack_trace *trace = malloc(sizeof(*trace) +
+						sizeof(trace->frames[0]));
 	if (!trace) {
 		err = &drgn_enomem;
 		goto err;

@@ -13,17 +13,23 @@
 #define DRGN_PROGRAM_H
 
 #include <elfutils/libdwfl.h>
+#include <libelf.h>
+#include <sys/types.h>
 #ifdef WITH_LIBKDUMPFILE
 #include <libkdumpfile/kdumpfile.h>
 #endif
 
+#include "drgn.h"
 #include "hash_table.h"
+#include "language.h"
 #include "memory_reader.h"
 #include "object_index.h"
-#include "language.h"
 #include "platform.h"
 #include "type.h"
 #include "vector.h"
+
+struct drgn_debug_info;
+struct drgn_symbol;
 
 /**
  * @ingroup Internals
@@ -58,8 +64,6 @@ struct vmcoreinfo {
 DEFINE_VECTOR_TYPE(drgn_typep_vector, struct drgn_type *)
 DEFINE_VECTOR_TYPE(drgn_prstatus_vector, struct string)
 DEFINE_HASH_MAP_TYPE(drgn_prstatus_map, uint32_t, struct string)
-
-struct drgn_dwarf_info_cache;
 
 struct drgn_program {
 	/** @privatesection */
@@ -118,7 +122,7 @@ struct drgn_program {
 	 * Debugging information.
 	 */
 	struct drgn_object_index oindex;
-	struct drgn_dwarf_info_cache *_dicache;
+	struct drgn_debug_info *_dbinfo;
 
 	/*
 	 * Program information.
@@ -250,7 +254,8 @@ drgn_program_word_size(struct drgn_program *prog, uint8_t *ret)
 	return NULL;
 }
 
-struct drgn_error *drgn_program_get_dwfl(struct drgn_program *prog, Dwfl **ret);
+struct drgn_error *drgn_program_get_dbinfo(struct drgn_program *prog,
+					   struct drgn_debug_info **ret);
 
 /**
  * Find the @c NT_PRSTATUS note for the given CPU.
