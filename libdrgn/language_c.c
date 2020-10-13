@@ -10,11 +10,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "bitops.h"
 #include "error.h"
 #include "hash_table.h"
 #include "language.h" // IWYU pragma: associated
 #include "lexer.h"
 #include "memory_reader.h"
+#include "minmax.h"
 #include "object.h"
 #include "program.h"
 #include "string_builder.h"
@@ -1684,7 +1686,7 @@ static const char *token_spelling[] = {
 	[C_TOKEN_ENUM] = "enum",
 };
 
-DEFINE_HASH_MAP(c_keyword_map, struct string, int, string_hash, string_eq);
+DEFINE_HASH_MAP(c_keyword_map, struct string, int, string_hash_pair, string_eq)
 
 static struct c_keyword_map c_keywords = HASH_TABLE_INIT;
 

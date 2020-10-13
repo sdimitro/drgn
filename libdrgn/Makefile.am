@@ -19,6 +19,7 @@ ARCH_INS = arch_x86_64.c.in
 
 libdrgnimpl_la_SOURCES = $(ARCH_INS:.c.in=.c) \
 			 binary_search_tree.h \
+			 bitops.h \
 			 cityhash.h \
 			 debug_info.c \
 			 debug_info.h \
@@ -38,6 +39,7 @@ libdrgnimpl_la_SOURCES = $(ARCH_INS:.c.in=.c) \
 			 linux_kernel_helpers.c \
 			 memory_reader.c \
 			 memory_reader.h \
+			 minmax.h \
 			 mread.h \
 			 object.c \
 			 object.h \
@@ -47,6 +49,7 @@ libdrgnimpl_la_SOURCES = $(ARCH_INS:.c.in=.c) \
 			 path.h \
 			 platform.c \
 			 platform.h \
+			 pp.h \
 			 program.c \
 			 program.h \
 			 serialize.c \
