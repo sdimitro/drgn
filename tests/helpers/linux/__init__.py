@@ -39,10 +39,18 @@ class LinuxHelperTestCase(unittest.TestCase):
                     "(run with env DRGN_RUN_LINUX_HELPER_TESTS=1 to force"
                 )
             else:
+                # Some of the tests use the loop module. Open loop-control so
+                # that it is loaded.
+                try:
+                    with open("/dev/loop-control", "r"):
+                        pass
+                except FileNotFoundError:
+                    pass
+
                 prog = drgn.Program()
                 prog.set_kernel()
                 try:
-                    prog.load_debug_info(main=True)
+                    prog.load_default_debug_info()
                     LinuxHelperTestCase.prog = prog
                     return
                 except drgn.MissingDebugInfoError as e:
