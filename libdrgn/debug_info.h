@@ -15,6 +15,7 @@
 #include <elfutils/libdwfl.h>
 #include <libelf.h>
 
+#include "binary_buffer.h"
 #include "drgn.h"
 #include "dwarf_index.h"
 #include "hash_table.h"
@@ -44,6 +45,14 @@ enum drgn_debug_info_module_state {
 	DRGN_DEBUG_INFO_MODULE_INDEXED,
 } __attribute__((packed));
 
+enum drgn_debug_info_scn {
+	DRGN_SCN_DEBUG_INFO,
+	DRGN_SCN_DEBUG_ABBREV,
+	DRGN_SCN_DEBUG_STR,
+	DRGN_SCN_DEBUG_LINE,
+	DRGN_NUM_DEBUG_SCNS,
+};
+
 /**
  * A module reported to a @ref drgn_debug_info.
  *
@@ -64,10 +73,7 @@ struct drgn_debug_info_module {
 	char *name;
 
 	Dwfl_Module *dwfl_module;
-	Elf_Data *debug_info;
-	Elf_Data *debug_abbrev;
-	Elf_Data *debug_str;
-	Elf_Data *debug_line;
+	Elf_Data *scns[DRGN_NUM_DEBUG_SCNS];
 
 	/*
 	 * path, elf, and fd are used when an ELF file was reported with
@@ -78,7 +84,7 @@ struct drgn_debug_info_module {
 	Elf *elf;
 	int fd;
 	enum drgn_debug_info_module_state state;
-	bool bswap;
+	bool little_endian;
 	/** Error while loading. */
 	struct drgn_error *err;
 	/**
@@ -91,6 +97,32 @@ struct drgn_debug_info_module {
 	 */
 	struct drgn_debug_info_module *next;
 };
+
+struct drgn_error *drgn_error_debug_info(struct drgn_debug_info_module *module,
+					 enum drgn_debug_info_scn scn,
+					 const char *ptr, const char *message);
+
+struct drgn_debug_info_buffer {
+	struct binary_buffer bb;
+	struct drgn_debug_info_module *module;
+	enum drgn_debug_info_scn scn;
+};
+
+struct drgn_error *drgn_debug_info_buffer_error(struct binary_buffer *bb,
+						const char *pos,
+						const char *message);
+
+static inline void
+drgn_debug_info_buffer_init(struct drgn_debug_info_buffer *buffer,
+			    struct drgn_debug_info_module *module,
+			    enum drgn_debug_info_scn scn)
+{
+	binary_buffer_init(&buffer->bb, module->scns[scn]->d_buf,
+			   module->scns[scn]->d_size, module->little_endian,
+			   drgn_debug_info_buffer_error);
+	buffer->module = module;
+	buffer->scn = scn;
+}
 
 struct drgn_debug_info_module_key {
 	const void *build_id;
