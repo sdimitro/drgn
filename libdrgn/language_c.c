@@ -337,7 +337,7 @@ c_declare_variable(struct drgn_qualified_type qualified_type,
 		   struct string_callback *name, size_t indent,
 		   struct string_builder *sb)
 {
-	switch (drgn_type_kind(qualified_type.type)) {
+	SWITCH_ENUM(drgn_type_kind(qualified_type.type),
 	case DRGN_TYPE_VOID:
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
@@ -356,8 +356,7 @@ c_declare_variable(struct drgn_qualified_type qualified_type,
 		return c_declare_array(qualified_type, name, indent, sb);
 	case DRGN_TYPE_FUNCTION:
 		return c_declare_function(qualified_type, name, indent, sb);
-	}
-	UNREACHABLE();
+	)
 }
 
 static struct drgn_error *
@@ -489,7 +488,7 @@ static struct drgn_error *
 c_define_type(struct drgn_qualified_type qualified_type, size_t indent,
 	      struct string_builder *sb)
 {
-	switch (drgn_type_kind(qualified_type.type)) {
+	SWITCH_ENUM(drgn_type_kind(qualified_type.type),
 	case DRGN_TYPE_VOID:
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
@@ -511,8 +510,7 @@ c_define_type(struct drgn_qualified_type qualified_type, size_t indent,
 	case DRGN_TYPE_FUNCTION:
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "function type cannot be formatted");
-	}
-	UNREACHABLE();
+	)
 }
 
 static struct drgn_error *
@@ -708,8 +706,8 @@ c_format_int_object(const struct drgn_object *obj,
 		return NULL;
 	}
 
-	switch (obj->kind) {
-	case DRGN_OBJECT_SIGNED: {
+	switch (obj->encoding) {
+	case DRGN_OBJECT_ENCODING_SIGNED: {
 		int64_t svalue;
 
 		err = drgn_object_read_signed(obj, &svalue);
@@ -719,7 +717,7 @@ c_format_int_object(const struct drgn_object *obj,
 			return &drgn_enomem;
 		return NULL;
 	}
-	case DRGN_OBJECT_UNSIGNED: {
+	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		uint64_t uvalue;
 
 		err = drgn_object_read_unsigned(obj, &uvalue);
@@ -1456,11 +1454,8 @@ c_format_array_object(const struct drgn_object *obj,
 
 	if ((flags & DRGN_FORMAT_OBJECT_STRING) && iter.length &&
 	    is_character_type(iter.element_type.type)) {
-		if (obj->is_reference) {
-			return c_format_string(&drgn_object_program(obj)->reader,
-					       obj->reference.address,
-					       iter.length, sb);
-		} else {
+		SWITCH_ENUM(obj->kind,
+		case DRGN_OBJECT_VALUE: {
 			const unsigned char *buf;
 			uint64_t size, i;
 
@@ -1480,6 +1475,12 @@ c_format_array_object(const struct drgn_object *obj,
 				return &drgn_enomem;
 			return NULL;
 		}
+		case DRGN_OBJECT_REFERENCE:
+			return c_format_string(&drgn_object_program(obj)->reader,
+					       obj->reference.address,
+					       iter.length, sb);
+		case DRGN_OBJECT_UNAVAILABLE:
+		)
 	}
 
 	err = drgn_type_bit_size(iter.element_type.type,
@@ -1532,11 +1533,7 @@ static struct drgn_error *
 c_format_function_object(const struct drgn_object *obj,
 			 struct string_builder *sb)
 {
-	/* Function values currently aren't possible anyways. */
-	if (!obj->is_reference) {
-		return drgn_error_create(DRGN_ERROR_TYPE,
-					 "cannot format function value");
-	}
+	assert(obj->kind == DRGN_OBJECT_REFERENCE);
 	if (!string_builder_appendf(sb, "0x%" PRIx64, obj->reference.address))
 		return &drgn_enomem;
 	return NULL;
@@ -1551,11 +1548,17 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 	struct drgn_error *err;
 	struct drgn_type *underlying_type = drgn_underlying_type(obj->type);
 
+	if (drgn_type_kind(underlying_type) == DRGN_TYPE_VOID) {
+		return drgn_error_create(DRGN_ERROR_TYPE,
+					 "cannot format void object");
+	}
+
 	/*
 	 * Pointers are special because they can have an asterisk prefix if
 	 * we're dereferencing them.
 	 */
-	if (drgn_type_kind(underlying_type) == DRGN_TYPE_POINTER) {
+	if (drgn_type_kind(underlying_type) == DRGN_TYPE_POINTER &&
+	    obj->kind != DRGN_OBJECT_UNAVAILABLE) {
 		return c_format_pointer_object(obj, underlying_type, indent,
 					       one_line_columns,
 					       multi_line_columns, flags, sb);
@@ -1578,10 +1581,13 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 		    one_line_columns = 0;
 	}
 
-	switch (drgn_type_kind(underlying_type)) {
-	case DRGN_TYPE_VOID:
-		return drgn_error_create(DRGN_ERROR_TYPE,
-					 "cannot format void object");
+	if (obj->kind == DRGN_OBJECT_UNAVAILABLE) {
+		if (!string_builder_append(sb, "<unavailable>"))
+			return &drgn_enomem;
+		return NULL;
+	}
+
+	SWITCH_ENUM(drgn_type_kind(underlying_type),
 	case DRGN_TYPE_INT:
 	case DRGN_TYPE_BOOL:
 		return c_format_int_object(obj, flags, sb);
@@ -1604,9 +1610,10 @@ c_format_object_impl(const struct drgn_object *obj, size_t indent,
 					     multi_line_columns, flags, sb);
 	case DRGN_TYPE_FUNCTION:
 		return c_format_function_object(obj, sb);
-	default:
-		UNREACHABLE();
-	}
+	case DRGN_TYPE_VOID:
+	case DRGN_TYPE_TYPEDEF:
+	case DRGN_TYPE_POINTER:
+	)
 }
 
 struct drgn_error *c_format_object(const struct drgn_object *obj,
