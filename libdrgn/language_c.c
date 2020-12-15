@@ -1462,7 +1462,7 @@ c_format_array_object(const struct drgn_object *obj,
 			if (!string_builder_appendc(sb, '"'))
 				return &drgn_enomem;
 			buf = (const unsigned char *)drgn_object_buffer(obj);
-			size = drgn_buffer_object_size(obj);
+			size = drgn_object_size(obj);
 			for (i = 0; i < size; i++) {
 				if (buf[i] == '\0')
 					break;
@@ -1477,8 +1477,7 @@ c_format_array_object(const struct drgn_object *obj,
 		}
 		case DRGN_OBJECT_REFERENCE:
 			return c_format_string(&drgn_object_program(obj)->reader,
-					       obj->reference.address,
-					       iter.length, sb);
+					       obj->address, iter.length, sb);
 		case DRGN_OBJECT_UNAVAILABLE:
 		)
 	}
@@ -1534,7 +1533,7 @@ c_format_function_object(const struct drgn_object *obj,
 			 struct string_builder *sb)
 {
 	assert(obj->kind == DRGN_OBJECT_REFERENCE);
-	if (!string_builder_appendf(sb, "0x%" PRIx64, obj->reference.address))
+	if (!string_builder_appendf(sb, "0x%" PRIx64, obj->address))
 		return &drgn_enomem;
 	return NULL;
 }

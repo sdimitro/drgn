@@ -16,6 +16,7 @@ from typing import (
     Dict,
     Iterable,
     Iterator,
+    Mapping,
     Optional,
     Sequence,
     Union,
@@ -60,7 +61,7 @@ class Program:
 
     def __init__(self, platform: Optional[Platform] = None) -> None:
         """
-        This class can be constructed directly, but it is usually more
+        Create a ``Program`` with no target program. It is usually more
         convenient to use one of the :ref:`api-program-constructors`.
 
         :param platform: The platform of the program, or ``None`` if it should
@@ -796,6 +797,8 @@ class Platform:
         self, arch: Architecture, flags: Optional[PlatformFlags] = None
     ) -> None:
         """
+        Create a ``Platform``.
+
         :param arch: :attr:`Platform.arch`
         :param flags: :attr:`Platform.flags`; if ``None``, default flags for
             the architecture are used.
@@ -811,7 +814,7 @@ class Platform:
     """Processor registers on this platform."""
 
 class Architecture(enum.Enum):
-    """``Architecture`` represents an instruction set architecture."""
+    """An ``Architecture`` represents an instruction set architecture."""
 
     X86_64 = ...
     """The x86-64 architecture, a.k.a. AMD64."""
@@ -941,42 +944,79 @@ class Object:
     conflicting with structure, union, or class members. The attributes and
     methods always take precedence; use :meth:`member_()` if there is a
     conflict.
+
+    Objects are usually obtained directly from a :class:`Program`, but they can
+    be constructed manually, as well (for example, if you got a variable
+    address from a log file).
     """
 
+    @overload
     def __init__(
         self,
         prog: Program,
-        type: Union[str, Type, None] = None,
-        value: Any = None,
+        type: Union[str, Type],
+        # This should use numbers.Number, but mypy doesn't support it yet; see
+        # python/mypy#3186. Additionally, once mypy supports recursive types,
+        # we can make the Mapping and Sequence item types stricter; see
+        # python/mypy#731.
+        value: Union[IntegerLike, float, bool, Mapping[str, Any], Sequence[Any]],
         *,
-        address: Optional[IntegerLike] = None,
         byteorder: Optional[str] = None,
-        bit_offset: Optional[IntegerLike] = None,
         bit_field_size: Optional[IntegerLike] = None,
     ) -> None:
         """
-        Objects are usually obtained directly from a :class:`Program`, but they
-        can be constructed manually, as well (for example, if you got a
-        variable address from a log file).
+        Create a value object given its type and value.
 
-        :param prog: The program to create this object in.
-        :param type: The type of the object. If omitted, this is deduced from
-            *value* according to the language's rules for literals.
-        :param value: The value of this object. See :meth:`value_()`.
-        :param address: The address of this object in the program. This may not
-            be combined with *value*.
+        :param prog: Program to create the object in.
+        :param type: Type of the object.
+        :param value: Value of the object. See :meth:`value_()`.
         :param byteorder: Byte order of the object. This should be ``'little'``
             or ``'big'``. The default is ``None``, which indicates the program
-            byte order. This must be ``None`` for primitive values and
-            unavailable objects.
-        :param bit_offset: Offset in bits from the object's address to the
-            beginning of the object. The default is ``None``, which means no
-            offset. This must be ``None`` for primitive values and unavailable
-            objects.
-        :param bit_field_size: Size in bits of this object if it is a bit
-            field. The default is ``None``, which means the object is not a bit
-            field.
+            byte order. This must be ``None`` for primitive values.
+        :param bit_field_size: Size in bits of the object if it is a bit field.
+            The default is ``None``, which means the object is not a bit field.
         """
+        ...
+    @overload
+    def __init__(self, prog: Program, *, value: Union[int, float, bool]) -> None:
+        """
+        Create a value object from a "literal".
+
+        This is used to emulate a literal number in the source code of the
+        program. The type is deduced from *value* according to the language's
+        rules for literals.
+
+        :param value: Value of the literal.
+        """
+        ...
+    @overload
+    def __init__(
+        self,
+        prog: Program,
+        type: Union[str, Type],
+        *,
+        address: IntegerLike,
+        byteorder: Optional[str] = None,
+        bit_offset: IntegerLike = 0,
+        bit_field_size: Optional[IntegerLike] = None,
+    ) -> None:
+        """
+        Create a reference object.
+
+        :param address: Address of the object in the program.
+        :param bit_offset: Offset in bits from *address* to the beginning of
+            the object.
+        """
+        ...
+    @overload
+    def __init__(
+        self,
+        prog: Program,
+        type: Union[str, Type],
+        *,
+        bit_field_size: Optional[IntegerLike] = None,
+    ) -> None:
+        """Create an unavailable object."""
         ...
     prog_: Program
     """Program that this object is from."""
@@ -999,7 +1039,7 @@ class Object:
     bit_offset_: Optional[int]
     """
     Offset in bits from this object's address to the beginning of the object if
-    it is a reference or a non-primitive value, ``None`` otherwise.
+    it is a reference, ``None`` otherwise.
     """
 
     bit_field_size_: Optional[int]
@@ -1553,6 +1593,8 @@ class TypeMember:
         bit_field_size: int = 0,
     ) -> None:
         """
+        Create a ``TypeMember``.
+
         :param type: :attr:`TypeMember.type`; may also be a callable that
             takes no arguments and returns a :class:`Type`.
         :param name: :attr:`TypeMember.name`
@@ -1593,6 +1635,8 @@ class TypeEnumerator:
 
     def __init__(self, name: str, value: int) -> None:
         """
+        Create a ``TypeEnumerator``.
+
         :param name: :attr:`TypeEnumerator.name`
         :param value: :attr:`TypeEnumerator.value`
         """
@@ -1615,6 +1659,8 @@ class TypeParameter:
         self, type: Union[Type, Callable[[], Type]], name: Optional[str] = None
     ) -> None:
         """
+        Create a ``TypeParameter``.
+
         :param type: :attr:`TypeParameter.type`; may also be a callable that
             takes no arguments and returns a :class:`Type`.
         :param name: :attr:`TypeParameter.name`
