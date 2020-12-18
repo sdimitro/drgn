@@ -19,6 +19,7 @@
 #include <assert.h>
 #include <limits.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/types.h>
 
 /**
@@ -840,8 +841,72 @@ struct drgn_error *drgn_parameter_type(struct drgn_type_parameter *parameter,
  * @param[out] ret Returned size.
  * @return @c NULL on success, non-@c NULL on error.
  */
-struct drgn_error *drgn_type_sizeof(struct drgn_type *type,
-				    uint64_t *ret);
+struct drgn_error *drgn_type_sizeof(struct drgn_type *type, uint64_t *ret);
+
+/**
+ * Get the offset in bytes of a member from the start of a structure, union, or
+ * class type.
+ *
+ * This corresponds to @c offsetof() in C.
+ *
+ * @param[in] type Type which contains the member.
+ * @param[in] member_designator Name of the member in @p type. This can include
+ * one or more member references and zero or more array subscripts.
+ */
+struct drgn_error *drgn_type_offsetof(struct drgn_type *type,
+				      const char *member_designator,
+				      uint64_t *ret);
+
+/**
+ * Like @ref drgn_type_find_member(), but takes the length of @p member_name.
+ */
+struct drgn_error *
+drgn_type_find_member_len(struct drgn_type *type, const char *member_name,
+			  size_t member_name_len,
+			  struct drgn_type_member **member_ret,
+			  uint64_t *bit_offset_ret);
+
+/**
+ * Find a member in a @ref drgn_type by name.
+ *
+ * If the type has any unnamed members, this also matches members of those
+ * unnamed members, recursively.
+ *
+ * @param[in] type Structure, union, or class type.
+ * @param[in] member_name Name of member.
+ * @param[out] member_ret Returned member.
+ * @param[out] bit_offset Offset in bits from the beginning of @p type to the
+ * beginning of the member. This can be different from @ref
+ * drgn_type_member::bit_offset if the returned member was found in an unnamed
+ * member of @p type.
+ */
+static inline struct drgn_error *
+drgn_type_find_member(struct drgn_type *type, const char *member_name,
+		      struct drgn_type_member **member_ret,
+		      uint64_t *bit_offset_ret)
+{
+	return drgn_type_find_member_len(type, member_name, strlen(member_name),
+					 member_ret, bit_offset_ret);
+}
+
+/** Like @ref drgn_type_has_member(), but takes the length of @p member_name. */
+struct drgn_error *drgn_type_has_member_len(struct drgn_type *type,
+					    const char *member_name,
+					    size_t member_name_len, bool *ret);
+
+/**
+ * Return whether a @ref drgn_type has a member with the given name.
+ *
+ * @param[in] type Structure, union, or class type.
+ * @param[in] member_name Name of member.
+ */
+static inline struct drgn_error *drgn_type_has_member(struct drgn_type *type,
+						      const char *member_name,
+						      bool *ret)
+{
+	return drgn_type_has_member_len(type, member_name, strlen(member_name),
+					ret);
+}
 
 /**
  * Compare two @ref drgn_type%s for equality.
@@ -1404,48 +1469,6 @@ struct drgn_element_info {
 struct drgn_error *drgn_program_element_info(struct drgn_program *prog,
 					     struct drgn_type *type,
 					     struct drgn_element_info *ret);
-
-/**
- * Type, offset, and bit field size of an object member.
- *
- * @sa drgn_type_member
- */
-struct drgn_member_info {
-	/** Type of the member. */
-	struct drgn_qualified_type qualified_type;
-	/**
-	 * Offset in bits from the beginning of the type to the beginning of the
-	 * member.
-	 *
-	 * If the member was found inside an unnamed member of the enclosing
-	 * type, this is the offset from the beginning of the type passed to
-	 * @ref drgn_program_member_info().
-	 *
-	 * See @ref drgn_type_member::bit_offset.
-	 */
-	uint64_t bit_offset;
-	/** See @ref drgn_type_member::bit_field_size. */
-	uint64_t bit_field_size;
-};
-
-/**
- * Get the type, offset, and bit field size of a member of a @ref drgn_type by
- * name.
- *
- * If the type has any unnamed members, this also matches members of those
- * unnamed members, recursively.
- *
- * @param[in] prog Program.
- * @param[in] type Structure or union type. After this function is called, this
- * type must remain valid until the program is destroyed.
- * @param[in] member_name Name of member.
- * @param[out] ret Returned member information.
- * @return @c NULL on success, non-@c NULL on error.
- */
-struct drgn_error *drgn_program_member_info(struct drgn_program *prog,
-					    struct drgn_type *type,
-					    const char *member_name,
-					    struct drgn_member_info *ret);
 
 /** @} */
 

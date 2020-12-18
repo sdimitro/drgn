@@ -12,6 +12,7 @@ from drgn import (
     TypeKind,
     TypeMember,
     TypeParameter,
+    offsetof,
     sizeof,
 )
 from tests import DEFAULT_LANGUAGE, MockProgramTestCase
@@ -769,6 +770,66 @@ class TestType(MockProgramTestCase):
                 TypeMember(self.prog.int_type("int", 4, True), "y", 32, 4),
                 TypeMember(self.prog.int_type("int", 4, True), "z", 64, 4),
             ),
+        )
+
+    def test_member(self):
+        t = self.prog.struct_type(
+            None,
+            8,
+            (
+                TypeMember(self.prog.int_type("int", 4, True), "x", 0),
+                TypeMember(
+                    self.prog.struct_type(
+                        None,
+                        4,
+                        (TypeMember(self.prog.int_type("int", 4, True), "y", 0),),
+                    ),
+                    None,
+                    32,
+                ),
+            ),
+        )
+        self.assertEqual(
+            t.member("x"), TypeMember(self.prog.int_type("int", 4, True), "x", 0)
+        )
+        self.assertEqual(
+            t.member("y"), TypeMember(self.prog.int_type("int", 4, True), "y", 32)
+        )
+        self.assertRaises(LookupError, t.member, "z")
+
+        self.assertEqual(
+            t.members[1].type.member("y"),
+            TypeMember(self.prog.int_type("int", 4, True), "y", 0),
+        )
+
+        self.assertRaises(TypeError, self.prog.int_type("int", 4, True).member, "foo")
+
+    def test_offsetof(self):
+        self.assertEqual(offsetof(self.line_segment_type, "b"), 8)
+        self.assertEqual(offsetof(self.line_segment_type, "a.y"), 4)
+        self.assertRaisesRegex(
+            LookupError,
+            "'struct line_segment' has no member 'c'",
+            offsetof,
+            self.line_segment_type,
+            "c.x",
+        )
+
+        small_point_type = self.prog.struct_type(
+            "small_point",
+            1,
+            (
+                TypeMember(self.prog.int_type("int", 4, True), "x", 0, 4),
+                TypeMember(self.prog.int_type("int", 4, True), "y", 4, 4),
+            ),
+        )
+        self.assertEqual(offsetof(small_point_type, "x"), 0)
+        self.assertRaisesRegex(
+            ValueError,
+            "member is not byte-aligned",
+            offsetof,
+            small_point_type,
+            "y",
         )
 
     def test_enum(self):
