@@ -19,6 +19,7 @@ from drgn import (
     TypeKind,
     TypeMember,
     TypeParameter,
+    TypeTemplateParameter,
 )
 
 DEFAULT_LANGUAGE = Language.C
@@ -188,16 +189,19 @@ def identical(a, b):
                         "enumerators",
                         "parameters",
                         "is_variadic",
+                        "template_parameters",
                     )
                     if hasattr(a, name) or hasattr(b, name)
                 ],
             )
         elif isinstance(a, TypeMember) and isinstance(b, TypeMember):
-            return _identical_attrs(
-                a, b, ("type", "name", "bit_offset", "bit_field_size")
-            )
+            return _identical_attrs(a, b, ("object", "name", "bit_offset"))
         elif isinstance(a, TypeParameter) and isinstance(b, TypeParameter):
-            return _identical_attrs(a, b, ("type", "name"))
+            return _identical_attrs(a, b, ("default_argument", "name"))
+        elif isinstance(a, TypeTemplateParameter) and isinstance(
+            b, TypeTemplateParameter
+        ):
+            return _identical_attrs(a, b, ("argument", "name", "is_default"))
         elif (isinstance(a, tuple) and isinstance(b, tuple)) or (
             isinstance(a, list) and isinstance(b, list)
         ):

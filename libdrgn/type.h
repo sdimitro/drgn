@@ -78,128 +78,6 @@ DEFINE_HASH_SET_TYPE(drgn_type_set, struct drgn_type *)
 #endif
 
 /**
- * @defgroup LazyTypes Lazy types
- *
- * Lazily-evaluated types.
- *
- * The graph of types in a program can be very deep (and often cyclical), so
- * drgn lazily evaluates the types of compound type members and function
- * parameters.
- *
- * @{
- */
-
-/**
- * Thunk which evaluates to a @ref drgn_qualified_type.
- *
- * This is used for @ref drgn_lazy_type.
- *
- * Note that the thunk callbacks take no additional arguments. A "closure" can
- * be created by embedding this structure in a structure containing the
- * necessary arguments; the closure type can then be accessed through a macro
- * like @c container_of().
- */
-struct drgn_type_thunk {
-	/** Program owning this thunk. */
-	struct drgn_program *prog;
-	/**
-	 * Callback to evaluate this thunk to a @ref drgn_qualified_type.
-	 *
-	 * This should initialize the passed qualified type. If this succeeds,
-	 * the thunk will then be freed with @ref drgn_type_thunk::free_fn().
-	 * Otherwise, this may be called again.
-	 */
-	struct drgn_error *(*evaluate_fn)(struct drgn_type_thunk *,
-					  struct drgn_qualified_type *);
-	/**
-	 * Callback to free this thunk.
-	 *
-	 * @ref drgn_type_thunk::evaluate_fn() may or may not have been called.
-	 */
-	void (*free_fn)(struct drgn_type_thunk *);
-};
-
-/**
- * Free a @ref drgn_type_thunk.
- *
- * @param[in] thunk Thunk to free.
- */
-static inline void drgn_type_thunk_free(struct drgn_type_thunk *thunk)
-{
-	thunk->free_fn(thunk);
-}
-
-/**
- * Create a @ref drgn_lazy_type from a @ref drgn_type_thunk.
- *
- * @param[out] lazy_type Lazy type to initialize.
- * @param[in] thunk Thunk to wrap.
- */
-static inline void drgn_lazy_type_init_thunk(struct drgn_lazy_type *lazy_type,
-					     struct drgn_type_thunk *thunk)
-{
-	lazy_type->thunk = thunk;
-	lazy_type->qualifiers = -1;
-}
-
-/**
- * Create a @ref drgn_lazy_type from a @ref drgn_type and qualifiers.
- *
- * @param[out] lazy_type Lazy type to initialize.
- * @param[in] type Type to wrap. May be @c NULL.
- * @param[in] qualifiers Type qualifiers. Must be 0 if type is @c NULL. Must not
- * be -1.
- */
-static inline void
-drgn_lazy_type_init_evaluated(struct drgn_lazy_type *lazy_type,
-			      struct drgn_type *type,
-			      enum drgn_qualifiers qualifiers)
-{
-	if (!type)
-		assert(!qualifiers);
-	assert(qualifiers != (enum drgn_qualifiers)-1);
-	lazy_type->type = type;
-	lazy_type->qualifiers = qualifiers;
-}
-
-/**
- * Get whether a @ref drgn_lazy_type has been evaluated.
- *
- * @param[in] lazy_type Lazy type to check.
- * @return Whether the lazy type is evaluated.
- */
-static inline bool drgn_lazy_type_is_evaluated(struct drgn_lazy_type *lazy_type)
-{
-	return lazy_type->qualifiers != (enum drgn_qualifiers)-1;
-}
-
-/**
- * Evaluate a @ref drgn_lazy_type to a @ref drgn_qualified_type.
- *
- * If this succeeds, the lazy type is considered evaluated and future calls will
- * always succeed and return the cached result. If this fails, the lazy type
- * remains in a valid, unevaluated state.
- *
- * @param[in] lazy_type Lazy type to evaluate.
- * @param[out] ret Evaluated type.
- * @return @c NULL on success, non-@c NULL on error.
- */
-struct drgn_error *drgn_lazy_type_evaluate(struct drgn_lazy_type *lazy_type,
-					   struct drgn_qualified_type *ret);
-
-/**
- * Free a @ref drgn_lazy_type.
- *
- * If the type has not been evaluted, this frees the @ref drgn_type_thunk.
- * Otherwise, this is a no-op.
- *
- * @param[in] lazy_type Lazy type to free.
- */
-void drgn_lazy_type_deinit(struct drgn_lazy_type *lazy_type);
-
-/** @} */
-
-/**
  * @defgroup TypeCreation Type creation
  *
  * Creating type descriptors.
@@ -301,11 +179,34 @@ struct drgn_error *drgn_complex_type_create(struct drgn_program *prog,
 					    const struct drgn_language *lang,
 					    struct drgn_type **ret);
 
+DEFINE_VECTOR_TYPE(drgn_type_template_parameter_vector,
+		   struct drgn_type_template_parameter)
+
+/**
+ * Common builder shared between compound and function types for template
+ * parameters.
+ */
+struct drgn_template_parameters_builder {
+	struct drgn_program *prog;
+	struct drgn_type_template_parameter_vector parameters;
+};
+
+/**
+ * Add a @ref drgn_type_template_parameter to a @ref
+ * drgn_template_parameters_builder.
+ *
+ * On success, @p builder takes ownership of @p argument.
+ */
+struct drgn_error *
+drgn_template_parameters_builder_add(struct drgn_template_parameters_builder *builder,
+				     const union drgn_lazy_object *argument,
+				     const char *name, bool is_default);
+
 DEFINE_VECTOR_TYPE(drgn_type_member_vector, struct drgn_type_member)
 
 /** Builder for members of a structure, union, or class type. */
 struct drgn_compound_type_builder {
-	struct drgn_program *prog;
+	struct drgn_template_parameters_builder template_builder;
 	enum drgn_type_kind kind;
 	struct drgn_type_member_vector members;
 };
@@ -331,56 +232,37 @@ drgn_compound_type_builder_deinit(struct drgn_compound_type_builder *builder);
 /**
  * Add a @ref drgn_type_member to a @ref drgn_compound_type_builder.
  *
- * On success, @p builder takes ownership of @p type.
+ * On success, @p builder takes ownership of @p object.
  */
 struct drgn_error *
 drgn_compound_type_builder_add_member(struct drgn_compound_type_builder *builder,
-				      struct drgn_lazy_type type,
-				      const char *name, uint64_t bit_offset,
-				      uint64_t bit_field_size);
+				      const union drgn_lazy_object *object,
+				      const char *name, uint64_t bit_offset);
 
 /**
  * Create a structure, union, or class type.
  *
  * On success, this takes ownership of @p builder.
  *
- * @param[in] builder Builder containing members. @c type and @c name of each
- * member must remain valid for the lifetime of @c builder->prog.
+ * @param[in] builder Builder containing members and template parameters. @c
+ * object/@c argument and @c name of each member and template parameter must
+ * remain valid for the lifetime of @c prog. If incomplete, must not contain any
+ * members.
  * @param[in] tag Name of the type. Not copied; must remain valid for the
- * lifetime of @c builder->prog. May be @c NULL if the type is anonymous.
- * @param[in] size Size of the type in bytes.
+ * lifetime of @c prog. May be @c NULL if the type is anonymous.
+ * @param[in] size Size of the type in bytes. Must be zero if the type is
+ * incomplete.
+ * @param[in] is_complete Whether the type is complete.
  * @param[in] lang Language of the type or @c NULL for the default language of
- * @c builder->prog.
+ * @c prog.
  * @param[out] ret Returned type.
  * @return @c NULL on success, non-@c NULL on error.
  */
 struct drgn_error *
 drgn_compound_type_create(struct drgn_compound_type_builder *builder,
-			  const char *tag, uint64_t size,
+			  const char *tag, uint64_t size, bool is_complete,
 			  const struct drgn_language *lang,
 			  struct drgn_type **ret);
-
-/**
- * Create an incomplete structure, union, or class type.
- *
- * @c size and @c num_members are set to zero and @c is_complete is set to @c
- * false.
- *
- * @param[in] prog Program owning type.
- * @param[in] kind One of @ref DRGN_TYPE_STRUCT, @ref DRGN_TYPE_UNION, or @ref
- * DRGN_TYPE_CLASS.
- * @param[in] tag Name of the type. Not copied; must remain valid for the
- * lifetime of @p prog. May be @c NULL if the type is anonymous.
- * @param[in] lang Language of the type or @c NULL for the default language of
- * @p prog.
- * @param[out] ret Returned type.
- * @return @c NULL on success, non-@c NULL on error.
- */
-struct drgn_error *
-drgn_incomplete_compound_type_create(struct drgn_program *prog,
-				     enum drgn_type_kind kind, const char *tag,
-				     const struct drgn_language *lang,
-				     struct drgn_type **ret);
 
 DEFINE_VECTOR_TYPE(drgn_type_enumerator_vector, struct drgn_type_enumerator)
 
@@ -531,7 +413,7 @@ DEFINE_VECTOR_TYPE(drgn_type_parameter_vector, struct drgn_type_parameter)
 
 /** Builder for parameters of a function type. */
 struct drgn_function_type_builder {
-	struct drgn_program *prog;
+	struct drgn_template_parameters_builder template_builder;
 	struct drgn_type_parameter_vector parameters;
 };
 
@@ -550,11 +432,11 @@ drgn_function_type_builder_deinit(struct drgn_function_type_builder *builder);
 /**
  * Add a @ref drgn_type_parameter to a @ref drgn_function_type_builder.
  *
- * On success, @p builder takes ownership of @p type.
+ * On success, @p builder takes ownership of @p default_argument.
  */
 struct drgn_error *
 drgn_function_type_builder_add_parameter(struct drgn_function_type_builder *builder,
-					 struct drgn_lazy_type type,
+					 const union drgn_lazy_object *default_argument,
 					 const char *name);
 
 /**
@@ -562,12 +444,13 @@ drgn_function_type_builder_add_parameter(struct drgn_function_type_builder *buil
  *
  * On success, this takes ownership of @p builder.
  *
- * @param[in] builder Builder containing parameters. @c type and @c name of each
- * parameter must remain valid for the lifetime of @c builder->prog.
+ * @param[in] builder Builder containing parameters and template parameters. @c
+ * default_argument/@c argument and @c name of each parameter and template
+ * parameter must remain valid for the lifetime of @c prog.
  * @param[in] return_type Type returned by the function type.
  * @param[in] is_variadic Whether the function type is variadic.
  * @param[in] lang Language of the type or @c NULL for the default language of
- * @c builder->prog.
+ * @c prog.
  * @param[out] ret Returned type.
  * @return @c NULL on success, non-@c NULL on error.
  */
