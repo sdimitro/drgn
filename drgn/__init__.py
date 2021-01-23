@@ -85,7 +85,7 @@ from _drgn import (
     reinterpret,
     sizeof,
 )
-from drgn.internal.version import version as __version__
+from drgn.internal.version import __version__ as __version__
 
 __all__ = (
     "Architecture",
@@ -210,7 +210,7 @@ def execscript(path: str, *args: str) -> None:
         sys.argv.extend(args)
 
         with _open_code(path) as f:
-            code = pkgutil.read_code(f)  # type: ignore[attr-defined]
+            code = pkgutil.read_code(f)
         if code is None:
             with _open_code(path) as f:
                 code = compile(f.read(), path, "exec")

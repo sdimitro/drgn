@@ -127,7 +127,19 @@ class egg_info(_egg_info):
 class test(Command):
     description = "run unit tests after in-place build"
 
-    KERNELS = ["5.10", "5.9", "5.8", "5.7", "5.6", "5.4", "4.19", "4.14", "4.9", "4.4"]
+    KERNELS = [
+        "5.11",
+        "5.10",
+        "5.9",
+        "5.8",
+        "5.7",
+        "5.6",
+        "5.4",
+        "4.19",
+        "4.14",
+        "4.9",
+        "4.4",
+    ]
 
     user_options = [
         (
@@ -289,7 +301,9 @@ def get_version():
         else:
             # The saved version must start with the public version.
             match = re.search(
-                fr'^version = "{re.escape(public_version)}([^"]*)"$', version_py, re.M
+                fr'^__version__ = "{re.escape(public_version)}([^"]*)"$',
+                version_py,
+                re.M,
             )
             if match:
                 local_version = match.group(1)
@@ -298,7 +312,7 @@ def get_version():
 
     version = public_version + local_version
     # Update version.py if necessary.
-    new_version_py = f'version = "{version}"\n'
+    new_version_py = f'__version__ = "{version}"\n'
     if new_version_py != version_py:
         with open("drgn/internal/version.py", "w") as f:
             f.write(new_version_py)
