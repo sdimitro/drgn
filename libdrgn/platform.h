@@ -11,7 +11,7 @@
 
 struct drgn_register {
 	const char *name;
-	enum drgn_register_number number;
+	uint64_t dwarf_number;
 };
 
 /* Page table iterator. */
@@ -92,6 +92,7 @@ drgn_architecture_register_by_name(const struct drgn_architecture_info *arch,
 
 extern const struct drgn_architecture_info arch_info_unknown;
 extern const struct drgn_architecture_info arch_info_x86_64;
+extern const struct drgn_architecture_info arch_info_ppc64;
 
 struct drgn_platform {
 	const struct drgn_architecture_info *arch;

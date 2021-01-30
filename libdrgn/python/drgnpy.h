@@ -39,6 +39,13 @@
 
 #define DRGNPY_PUBLIC __attribute__((visibility("default")))
 
+#define Py_RETURN_BOOL(cond) do {	\
+	if (cond)			\
+		Py_RETURN_TRUE;		\
+	else				\
+		Py_RETURN_FALSE;	\
+} while (0)
+
 typedef struct {
 	PyObject_HEAD
 	struct drgn_object obj;
@@ -89,6 +96,11 @@ typedef struct {
 	 */
 	struct pyobjectp_set objects;
 } Program;
+
+typedef struct {
+	PyObject_HEAD
+	const struct drgn_register *reg;
+} Register;
 
 typedef struct {
 	PyObject_HEAD
@@ -150,7 +162,6 @@ extern PyObject *PrimitiveType_class;
 extern PyObject *ProgramFlags_class;
 extern PyObject *Qualifiers_class;
 extern PyObject *TypeKind_class;
-extern PyStructSequence_Desc Register_desc;
 extern PyTypeObject DrgnObject_type;
 extern PyTypeObject DrgnType_type;
 extern PyTypeObject FaultError_type;
