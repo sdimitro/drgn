@@ -36,7 +36,7 @@ from yarl import URL
 
 from util import nproc
 
-logger = logging.getLogger("asyncio")
+logger = logging.getLogger(__name__)
 
 
 KERNEL_CONFIG_PATH = Path(__file__).parent / "config"
@@ -229,7 +229,8 @@ async def build_kernel(
         .strip()
     )
 
-    modules_dir = build_dir / "install" / "lib" / "modules" / release
+    install_dir = build_dir / "install"
+    modules_dir = install_dir / "lib" / "modules" / release
 
     await check_call(
         "make",
@@ -284,6 +285,7 @@ async def build_kernel(
         raise CalledProcessError(tar_returncode, tar_command)
     if zstd_returncode != 0:
         raise CalledProcessError(zstd_returncode, zstd_command)
+    shutil.rmtree(install_dir)
     elapsed = time.monotonic() - start
     logger.info("packaged %s in %s", commit, humanize_duration(elapsed))
 
@@ -313,7 +315,7 @@ async def try_build_kernel(commit: str) -> Optional[Tuple[str, Path]]:
             try:
                 return await build_kernel(commit, build_dir, log_file)
             except Exception:
-                logger.exception("building %s failed; see %r", commit, repr(log_path))
+                logger.exception("building %s failed; see %r", commit, str(log_path))
                 return None
     except Exception:
         logger.exception("preparing %r failed", str(build_dir))

@@ -37,7 +37,7 @@
     } while (0)
 #endif
 
-#define DRGNPY_PUBLIC __attribute__((visibility("default")))
+#define DRGNPY_PUBLIC __attribute__((__visibility__("default")))
 
 #define Py_RETURN_BOOL(cond) do {	\
 	if (cond)			\
@@ -236,7 +236,6 @@ DrgnType *Program_void_type(Program *self, PyObject *args, PyObject *kwds);
 DrgnType *Program_int_type(Program *self, PyObject *args, PyObject *kwds);
 DrgnType *Program_bool_type(Program *self, PyObject *args, PyObject *kwds);
 DrgnType *Program_float_type(Program *self, PyObject *args, PyObject *kwds);
-DrgnType *Program_complex_type(Program *self, PyObject *args, PyObject *kwds);
 DrgnType *Program_struct_type(Program *self, PyObject *args, PyObject *kwds);
 DrgnType *Program_union_type(Program *self, PyObject *args, PyObject *kwds);
 DrgnType *Program_class_type(Program *self, PyObject *args, PyObject *kwds);
@@ -249,7 +248,6 @@ DrgnType *Program_function_type(Program *self, PyObject *args, PyObject *kwds);
 int append_string(PyObject *parts, const char *s);
 int append_format(PyObject *parts, const char *format, ...);
 PyObject *join_strings(PyObject *parts);
-PyObject *byteorder_string(bool little_endian);
 
 struct byteorder_arg {
 	bool allow_none;

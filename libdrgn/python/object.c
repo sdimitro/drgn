@@ -52,14 +52,12 @@ static int DrgnObject_literal(struct drgn_object *res, PyObject *literal)
 static int serialize_py_object(struct drgn_program *prog, char *buf,
 			       uint64_t buf_bit_size, uint64_t bit_offset,
 			       PyObject *value_obj,
-			       struct drgn_object_type *type,
-			       bool little_endian);
+			       const struct drgn_object_type *type);
 
 static int serialize_compound_value(struct drgn_program *prog, char *buf,
 				    uint64_t buf_bit_size, uint64_t bit_offset,
 				    PyObject *value_obj,
-				    struct drgn_object_type *type,
-				    bool little_endian)
+				    const struct drgn_object_type *type)
 {
 	struct drgn_error *err;
 	int ret = -1;
@@ -117,17 +115,15 @@ static int serialize_compound_value(struct drgn_program *prog, char *buf,
 			goto out;
 		}
 
-		struct drgn_object_type member_type = {
-			.type = member_qualified_type.type,
-			.qualifiers = member_qualified_type.qualifiers,
-			.underlying_type =
-				drgn_underlying_type(member_qualified_type.type),
-			.bit_field_size = member_bit_field_size,
-		};
+		struct drgn_object_type member_type;
+		err = drgn_object_type(member_qualified_type,
+				       member_bit_field_size, &member_type);
+		if (err)
+			goto out;
 		if (serialize_py_object(prog, buf, buf_bit_size,
-					bit_offset + member->bit_offset,
+					bit_offset + member_bit_offset,
 					PyTuple_GET_ITEM(item, 1),
-					&member_type, little_endian) == -1)
+					&member_type) == -1)
 			goto out;
 	}
 
@@ -140,35 +136,25 @@ out:
 static int serialize_array_value(struct drgn_program *prog, char *buf,
 				 uint64_t buf_bit_size, uint64_t bit_offset,
 				 PyObject *value_obj,
-				 struct drgn_object_type *type,
-				 bool little_endian)
+				 const struct drgn_object_type *type)
 {
 	struct drgn_error *err;
-	struct drgn_qualified_type qualified_type;
-	struct drgn_object_type element_type;
-	uint64_t element_bit_size, length;
-	PyObject *seq;
-	size_t seq_length, i;
 
-	qualified_type = drgn_type_type(type->underlying_type);
-	element_type.type = qualified_type.type;
-	element_type.qualifiers = qualified_type.qualifiers;
-	element_type.underlying_type = drgn_underlying_type(element_type.type);
-	element_type.bit_field_size = 0;
-	err = drgn_type_bit_size(element_type.underlying_type,
-				 &element_bit_size);
+	struct drgn_object_type element_type;
+	err = drgn_object_type(drgn_type_type(type->underlying_type), 0,
+			       &element_type);
 	if (err) {
 		set_drgn_error(err);
 		return -1;
 	}
 
-	length = drgn_type_length(type->underlying_type);
+	uint64_t length = drgn_type_length(type->underlying_type);
 	if (length > PY_SSIZE_T_MAX) {
 		PyErr_NoMemory();
 		return -1;
 	}
 
-	seq = PySequence_Fast(value_obj, "");
+	PyObject *seq = PySequence_Fast(value_obj, "");
 	if (!seq) {
 		if (PyErr_ExceptionMatches(PyExc_TypeError)) {
 			set_error_type_name("'%s' value must be iterable",
@@ -176,7 +162,7 @@ static int serialize_array_value(struct drgn_program *prog, char *buf,
 		}
 		return -1;
 	}
-	seq_length = PySequence_Fast_GET_SIZE(seq);
+	size_t seq_length = PySequence_Fast_GET_SIZE(seq);
 	if (seq_length > length) {
 		Py_DECREF(seq);
 		PyErr_SetString(PyExc_ValueError,
@@ -184,11 +170,11 @@ static int serialize_array_value(struct drgn_program *prog, char *buf,
 		return -1;
 	}
 
-	for (i = 0; i < seq_length; i++) {
+	for (size_t i = 0; i < seq_length; i++) {
 		if (serialize_py_object(prog, buf, buf_bit_size,
-					bit_offset + i * element_bit_size,
+					bit_offset + i * element_type.bit_size,
 					PySequence_Fast_GET_ITEM(seq, i),
-					&element_type, little_endian) == -1) {
+					&element_type) == -1) {
 			Py_DECREF(seq);
 			return -1;
 		}
@@ -201,26 +187,12 @@ static int serialize_array_value(struct drgn_program *prog, char *buf,
 static int serialize_py_object(struct drgn_program *prog, char *buf,
 			       uint64_t buf_bit_size, uint64_t bit_offset,
 			       PyObject *value_obj,
-			       struct drgn_object_type *type,
-			       bool little_endian)
+			       const struct drgn_object_type *type)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size, bit_end;
 
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);
-	if (err) {
-		set_drgn_error(err);
-		return -1;
-	}
-
-	err = sanity_check_object(encoding, type->bit_field_size, bit_size);
-	if (err) {
-		set_drgn_error(err);
-		return -1;
-	}
-
-	if (__builtin_add_overflow(bit_offset, bit_size, &bit_end) ||
+	uint64_t bit_end;
+	if (__builtin_add_overflow(bit_offset, type->bit_size, &bit_end) ||
 	    bit_end > buf_bit_size) {
 		err = drgn_error_create(DRGN_ERROR_OUT_OF_BOUNDS,
 					"out of bounds of value");
@@ -228,75 +200,70 @@ static int serialize_py_object(struct drgn_program *prog, char *buf,
 		return -1;
 	}
 
-	switch (encoding) {
+	switch (type->encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED:
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
-		PyObject *long_obj;
-		union {
-			int64_t svalue;
-			uint64_t uvalue;
-		} tmp;
-
 		if (!PyNumber_Check(value_obj)) {
 			set_error_type_name("'%s' value must be number",
 					    drgn_object_type_qualified(type));
 			return -1;
 		}
-		long_obj = PyNumber_Long(value_obj);
+		PyObject *long_obj = PyNumber_Long(value_obj);
 		if (!long_obj)
 			return -1;
+		union {
+			int64_t svalue;
+			uint64_t uvalue;
+		} tmp;
 		tmp.uvalue = PyLong_AsUnsignedLongLongMask(long_obj);
 		Py_DECREF(long_obj);
 		if (tmp.uvalue == (unsigned long long)-1 && PyErr_Occurred())
 			return -1;
-		if (encoding == DRGN_OBJECT_ENCODING_SIGNED)
-			tmp.svalue = truncate_signed(tmp.svalue, bit_size);
-		else
-			tmp.uvalue = truncate_unsigned(tmp.uvalue, bit_size);
-		serialize_bits(buf, bit_offset, tmp.uvalue, bit_size,
-			       little_endian);
+		if (type->encoding == DRGN_OBJECT_ENCODING_SIGNED) {
+			tmp.svalue = truncate_signed(tmp.svalue,
+						     type->bit_size);
+		} else {
+			tmp.uvalue = truncate_unsigned(tmp.uvalue,
+						       type->bit_size);
+		}
+		serialize_bits(buf, bit_offset, tmp.uvalue, type->bit_size,
+			       type->little_endian);
 		return 0;
 	}
 	case DRGN_OBJECT_ENCODING_FLOAT: {
+		if (!PyNumber_Check(value_obj)) {
+			set_error_type_name("'%s' value must be number",
+					    drgn_object_type_qualified(type));
+			return -1;
+		}
+		double fvalue = PyFloat_AsDouble(value_obj);
+		if (fvalue == -1.0 && PyErr_Occurred())
+			return -1;
 		union {
 			uint64_t uvalue;
 			double fvalue64;
 			float fvalue32;
 		} tmp;
-		double fvalue;
-
-		if (!PyNumber_Check(value_obj)) {
-			set_error_type_name("'%s' value must be number",
-					    drgn_object_type_qualified(type));
-			return -1;
-		}
-		fvalue = PyFloat_AsDouble(value_obj);
-		if (fvalue == -1.0 && PyErr_Occurred())
-			return -1;
-		if (bit_size == 64)
+		if (type->bit_size == 64)
 			tmp.fvalue64 = fvalue;
 		else
 			tmp.fvalue32 = fvalue;
-		serialize_bits(buf, bit_offset, tmp.uvalue, bit_size,
-			       little_endian);
+		serialize_bits(buf, bit_offset, tmp.uvalue, type->bit_size,
+			       type->little_endian);
 		return 0;
 	}
 	case DRGN_OBJECT_ENCODING_BUFFER:
 		switch (drgn_type_kind(type->underlying_type)) {
-		case DRGN_TYPE_COMPLEX:
-			PyErr_SetString(PyExc_NotImplementedError,
-					"creating complex object is not implemented");
-			return -1;
 		case DRGN_TYPE_STRUCT:
 		case DRGN_TYPE_UNION:
 		case DRGN_TYPE_CLASS:
 			return serialize_compound_value(prog, buf, buf_bit_size,
 							bit_offset, value_obj,
-							type, little_endian);
+							type);
 		case DRGN_TYPE_ARRAY:
 			return serialize_array_value(prog, buf, buf_bit_size,
 						     bit_offset, value_obj,
-						     type, little_endian);
+						     type);
 		default:
 			break;
 		}
@@ -309,30 +276,18 @@ static int serialize_py_object(struct drgn_program *prog, char *buf,
 
 static int buffer_object_from_value(struct drgn_object *res,
 				    struct drgn_qualified_type qualified_type,
-				    PyObject *value_obj,
-				    enum drgn_byte_order byte_order)
+				    PyObject *value_obj)
 {
 	struct drgn_error *err;
 
-	bool little_endian;
-	err = drgn_byte_order_to_little_endian(drgn_object_program(res),
-					       byte_order, &little_endian);
-	if (err) {
-		set_drgn_error(err);
-		return -1;
-	}
-
 	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-	err = drgn_object_set_common(qualified_type, 0, &type, &encoding,
-				     &bit_size);
+	err = drgn_object_type(qualified_type, 0, &type);
 	if (err) {
 		set_drgn_error(err);
 		return -1;
 	}
 
-	uint64_t size = drgn_value_size(bit_size);
+	uint64_t size = drgn_value_size(type.bit_size);
 	if (size > SIZE_MAX) {
 		PyErr_NoMemory();
 		return -1;
@@ -351,16 +306,15 @@ static int buffer_object_from_value(struct drgn_object *res,
 	}
 	memset(buf, 0, size);
 
-	if (serialize_py_object(drgn_object_program(res), buf, bit_size, 0,
-				value_obj, &type, little_endian) == -1) {
+	if (serialize_py_object(drgn_object_program(res), buf, type.bit_size, 0,
+				value_obj, &type) == -1) {
 		if (buf != value.ibuf)
 			free(buf);
 		return -1;
 	}
 
-	drgn_object_reinit(res, &type, encoding, bit_size, DRGN_OBJECT_VALUE);
+	drgn_object_reinit(res, &type, DRGN_OBJECT_VALUE);
 	res->value = value;
-	res->little_endian = little_endian;
 	return 0;
 }
 
@@ -368,30 +322,23 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 				  PyObject *kwds)
 {
 	static char *keywords[] = {
-		"prog", "type", "value", "address", "byteorder",
-		"bit_offset", "bit_field_size", NULL,
+		"prog", "type", "value", "address", "bit_offset",
+		"bit_field_size", NULL,
 	};
 	struct drgn_error *err;
 	Program *prog;
 	PyObject *type_obj = Py_None, *value_obj = Py_None;
 	struct index_arg address = { .allow_none = true, .is_none = true };
-	struct byteorder_arg byteorder = {
-		.allow_none = true,
-		.is_none = true,
-		.value = DRGN_PROGRAM_ENDIAN,
-	};
 	struct index_arg bit_offset = { .allow_none = true, .is_none = true };
 	struct index_arg bit_field_size = { .allow_none = true, .is_none = true };
 	struct drgn_qualified_type qualified_type;
 	DrgnObject *obj;
 
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!|OO$O&O&O&O&:Object",
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "O!|OO$O&O&O&:Object",
 					 keywords, &Program_type, &prog,
 					 &type_obj, &value_obj, index_converter,
-					 &address, byteorder_converter,
-					 &byteorder, index_converter,
-					 &bit_offset, index_converter,
-					 &bit_field_size))
+					 &address, index_converter, &bit_offset,
+					 index_converter, &bit_field_size))
 		return NULL;
 
 	if (Program_type_arg(prog, type_obj, true, &qualified_type) == -1)
@@ -420,16 +367,10 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 		err = drgn_object_set_reference(&obj->obj, qualified_type,
 						address.uvalue,
 						bit_offset.uvalue,
-						bit_field_size.uvalue,
-						byteorder.value);
+						bit_field_size.uvalue);
 	} else if (value_obj != Py_None && !qualified_type.type) {
 		int ret;
 
-		if (!byteorder.is_none) {
-			PyErr_SetString(PyExc_ValueError,
-					"literal cannot have byteorder");
-			goto err;
-		}
 		if (!bit_offset.is_none) {
 			PyErr_SetString(PyExc_ValueError,
 					"literal cannot have bit offset");
@@ -474,17 +415,11 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 					"bit field must be integer");
 			goto err;
 		}
-		if (encoding != DRGN_OBJECT_ENCODING_BUFFER && !byteorder.is_none) {
-			PyErr_SetString(PyExc_ValueError,
-					"primitive value cannot have byteorder");
-			goto err;
-		}
 
 		switch (encoding) {
 		case DRGN_OBJECT_ENCODING_BUFFER:
 			if (buffer_object_from_value(&obj->obj, qualified_type,
-						     value_obj,
-						     byteorder.value) == -1)
+						     value_obj) == -1)
 				goto err;
 			err = NULL;
 			break;
@@ -544,11 +479,6 @@ static DrgnObject *DrgnObject_new(PyTypeObject *subtype, PyObject *args,
 		if (!qualified_type.type) {
 			PyErr_SetString(PyExc_ValueError,
 					"absent object must have type");
-			goto err;
-		}
-		if (!byteorder.is_none) {
-			PyErr_SetString(PyExc_ValueError,
-					"absent object cannot have byteorder");
 			goto err;
 		}
 		if (!bit_offset.is_none) {
@@ -739,10 +669,6 @@ static PyObject *DrgnObject_value_impl(struct drgn_object *obj)
 	}
 	case DRGN_OBJECT_ENCODING_BUFFER:
 		switch (drgn_type_kind(underlying_type)) {
-		case DRGN_TYPE_COMPLEX:
-			PyErr_SetString(PyExc_NotImplementedError,
-					"reading complex type is not implemented");
-			return NULL;
 		case DRGN_TYPE_STRUCT:
 		case DRGN_TYPE_UNION:
 		case DRGN_TYPE_CLASS:
@@ -821,24 +747,6 @@ static DrgnObject *DrgnObject_read(DrgnObject *self)
 	)
 }
 
-static int append_byte_order(PyObject *parts, struct drgn_program *prog,
-			     bool little_endian)
-{
-	struct drgn_error *err;
-	if (prog->has_platform) {
-		bool prog_little_endian;
-		err = drgn_program_is_little_endian(prog, &prog_little_endian);
-		if (err) {
-			set_drgn_error(err);
-			return -1;
-		}
-		if (little_endian == prog_little_endian)
-			return 0;
-	}
-	return append_format(parts, ", byteorder='%s'",
-			     little_endian ? "little" : "big");
-}
-
 static int append_bit_offset(PyObject *parts, uint8_t bit_offset)
 {
 	if (bit_offset == 0)
@@ -893,19 +801,12 @@ static PyObject *DrgnObject_repr(DrgnObject *self)
 			goto out;
 		}
 		Py_DECREF(tmp);
-		if (self->obj.encoding == DRGN_OBJECT_ENCODING_BUFFER &&
-		    append_byte_order(parts, drgn_object_program(&self->obj),
-				      self->obj.little_endian) == -1)
-			goto out;
 		break;
 	}
 	case DRGN_OBJECT_REFERENCE: {
 		char buf[17];
 		snprintf(buf, sizeof(buf), "%" PRIx64, self->obj.address);
-		if (append_format(parts, ", address=0x%s", buf) == -1)
-			goto out;
-		if (append_byte_order(parts, drgn_object_program(&self->obj),
-				      self->obj.little_endian) == -1 ||
+		if (append_format(parts, ", address=0x%s", buf) == -1 ||
 		    append_bit_offset(parts, self->obj.bit_offset) == -1)
 			goto out;
 		break;
@@ -1056,21 +957,6 @@ static PyObject *DrgnObject_get_address(DrgnObject *self, void *arg)
 		return PyLong_FromUnsignedLongLong(self->obj.address);
 	else
 		Py_RETURN_NONE;
-}
-
-static PyObject *DrgnObject_get_byteorder(DrgnObject *self, void *arg)
-{
-	SWITCH_ENUM(self->obj.kind,
-	case DRGN_OBJECT_VALUE:
-		if (self->obj.encoding == DRGN_OBJECT_ENCODING_BUFFER)
-			return byteorder_string(self->obj.little_endian);
-		else
-			Py_RETURN_NONE;
-	case DRGN_OBJECT_REFERENCE:
-		return byteorder_string(self->obj.little_endian);
-	case DRGN_OBJECT_ABSENT:
-		Py_RETURN_NONE;
-	)
 }
 
 static PyObject *DrgnObject_get_bit_offset(DrgnObject *self, void *arg)
@@ -1677,8 +1563,6 @@ static PyGetSetDef DrgnObject_getset[] = {
 	 drgn_Object_absent__DOC},
 	{"address_", (getter)DrgnObject_get_address, NULL,
 	 drgn_Object_address__DOC},
-	{"byteorder_", (getter)DrgnObject_get_byteorder, NULL,
-	 drgn_Object_byteorder__DOC},
 	{"bit_offset_", (getter)DrgnObject_get_bit_offset, NULL,
 	 drgn_Object_bit_offset__DOC},
 	{"bit_field_size_", (getter)DrgnObject_get_bit_field_size, NULL,
@@ -1809,21 +1693,15 @@ DrgnObject *cast(PyObject *self, PyObject *args, PyObject *kwds)
 
 DrgnObject *reinterpret(PyObject *self, PyObject *args, PyObject *kwds)
 {
-	static char *keywords[] = {"type", "obj", "byteorder", NULL};
+	static char *keywords[] = {"type", "obj", NULL};
 	struct drgn_error *err;
 	PyObject *type_obj;
 	struct drgn_qualified_type qualified_type;
-	struct byteorder_arg byteorder = {
-		.allow_none = true,
-		.is_none = true,
-		.value = DRGN_PROGRAM_ENDIAN,
-	};
 	DrgnObject *obj, *res;
 
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO!|O&:reinterpret",
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "OO!:reinterpret",
 					 keywords, &type_obj, &DrgnObject_type,
-					 &obj, byteorder_converter,
-					 &byteorder))
+					 &obj))
 		return NULL;
 
 	if (Program_type_arg(DrgnObject_prog(obj), type_obj, false,
@@ -1834,8 +1712,7 @@ DrgnObject *reinterpret(PyObject *self, PyObject *args, PyObject *kwds)
 	if (!res)
 		return NULL;
 
-	err = drgn_object_reinterpret(&res->obj, qualified_type,
-				      byteorder.value, &obj->obj);
+	err = drgn_object_reinterpret(&res->obj, qualified_type, &obj->obj);
 	if (err) {
 		Py_DECREF(res);
 		return set_drgn_error(err);

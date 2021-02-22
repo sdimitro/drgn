@@ -34,6 +34,22 @@ struct drgn_language;
  * @{
  */
 
+/** Byte-order specification. */
+enum drgn_byte_order {
+	/** Big-endian. */
+	DRGN_BIG_ENDIAN,
+	/** Little-endian. */
+	DRGN_LITTLE_ENDIAN,
+	/** Endianness of the program. */
+	DRGN_PROGRAM_ENDIAN,
+};
+
+static inline enum drgn_byte_order
+drgn_byte_order_from_little_endian(bool little_endian)
+{
+	return little_endian ? DRGN_LITTLE_ENDIAN : DRGN_BIG_ENDIAN;
+}
+
 /** Registered type finding callback in a @ref drgn_program. */
 struct drgn_type_finder {
 	/** The callback. */
@@ -122,6 +138,7 @@ struct drgn_type *drgn_void_type(struct drgn_program *prog,
 struct drgn_error *drgn_int_type_create(struct drgn_program *prog,
 					const char *name, uint64_t size,
 					bool is_signed,
+					enum drgn_byte_order byte_order,
 					const struct drgn_language *lang,
 					struct drgn_type **ret);
 
@@ -139,6 +156,7 @@ struct drgn_error *drgn_int_type_create(struct drgn_program *prog,
  */
 struct drgn_error *drgn_bool_type_create(struct drgn_program *prog,
 					 const char *name, uint64_t size,
+					 enum drgn_byte_order byte_order,
 					 const struct drgn_language *lang,
 					 struct drgn_type **ret);
 
@@ -156,28 +174,9 @@ struct drgn_error *drgn_bool_type_create(struct drgn_program *prog,
  */
 struct drgn_error *drgn_float_type_create(struct drgn_program *prog,
 					  const char *name, uint64_t size,
+					  enum drgn_byte_order byte_order,
 					  const struct drgn_language *lang,
 					  struct drgn_type **ret);
-
-/**
- * Create a complex type.
- *
- * @param[in] prog Program owning type.
- * @param[in] name Name of the type. Not copied; must remain valid for the
- * lifetime of @p prog. Must not be @c NULL.
- * @param[in] size Size of the type in bytes.
- * @param[in] real_type Corresponding real type. Must not be @c NULL and must be
- * a floating-point or integer type.
- * @param[in] lang Language of the type or @c NULL for the default language of
- * @p prog.
- * @param[out] ret Returned type.
- * @return @c NULL on success, non-@c NULL on error.
- */
-struct drgn_error *drgn_complex_type_create(struct drgn_program *prog,
-					    const char *name, uint64_t size,
-					    struct drgn_type *real_type,
-					    const struct drgn_language *lang,
-					    struct drgn_type **ret);
 
 DEFINE_VECTOR_TYPE(drgn_type_template_parameter_vector,
 		   struct drgn_type_template_parameter)
@@ -371,7 +370,8 @@ drgn_typedef_type_create(struct drgn_program *prog, const char *name,
 struct drgn_error *
 drgn_pointer_type_create(struct drgn_program *prog,
 			 struct drgn_qualified_type referenced_type,
-			 uint64_t size, const struct drgn_language *lang,
+			 uint64_t size, enum drgn_byte_order byte_order,
+			 const struct drgn_language *lang,
 			 struct drgn_type **ret);
 
 /**
@@ -461,6 +461,12 @@ drgn_function_type_create(struct drgn_function_type_builder *builder,
 			  struct drgn_type **ret);
 
 /** @} */
+
+/** Create a copy of a type with a different byte order. */
+struct drgn_error *
+drgn_type_with_byte_order(struct drgn_type **type,
+			  struct drgn_type **underlying_type,
+			  enum drgn_byte_order byte_order);
 
 /** Mapping from @ref drgn_type_kind to the spelling of that kind. */
 extern const char * const drgn_type_kind_spelling[];

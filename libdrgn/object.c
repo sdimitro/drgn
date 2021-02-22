@@ -49,7 +49,7 @@ LIBDRGN_PUBLIC void drgn_object_deinit(struct drgn_object *obj)
 		drgn_value_deinit(obj, &obj->value);
 }
 
-/* Copy everything from src to dst but the program, kind, and value. */
+/* Copy everything from src to dst but the kind and value. */
 static inline void drgn_object_reinit_copy(struct drgn_object *dst,
 					   const struct drgn_object *src)
 {
@@ -59,64 +59,92 @@ static inline void drgn_object_reinit_copy(struct drgn_object *dst,
 	dst->encoding = src->encoding;
 	dst->bit_size = src->bit_size;
 	dst->is_bit_field = src->is_bit_field;
+	dst->little_endian = src->little_endian;
 }
 
-struct drgn_error *
-drgn_object_type_encoding_and_size(const struct drgn_object_type *type,
-				   enum drgn_object_encoding *encoding_ret,
-				   uint64_t *bit_size_ret)
+static struct drgn_error *
+drgn_object_type_impl(struct drgn_type *type, struct drgn_type *underlying_type,
+		      enum drgn_qualifiers qualifiers, uint64_t bit_field_size,
+		      struct drgn_object_type *ret)
 {
 	struct drgn_error *err;
-	bool is_complete;
 
-	*encoding_ret = drgn_type_object_encoding(type->underlying_type);
-	is_complete = drgn_object_encoding_is_complete(*encoding_ret);
-	if (is_complete) {
-		err = drgn_type_bit_size(type->underlying_type, bit_size_ret);
+	ret->type = type;
+	ret->underlying_type = underlying_type;
+	ret->qualifiers = qualifiers;
+
+	ret->encoding = drgn_type_object_encoding(type);
+	if (drgn_object_encoding_is_complete(ret->encoding)) {
+		err = drgn_type_bit_size(type, &ret->bit_size);
 		if (err)
 			return err;
 	} else {
-		*bit_size_ret = 0;
+		ret->bit_size = 0;
 	}
-	if (type->bit_field_size) {
-		if (is_complete && type->bit_field_size > *bit_size_ret) {
-			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-						 "bit field size is larger than type size");
+
+	ret->is_bit_field = bit_field_size != 0;
+	if (ret->encoding == DRGN_OBJECT_ENCODING_SIGNED ||
+	    ret->encoding == DRGN_OBJECT_ENCODING_UNSIGNED) {
+		if (bit_field_size != 0) {
+			if (bit_field_size > ret->bit_size) {
+				return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+							 "bit field size is larger than type size");
+			}
+			ret->bit_size = bit_field_size;
 		}
-		*bit_size_ret = type->bit_field_size;
+		if (ret->bit_size < 1 || ret->bit_size > 64) {
+			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
+						 "unsupported integer bit size (%" PRIu64 ")",
+						 ret->bit_size);
+		}
+	} else {
+		if (bit_field_size != 0) {
+			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+						 "bit field must be integer");
+		}
+		if (ret->encoding == DRGN_OBJECT_ENCODING_FLOAT &&
+		    ret->bit_size != 32 && ret->bit_size != 64) {
+			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
+						 "unsupported floating-point bit size (%" PRIu64 ")",
+						 ret->bit_size);
+		}
+	}
+
+	if (drgn_type_has_little_endian(underlying_type)) {
+		ret->little_endian = drgn_type_little_endian(underlying_type);
+	} else if (drgn_type_kind(underlying_type) == DRGN_TYPE_ENUM &&
+		   drgn_type_is_complete(underlying_type)) {
+		ret->little_endian =
+			drgn_type_little_endian(drgn_type_type(underlying_type).type);
 	}
 	return NULL;
 }
 
 struct drgn_error *
-drgn_object_set_common(struct drgn_qualified_type qualified_type,
-		       uint64_t bit_field_size,
-		       struct drgn_object_type *type_ret,
-		       enum drgn_object_encoding *encoding_ret,
-		       uint64_t *bit_size_ret)
+drgn_object_type(struct drgn_qualified_type qualified_type,
+		 uint64_t bit_field_size, struct drgn_object_type *ret)
 {
-	type_ret->type = qualified_type.type;
-	type_ret->qualifiers = qualified_type.qualifiers;
-	type_ret->underlying_type = drgn_underlying_type(qualified_type.type);
-	type_ret->bit_field_size = bit_field_size;
-	return drgn_object_type_encoding_and_size(type_ret, encoding_ret,
-						  bit_size_ret);
+	return drgn_object_type_impl(qualified_type.type,
+				     drgn_underlying_type(qualified_type.type),
+				     qualified_type.qualifiers, bit_field_size,
+				     ret);
 }
 
-struct drgn_error *
-drgn_object_set_signed_internal(struct drgn_object *res,
-				const struct drgn_object_type *type,
-				uint64_t bit_size, int64_t svalue)
+static struct drgn_error *
+drgn_object_type_operand(const struct drgn_operand_type *op_type,
+			 struct drgn_object_type *ret)
 {
-	if (bit_size == 0 || bit_size > 64) {
-		return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
-					 "unsupported integer bit size (%" PRIu64 ")",
-					 bit_size);
-	}
-	drgn_object_reinit(res, type, DRGN_OBJECT_ENCODING_SIGNED, bit_size,
-			   DRGN_OBJECT_VALUE);
-	res->value.svalue = truncate_signed(svalue, bit_size);
-	return NULL;
+	return drgn_object_type_impl(op_type->type, op_type->underlying_type,
+				     op_type->qualifiers,
+				     op_type->bit_field_size, ret);
+}
+
+void drgn_object_set_signed_internal(struct drgn_object *res,
+				     const struct drgn_object_type *type,
+				     int64_t svalue)
+{
+	drgn_object_reinit(res, type, DRGN_OBJECT_VALUE);
+	res->value.svalue = truncate_signed(svalue, type->bit_size);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -126,34 +154,23 @@ drgn_object_set_signed(struct drgn_object *res,
 {
 	struct drgn_error *err;
 	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-
-	err = drgn_object_set_common(qualified_type, bit_field_size, &type,
-				     &encoding, &bit_size);
+	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-	if (encoding != DRGN_OBJECT_ENCODING_SIGNED) {
+	if (type.encoding != DRGN_OBJECT_ENCODING_SIGNED) {
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "not a signed integer type");
 	}
-	return drgn_object_set_signed_internal(res, &type, bit_size, svalue);
+	drgn_object_set_signed_internal(res, &type, svalue);
+	return NULL;
 }
 
-struct drgn_error *
-drgn_object_set_unsigned_internal(struct drgn_object *res,
-				  const struct drgn_object_type *type,
-				  uint64_t bit_size, uint64_t uvalue)
+void drgn_object_set_unsigned_internal(struct drgn_object *res,
+				       const struct drgn_object_type *type,
+				       uint64_t uvalue)
 {
-	if (bit_size == 0 || bit_size > 64) {
-		return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
-					 "unsupported integer bit size (%" PRIu64 ")",
-					 bit_size);
-	}
-	drgn_object_reinit(res, type, DRGN_OBJECT_ENCODING_UNSIGNED, bit_size,
-			   DRGN_OBJECT_VALUE);
-	res->value.uvalue = truncate_unsigned(uvalue, bit_size);
-	return NULL;
+	drgn_object_reinit(res, type, DRGN_OBJECT_VALUE);
+	res->value.uvalue = truncate_unsigned(uvalue, type->bit_size);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -163,37 +180,27 @@ drgn_object_set_unsigned(struct drgn_object *res,
 {
 	struct drgn_error *err;
 	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-
-	err = drgn_object_set_common(qualified_type, bit_field_size, &type,
-				     &encoding, &bit_size);
+	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-	if (encoding != DRGN_OBJECT_ENCODING_UNSIGNED) {
+	if (type.encoding != DRGN_OBJECT_ENCODING_UNSIGNED) {
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "not an unsigned integer type");
 	}
-	return drgn_object_set_unsigned_internal(res, &type, bit_size, uvalue);
+	drgn_object_set_unsigned_internal(res, &type, uvalue);
+	return NULL;
 }
 
-static struct drgn_error *
+static void
 drgn_object_set_float_internal(struct drgn_object *res,
 			       const struct drgn_object_type *type,
-			       uint64_t bit_size, double fvalue)
+			       double fvalue)
 {
-	if (bit_size != 32 && bit_size != 64) {
-		return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
-					 "unsupported floating-point bit size (%" PRIu64 ")",
-					 bit_size);
-	}
-	drgn_object_reinit(res, type, DRGN_OBJECT_ENCODING_FLOAT, bit_size,
-			   DRGN_OBJECT_VALUE);
-	if (bit_size == 32)
+	drgn_object_reinit(res, type, DRGN_OBJECT_VALUE);
+	if (type->bit_size == 32)
 		res->value.fvalue = (float)fvalue;
 	else
 		res->value.fvalue = fvalue;
-	return NULL;
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -202,48 +209,15 @@ drgn_object_set_float(struct drgn_object *res,
 {
 	struct drgn_error *err;
 	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-
-	err = drgn_object_set_common(qualified_type, 0, &type, &encoding,
-				     &bit_size);
+	err = drgn_object_type(qualified_type, 0, &type);
 	if (err)
 		return err;
-	if (encoding != DRGN_OBJECT_ENCODING_FLOAT) {
+	if (type.encoding != DRGN_OBJECT_ENCODING_FLOAT) {
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "not a floating-point type");
 	}
-	return drgn_object_set_float_internal(res, &type, bit_size, fvalue);
-}
-
-struct drgn_error *sanity_check_object(enum drgn_object_encoding encoding,
-				       uint64_t bit_field_size,
-				       uint64_t bit_size)
-{
-	if (bit_field_size && encoding != DRGN_OBJECT_ENCODING_SIGNED &&
-	    encoding != DRGN_OBJECT_ENCODING_UNSIGNED) {
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "bit field must be integer");
-	}
-	switch (encoding) {
-	case DRGN_OBJECT_ENCODING_SIGNED:
-	case DRGN_OBJECT_ENCODING_UNSIGNED:
-		if (bit_size == 0 || bit_size > 64) {
-			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
-						 "unsupported integer bit size (%" PRIu64 ")",
-						 bit_size);
-		}
-		return NULL;
-	case DRGN_OBJECT_ENCODING_FLOAT:
-		if (bit_size != 32 && bit_size != 64) {
-			return drgn_error_format(DRGN_ERROR_INVALID_ARGUMENT,
-						 "unsupported floating-point bit size (%" PRIu64 ")",
-						 bit_size);
-		}
-		return NULL;
-	default:
-		return NULL;
-	}
+	drgn_object_set_float_internal(res, &type, fvalue);
+	return NULL;
 }
 
 static void drgn_value_deserialize(union drgn_value *value, const void *buf,
@@ -275,92 +249,23 @@ static void drgn_value_deserialize(union drgn_value *value, const void *buf,
 }
 
 struct drgn_error *
-drgn_byte_order_to_little_endian(struct drgn_program *prog,
-				 enum drgn_byte_order byte_order, bool *ret)
-{
-	SWITCH_ENUM_DEFAULT(byte_order,
-	case DRGN_BIG_ENDIAN:
-		*ret = false;
-		return NULL;
-	case DRGN_LITTLE_ENDIAN:
-		*ret = true;
-		return NULL;
-	case DRGN_PROGRAM_ENDIAN:
-		return drgn_program_is_little_endian(prog, ret);
-	default:
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "invalid byte order");
-	)
-}
-
-static void copy_bits(void *dst, const void *src, unsigned int bit_offset,
-		      uint64_t bit_size, bool little_endian)
-{
-	unsigned char *d = dst;
-	const unsigned char *s = src;
-	size_t bytes = bit_size / CHAR_BIT;
-	unsigned int bits = bit_size % CHAR_BIT;
-	if (little_endian) {
-		if (bit_offset) {
-			for (size_t i = 0; i < bytes; i++) {
-				d[i] = ((s[i] >> bit_offset) |
-					(s[i + 1] << (CHAR_BIT - bit_offset)));
-			}
-		} else if (d != s) {
-			memcpy(d, s, bytes);
-		}
-		if (bits) {
-			unsigned char c = s[bytes] >> bit_offset;
-			if (bits > CHAR_BIT - bit_offset)
-				c |= s[bytes + 1] << (CHAR_BIT - bit_offset);
-			d[bytes] = c & ((1U << bits) - 1);
-		}
-	} else {
-		if (bit_offset) {
-			for (size_t i = 0; i < bytes; i++) {
-				d[i] = ((s[i] << bit_offset) |
-					(s[i + 1] >> (CHAR_BIT - bit_offset)));
-			}
-		} else if (d != s) {
-			memcpy(d, s, bytes);
-		}
-		if (bits) {
-			unsigned char c = s[bytes] << bit_offset;
-			if (bits > CHAR_BIT - bit_offset)
-				c |= s[bytes + 1] >> (CHAR_BIT - bit_offset);
-			d[bytes] = c & (-1U << (CHAR_BIT - bits));
-		}
-	}
-}
-
-struct drgn_error *
 drgn_object_set_from_buffer_internal(struct drgn_object *res,
 				     const struct drgn_object_type *type,
-				     enum drgn_object_encoding encoding,
-				     uint64_t bit_size, const void *buf,
-				     uint64_t bit_offset, bool little_endian)
+				     const void *buf, uint64_t bit_offset)
 {
-	struct drgn_error *err;
-
-	if (!drgn_object_encoding_is_complete(encoding)) {
-		return drgn_error_incomplete_type("cannot create object with %s type",
-						  type->type);
-	}
-
-	err = sanity_check_object(encoding, type->bit_field_size, bit_size);
-	if (err)
-		return err;
-
 	const char *p = (const char *)buf + (bit_offset / CHAR_BIT);
 	bit_offset %= CHAR_BIT;
-	if (encoding == DRGN_OBJECT_ENCODING_BUFFER) {
+	if (type->encoding == DRGN_OBJECT_ENCODING_BUFFER) {
+		if (bit_offset != 0) {
+			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+						 "non-scalar must be byte-aligned");
+		}
 		/*
-		 * `buf` may point inside of `drgn_object_buffer(res)`, so copy
-		 * to a temporary value before freeing or modifying the latter.
+		 * buf may point inside of drgn_object_buffer(res), so copy to a
+		 * temporary value before freeing or modifying the latter.
 		 */
 		union drgn_value value;
-
-		uint64_t size = drgn_value_size(bit_size);
+		uint64_t size = drgn_value_size(type->bit_size);
 		char *dst;
 		if (size <= sizeof(res->value.ibuf)) {
 			dst = value.ibuf;
@@ -370,17 +275,17 @@ drgn_object_set_from_buffer_internal(struct drgn_object *res,
 				return &drgn_enomem;
 			value.bufp = dst;
 		}
-		copy_bits(dst, p, bit_offset, bit_size, little_endian);
-
-		drgn_object_reinit(res, type, DRGN_OBJECT_ENCODING_BUFFER,
-				   bit_size, DRGN_OBJECT_VALUE);
+		memcpy(dst, p, size);
+		drgn_object_reinit(res, type, DRGN_OBJECT_VALUE);
 		res->value = value;
-		res->little_endian = little_endian;
+	} else if (drgn_object_encoding_is_complete(type->encoding)) {
+		drgn_object_reinit(res, type, DRGN_OBJECT_VALUE);
+		drgn_value_deserialize(&res->value, p, bit_offset,
+				       type->encoding, type->bit_size,
+				       type->little_endian);
 	} else {
-		drgn_object_reinit(res, type, encoding, bit_size,
-				   DRGN_OBJECT_VALUE);
-		drgn_value_deserialize(&res->value, p, bit_offset, encoding,
-				       bit_size, little_endian);
+		return drgn_error_incomplete_type("cannot create object with %s type",
+						  type->type);
 	}
 	return NULL;
 }
@@ -389,42 +294,26 @@ LIBDRGN_PUBLIC struct drgn_error *
 drgn_object_set_from_buffer(struct drgn_object *res,
 			    struct drgn_qualified_type qualified_type,
 			    const void *buf, size_t buf_size,
-			    uint64_t bit_offset, uint64_t bit_field_size,
-			    enum drgn_byte_order byte_order)
+			    uint64_t bit_offset, uint64_t bit_field_size)
 {
 	struct drgn_error *err;
-
-	bool little_endian;
-	err = drgn_byte_order_to_little_endian(drgn_object_program(res),
-					       byte_order, &little_endian);
-	if (err)
-		return err;
-
 	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-	err = drgn_object_set_common(qualified_type, bit_field_size, &type,
-				     &encoding, &bit_size);
+	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-
-	if (bit_size > UINT64_MAX - bit_offset ||
-	    buf_size < drgn_value_size(bit_offset + bit_size)) {
+	if (type.bit_size > UINT64_MAX - bit_offset ||
+	    buf_size < drgn_value_size(bit_offset + type.bit_size)) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "buffer is too small");
 	}
-
-	return drgn_object_set_from_buffer_internal(res, &type, encoding,
-						    bit_size, buf, bit_offset,
-						    little_endian);
+	return drgn_object_set_from_buffer_internal(res, &type, buf,
+						    bit_offset);
 }
 
 static struct drgn_error *
 drgn_object_set_reference_internal(struct drgn_object *res,
 				   const struct drgn_object_type *type,
-				   enum drgn_object_encoding encoding,
-				   uint64_t bit_size, uint64_t address,
-				   uint64_t bit_offset, bool little_endian)
+				   uint64_t address, uint64_t bit_offset)
 {
 	bool is_64_bit;
 	struct drgn_error *err =
@@ -432,23 +321,25 @@ drgn_object_set_reference_internal(struct drgn_object *res,
 	if (err)
 		return err;
 
-	err = sanity_check_object(encoding, type->bit_field_size, bit_size);
-	if (err)
-		return err;
-
 	address += bit_offset / 8;
 	address &= is_64_bit ? UINT64_MAX : UINT32_MAX;
 	bit_offset %= 8;
-	if (bit_size > UINT64_MAX - bit_offset) {
+	if (type->encoding != DRGN_OBJECT_ENCODING_SIGNED &&
+	    type->encoding != DRGN_OBJECT_ENCODING_UNSIGNED &&
+	    type->encoding != DRGN_OBJECT_ENCODING_FLOAT &&
+	    type->encoding != DRGN_OBJECT_ENCODING_INCOMPLETE_INTEGER &&
+	    bit_offset != 0) {
+		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
+					 "non-scalar must be byte-aligned");
+	}
+	if (type->bit_size > UINT64_MAX - bit_offset) {
 		return drgn_error_format(DRGN_ERROR_OVERFLOW,
 					 "object is too large");
 	}
 
-	drgn_object_reinit(res, type, encoding, bit_size,
-			   DRGN_OBJECT_REFERENCE);
+	drgn_object_reinit(res, type, DRGN_OBJECT_REFERENCE);
 	res->address = address;
 	res->bit_offset = bit_offset;
-	res->little_endian = little_endian;
 	return NULL;
 }
 
@@ -456,27 +347,15 @@ LIBDRGN_PUBLIC struct drgn_error *
 drgn_object_set_reference(struct drgn_object *res,
 			  struct drgn_qualified_type qualified_type,
 			  uint64_t address, uint64_t bit_offset,
-			  uint64_t bit_field_size,
-			  enum drgn_byte_order byte_order)
+			  uint64_t bit_field_size)
 {
 	struct drgn_error *err;
-	bool little_endian;
 	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-
-	err = drgn_byte_order_to_little_endian(drgn_object_program(res),
-					       byte_order, &little_endian);
+	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-
-	err = drgn_object_set_common(qualified_type, bit_field_size, &type,
-				     &encoding, &bit_size);
-	if (err)
-		return err;
-	return drgn_object_set_reference_internal(res, &type, encoding, bit_size,
-						  address, bit_offset,
-						  little_endian);
+	return drgn_object_set_reference_internal(res, &type, address,
+						  bit_offset);
 }
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -486,17 +365,10 @@ drgn_object_set_absent(struct drgn_object *res,
 {
 	struct drgn_error *err;
 	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-	err = drgn_object_set_common(qualified_type, bit_field_size, &type,
-				     &encoding, &bit_size);
+	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-	err = sanity_check_object(encoding, type.bit_field_size, bit_size);
-	if (err)
-		return err;
-	drgn_object_reinit(res, &type, encoding, bit_size,
-			   DRGN_OBJECT_ABSENT);
+	drgn_object_reinit(res, &type, DRGN_OBJECT_ABSENT);
 	return NULL;
 }
 
@@ -531,7 +403,6 @@ drgn_object_copy(struct drgn_object *res, const struct drgn_object *obj)
 			memcpy(dst, src, size);
 			if (dst != res->value.ibuf)
 				res->value.bufp = dst;
-			res->little_endian = obj->little_endian;
 		} else {
 			drgn_object_reinit_copy(res, obj);
 			res->kind = DRGN_OBJECT_VALUE;
@@ -543,7 +414,6 @@ drgn_object_copy(struct drgn_object *res, const struct drgn_object *obj)
 		res->kind = DRGN_OBJECT_REFERENCE;
 		res->address = obj->address;
 		res->bit_offset = obj->bit_offset;
-		res->little_endian = obj->little_endian;
 		break;
 	case DRGN_OBJECT_ABSENT:
 		drgn_object_reinit_copy(res, obj);
@@ -556,9 +426,8 @@ drgn_object_copy(struct drgn_object *res, const struct drgn_object *obj)
 static struct drgn_error *
 drgn_object_slice_internal(struct drgn_object *res,
 			   const struct drgn_object *obj,
-			   struct drgn_object_type *type,
-			   enum drgn_object_encoding encoding,
-			   uint64_t bit_size, uint64_t bit_offset)
+			   const struct drgn_object_type *type,
+			   uint64_t bit_offset)
 {
 	SWITCH_ENUM(obj->kind,
 	case DRGN_OBJECT_VALUE: {
@@ -568,16 +437,15 @@ drgn_object_slice_internal(struct drgn_object *res,
 		}
 
 		uint64_t bit_end;
-		if (__builtin_add_overflow(bit_offset, bit_size, &bit_end) ||
+		if (__builtin_add_overflow(bit_offset, type->bit_size,
+					   &bit_end) ||
 		    bit_end > obj->bit_size) {
 			return drgn_error_create(DRGN_ERROR_OUT_OF_BOUNDS,
 						 "out of bounds of value");
 		}
-		return drgn_object_set_from_buffer_internal(res, type, encoding,
-							    bit_size,
+		return drgn_object_set_from_buffer_internal(res, type,
 							    drgn_object_buffer(obj),
-							    bit_offset,
-							    obj->little_endian);
+							    bit_offset);
 	}
 	case DRGN_OBJECT_REFERENCE:
 		if (obj->encoding != DRGN_OBJECT_ENCODING_BUFFER &&
@@ -586,11 +454,9 @@ drgn_object_slice_internal(struct drgn_object *res,
 						 "not a buffer object");
 		}
 
-		return drgn_object_set_reference_internal(res, type, encoding,
-							  bit_size,
+		return drgn_object_set_reference_internal(res, type,
 							  obj->address,
-							  bit_offset,
-							  obj->little_endian);
+							  bit_offset);
 	case DRGN_OBJECT_ABSENT:
 		return &drgn_error_object_absent;
 	)
@@ -602,24 +468,18 @@ drgn_object_slice(struct drgn_object *res, const struct drgn_object *obj,
 		  uint64_t bit_offset, uint64_t bit_field_size)
 {
 	struct drgn_error *err;
-	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-
 	if (drgn_object_program(res) != drgn_object_program(obj)) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "objects are from different programs");
 	}
-
-	err = drgn_object_set_common(qualified_type, bit_field_size, &type,
-				     &encoding, &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type(qualified_type, bit_field_size, &type);
 	if (err)
 		return err;
-	return drgn_object_slice_internal(res, obj, &type, encoding, bit_size,
-					  bit_offset);
+	return drgn_object_slice_internal(res, obj, &type, bit_offset);
 }
 
-struct drgn_error *
+LIBDRGN_PUBLIC struct drgn_error *
 drgn_object_dereference_offset(struct drgn_object *res,
 			       const struct drgn_object *obj,
 			       struct drgn_qualified_type qualified_type,
@@ -640,13 +500,12 @@ drgn_object_dereference_offset(struct drgn_object *res,
 	address += bit_offset >> 3;
 	bit_offset &= 7;
 	return drgn_object_set_reference(res, qualified_type, address,
-					 bit_offset, bit_field_size,
-					 DRGN_PROGRAM_ENDIAN);
+					 bit_offset, bit_field_size);
 }
 
 static struct drgn_error *
 drgn_object_read_reference(const struct drgn_object *obj,
-				union drgn_value *value)
+			   union drgn_value *value)
 {
 	struct drgn_error *err;
 
@@ -657,46 +516,31 @@ drgn_object_read_reference(const struct drgn_object *obj,
 						  obj->type);
 	}
 
-	uint64_t bit_size = obj->bit_size;
-	uint8_t bit_offset = obj->bit_offset;
-	uint64_t read_size;
-	if (bit_offset == 0)
-		read_size = drgn_object_size(obj);
-	else
-		read_size = drgn_value_size(bit_offset + bit_size);
-
 	if (obj->encoding == DRGN_OBJECT_ENCODING_BUFFER) {
-		char ibuf_offset[sizeof(value->ibuf) + 1];
-		char *buf, *read_buf;
-		if (read_size <= sizeof(value->ibuf)) {
-			buf = read_buf = value->ibuf;
-		} else if (drgn_object_is_inline(obj)) {
-			/*
-			 * The value fits inside of the inline buffer, but it is
-			 * offset, so we need to read an additional byte. Read
-			 * it into an on-stack buffer first.
-			 */
-			buf = value->ibuf;
-			read_buf = ibuf_offset;
+		assert(obj->bit_offset == 0);
+		uint64_t size = drgn_object_size(obj);
+		char *dst;
+		if (size <= sizeof(value->ibuf)) {
+			dst = value->ibuf;
 		} else {
-			buf = read_buf = malloc64(read_size);
-			if (!buf)
+			dst = malloc64(size);
+			if (!dst)
 				return &drgn_enomem;
 		}
 		err = drgn_memory_reader_read(&drgn_object_program(obj)->reader,
-					      read_buf, obj->address, read_size,
-					      false);
+					      dst, obj->address, size, false);
 		if (err) {
-			if (buf != value->ibuf)
-				free(buf);
+			if (dst != value->ibuf)
+				free(dst);
 			return err;
 		}
-		copy_bits(buf, read_buf, bit_offset, bit_size,
-			  obj->little_endian);
-		if (buf != value->ibuf)
-			value->bufp = buf;
+		if (size > sizeof(value->ibuf))
+			value->bufp = dst;
 		return NULL;
 	} else {
+		uint8_t bit_offset = obj->bit_offset;
+		uint64_t bit_size = obj->bit_size;
+		uint64_t read_size = drgn_value_size(bit_offset + bit_size);
 		char buf[9];
 		assert(read_size <= sizeof(buf));
 		err = drgn_memory_reader_read(&drgn_object_program(obj)->reader,
@@ -719,20 +563,17 @@ drgn_object_read(struct drgn_object *res, const struct drgn_object *obj)
 	case DRGN_OBJECT_VALUE:
 		return drgn_object_copy(res, obj);
 	case DRGN_OBJECT_REFERENCE: {
-		union drgn_value value;
-
 		if (drgn_object_program(res) != drgn_object_program(obj)) {
 			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 						 "objects are from different programs");
 		}
-
+		union drgn_value value;
 		err = drgn_object_read_reference(obj, &value);
 		if (err)
 			return err;
 		drgn_object_reinit_copy(res, obj);
 		res->kind = DRGN_OBJECT_VALUE;
 		res->value = value;
-		res->little_endian = obj->little_endian;
 		return NULL;
 	}
 	case DRGN_OBJECT_ABSENT:
@@ -1180,27 +1021,17 @@ drgn_object_cast(struct drgn_object *res,
 LIBDRGN_PUBLIC struct drgn_error *
 drgn_object_reinterpret(struct drgn_object *res,
 			struct drgn_qualified_type qualified_type,
-			enum drgn_byte_order byte_order,
 			const struct drgn_object *obj)
 {
 	struct drgn_error *err;
-	bool little_endian;
-	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
 
 	if (drgn_object_program(res) != drgn_object_program(obj)) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "objects are from different programs");
 	}
 
-	err = drgn_byte_order_to_little_endian(drgn_object_program(res),
-					       byte_order, &little_endian);
-	if (err)
-		return err;
-
-	err = drgn_object_set_common(qualified_type, 0, &type, &encoding,
-				     &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type(qualified_type, 0, &type);
 	if (err)
 		return err;
 
@@ -1210,18 +1041,14 @@ drgn_object_reinterpret(struct drgn_object *res,
 			return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 						 "cannot reinterpret primitive value");
 		}
-		err = drgn_object_slice_internal(res, obj, &type, encoding,
-						 bit_size, 0);
+		err = drgn_object_slice_internal(res, obj, &type, 0);
 		if (err)
 			return err;
-		res->little_endian = little_endian;
 		return NULL;
 	case DRGN_OBJECT_REFERENCE:
-		drgn_object_reinit(res, &type, encoding, bit_size,
-				   DRGN_OBJECT_REFERENCE);
+		drgn_object_reinit(res, &type, DRGN_OBJECT_REFERENCE);
 		res->address = obj->address;
 		res->bit_offset = obj->bit_offset;
-		res->little_endian = little_endian;
 		return NULL;
 	case DRGN_OBJECT_ABSENT:
 		return &drgn_error_object_absent;
@@ -1273,8 +1100,8 @@ LIBDRGN_PUBLIC struct drgn_error *drgn_object_cmp(const struct drgn_object *lhs,
 }
 
 struct drgn_error *drgn_error_binary_op(const char *op_name,
-					struct drgn_object_type *lhs_type,
-					struct drgn_object_type *rhs_type)
+					struct drgn_operand_type *lhs_type,
+					struct drgn_operand_type *rhs_type)
 {
 	struct drgn_error *err;
 	struct drgn_qualified_type lhs_qualified_type = {
@@ -1305,7 +1132,7 @@ struct drgn_error *drgn_error_binary_op(const char *op_name,
 }
 
 struct drgn_error *drgn_error_unary_op(const char *op_name,
-				       struct drgn_object_type *type)
+				       struct drgn_operand_type *type)
 {
 	struct drgn_error *err;
 	struct drgn_qualified_type qualified_type = {
@@ -1409,7 +1236,7 @@ drgn_object_address_of(struct drgn_object *res, const struct drgn_object *obj)
 		return err;
 	struct drgn_qualified_type result_type;
 	err = drgn_pointer_type_create(drgn_object_program(obj), qualified_type,
-				       word_size,
+				       word_size, DRGN_PROGRAM_ENDIAN,
 				       drgn_type_language(qualified_type.type),
 				       &result_type.type);
 	if (err)
@@ -1473,9 +1300,10 @@ drgn_object_member(struct drgn_object *res, const struct drgn_object *obj,
 				 member_bit_field_size);
 }
 
-struct drgn_error *drgn_object_member_dereference(struct drgn_object *res,
-						  const struct drgn_object *obj,
-						  const char *member_name)
+LIBDRGN_PUBLIC struct drgn_error *
+drgn_object_member_dereference(struct drgn_object *res,
+			       const struct drgn_object *obj,
+			       const char *member_name)
 {
 	struct drgn_error *err;
 
@@ -1541,7 +1369,7 @@ drgn_object_container_of(struct drgn_object *res, const struct drgn_object *obj,
 		return err;
 	struct drgn_qualified_type result_type;
 	err = drgn_pointer_type_create(drgn_object_program(obj), qualified_type,
-				       word_size,
+				       word_size, DRGN_PROGRAM_ENDIAN,
 				       drgn_type_language(qualified_type.type),
 				       &result_type.type);
 	if (err)
@@ -1624,61 +1452,21 @@ static struct drgn_error *pointer_operand(const struct drgn_object *ptr,
 	}
 }
 
-static struct drgn_error *drgn_error_cast(struct drgn_object_type *to,
-					  struct drgn_object_type *from)
-{
-	struct drgn_error *err;
-	struct drgn_qualified_type to_qualified_type = {
-		.type = to->type,
-		.qualifiers = to->qualifiers,
-	};
-	struct drgn_qualified_type from_qualified_type = {
-		.type = from->type,
-		.qualifiers = from->qualifiers,
-	};
-	char *to_type_name, *from_type_name;
-
-	err = drgn_format_type_name(to_qualified_type, &to_type_name);
-	if (err) {
-		return err;
-	}
-	err = drgn_format_type_name(from_qualified_type, &from_type_name);
-	if (err) {
-		free(from_type_name);
-		return err;
-	}
-	err = drgn_error_format(DRGN_ERROR_TYPE,
-				"cannot convert '%s' to '%s'",
-				from_type_name, to_type_name);
-	free(from_type_name);
-	free(to_type_name);
-	return err;
-}
-
 struct drgn_error *drgn_op_cast(struct drgn_object *res,
 				struct drgn_qualified_type qualified_type,
 				const struct drgn_object *obj,
-				struct drgn_object_type *obj_type)
+				const struct drgn_operand_type *obj_type)
 {
 	struct drgn_error *err;
-	struct drgn_object_type type;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-	bool is_pointer;
 
-	err = drgn_object_set_common(qualified_type, 0, &type, &encoding,
-				     &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type(qualified_type, 0, &type);
 	if (err)
 		goto err;
 
-	if (!drgn_object_encoding_is_complete(encoding)) {
-		return drgn_error_incomplete_type("cannot cast to %s type",
-						  type.type);
-	}
-
-	is_pointer = (drgn_type_kind(obj_type->underlying_type) ==
-		      DRGN_TYPE_POINTER);
-	switch (encoding) {
+	bool is_pointer = (drgn_type_kind(obj_type->underlying_type) ==
+			   DRGN_TYPE_POINTER);
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_BUFFER: {
 		char *type_name;
 		err = drgn_format_type_name(qualified_type, &type_name);
@@ -1694,45 +1482,46 @@ struct drgn_error *drgn_op_cast(struct drgn_object *res,
 			int64_t svalue;
 			uint64_t uvalue;
 		} tmp;
-
 		if (is_pointer) {
 			err = pointer_operand(obj, &tmp.uvalue);
 		} else {
-			err = drgn_object_convert_signed(obj, bit_size,
+			err = drgn_object_convert_signed(obj, type.bit_size,
 							 &tmp.svalue);
 		}
 		if (err)
 			goto err;
-		return drgn_object_set_signed_internal(res, &type, bit_size,
-						       tmp.svalue);
+		drgn_object_set_signed_internal(res, &type, tmp.svalue);
+		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		uint64_t uvalue;
-
 		if (is_pointer) {
 			err = pointer_operand(obj, &uvalue);
 		} else {
-			err = drgn_object_convert_unsigned(obj, bit_size,
+			err = drgn_object_convert_unsigned(obj, type.bit_size,
 							   &uvalue);
 		}
 		if (err)
 			goto err;
-		return drgn_object_set_unsigned_internal(res, &type, bit_size,
-							 uvalue);
+		drgn_object_set_unsigned_internal(res, &type, uvalue);
+		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_FLOAT: {
-		double fvalue;
-
 		if (is_pointer)
 			goto type_error;
 
+		double fvalue;
 		err = drgn_object_convert_float(obj, &fvalue);
 		if (err)
 			goto err;
-		return drgn_object_set_float_internal(res, &type, bit_size,
-						      fvalue);
+		drgn_object_set_float_internal(res, &type, fvalue);
+		return NULL;
 	}
 	default:
+		if (!drgn_object_encoding_is_complete(type.encoding)) {
+			return drgn_error_incomplete_type("cannot cast to %s type",
+							  type.type);
+		}
 		goto type_error;
 	}
 
@@ -1743,8 +1532,26 @@ err:
 	}
 	return err;
 
-type_error:
-	return drgn_error_cast(&type, obj_type);
+type_error:;
+	struct drgn_qualified_type from_qualified_type = {
+		.type = obj_type->type,
+		.qualifiers = obj_type->qualifiers,
+	};
+	char *to_type_name, *from_type_name;
+
+	err = drgn_format_type_name(qualified_type, &to_type_name);
+	if (err)
+		return err;
+	err = drgn_format_type_name(from_qualified_type, &from_type_name);
+	if (err) {
+		free(from_type_name);
+		return err;
+	}
+	err = drgn_error_format(DRGN_ERROR_TYPE, "cannot convert '%s' to '%s'",
+				from_type_name, to_type_name);
+	free(from_type_name);
+	free(to_type_name);
+	return err;
 }
 
 /*
@@ -1753,50 +1560,43 @@ type_error:
  * bitwise operator by doing the operation on unsigned operands and then
  * converting back to a signed integer.
  */
-#define BINARY_OP_SIGNED_2C(res, type, bit_size, lhs, op, rhs) ({		\
+#define BINARY_OP_SIGNED_2C(res, type, lhs, op, rhs) ({				\
 	struct drgn_error *_err;						\
-	uint64_t _bit_size = (bit_size);					\
+	const struct drgn_object_type *_type = (type);				\
 	union {									\
 		int64_t svalue;							\
 		uint64_t uvalue;						\
 	} lhs_tmp, rhs_tmp, tmp;						\
-										\
-	_err = binary_operands_signed((lhs), (rhs),  _bit_size,			\
+	_err = binary_operands_signed((lhs), (rhs), _type->bit_size,		\
 				      &lhs_tmp.svalue, &rhs_tmp.svalue);	\
 	if (!_err) {								\
 		tmp.uvalue = lhs_tmp.uvalue op rhs_tmp.uvalue;			\
-		_err = drgn_object_set_signed_internal((res), (type),		\
-						       _bit_size, tmp.svalue);	\
+		drgn_object_set_signed_internal((res), _type, tmp.svalue);	\
 	}									\
 	_err;									\
 })
 
-#define BINARY_OP_UNSIGNED(res, type, bit_size, lhs, op, rhs) ({		\
+#define BINARY_OP_UNSIGNED(res, type, lhs, op, rhs) ({				\
 	struct drgn_error *_err;						\
-	uint64_t _bit_size = (bit_size);					\
+	const struct drgn_object_type *_type = (type);				\
 	uint64_t lhs_uvalue, rhs_uvalue;					\
 										\
-	_err = binary_operands_unsigned((lhs), (rhs), _bit_size, &lhs_uvalue,	\
-					&rhs_uvalue);				\
+	_err = binary_operands_unsigned((lhs), (rhs), _type->bit_size,		\
+					&lhs_uvalue, &rhs_uvalue);		\
 	if (!_err) {								\
-		_err = drgn_object_set_unsigned_internal((res), (type),		\
-							 _bit_size,		\
-							 lhs_uvalue op		\
-							 rhs_uvalue);		\
+		drgn_object_set_unsigned_internal((res), _type,			\
+						  lhs_uvalue op rhs_uvalue);	\
 	}									\
 	_err;									\
 })
 
-#define BINARY_OP_FLOAT(res, type, bit_size, lhs, op, rhs) ({			\
+#define BINARY_OP_FLOAT(res, type, lhs, op, rhs) ({				\
 	struct drgn_error *_err;						\
 	double lhs_fvalue, rhs_fvalue;						\
-										\
 	_err = binary_operands_float((lhs), (rhs), &lhs_fvalue, &rhs_fvalue);	\
 	if (!_err) {								\
-		_err = drgn_object_set_float_internal((res), (type),		\
-						      (bit_size),		\
-						      lhs_fvalue op		\
-						      rhs_fvalue);		\
+		drgn_object_set_float_internal((res), (type),			\
+					       lhs_fvalue op rhs_fvalue);	\
 	}									\
 	_err;									\
 })
@@ -1810,23 +1610,21 @@ type_error:
 
 struct drgn_error *drgn_op_cmp_impl(const struct drgn_object *lhs,
 				    const struct drgn_object *rhs,
-				    const struct drgn_object_type *type,
+				    const struct drgn_operand_type *op_type,
 				    int *ret)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
 
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(op_type, &type);
 	if (err)
 		return err;
 
-	switch (encoding) {
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		int64_t lhs_svalue, rhs_svalue;
-
-		err = binary_operands_signed(lhs, rhs, bit_size, &lhs_svalue,
-					     &rhs_svalue);
+		err = binary_operands_signed(lhs, rhs, type.bit_size,
+					     &lhs_svalue, &rhs_svalue);
 		if (err)
 			return err;
 		*ret = CMP(lhs_svalue, rhs_svalue);
@@ -1834,9 +1632,8 @@ struct drgn_error *drgn_op_cmp_impl(const struct drgn_object *lhs,
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		uint64_t lhs_uvalue, rhs_uvalue;
-
-		err = binary_operands_unsigned(lhs, rhs, bit_size, &lhs_uvalue,
-					       &rhs_uvalue);
+		err = binary_operands_unsigned(lhs, rhs, type.bit_size,
+					       &lhs_uvalue, &rhs_uvalue);
 		if (err)
 			return err;
 		*ret = CMP(lhs_uvalue, rhs_uvalue);
@@ -1844,7 +1641,6 @@ struct drgn_error *drgn_op_cmp_impl(const struct drgn_object *lhs,
 	}
 	case DRGN_OBJECT_ENCODING_FLOAT: {
 		double lhs_fvalue, rhs_fvalue;
-
 		err = binary_operands_float(lhs, rhs, &lhs_fvalue, &rhs_fvalue);
 		if (err)
 			return err;
@@ -1879,25 +1675,22 @@ struct drgn_error *drgn_op_cmp_pointers(const struct drgn_object *lhs,
 #define ARITHMETIC_BINARY_OP(op_name, op)					\
 struct drgn_error *								\
 drgn_op_##op_name##_impl(struct drgn_object *res,				\
-			 const struct drgn_object_type *type,			\
+			 const struct drgn_operand_type *op_type,		\
 			 const struct drgn_object *lhs,				\
 			 const struct drgn_object *rhs)				\
 {										\
 	struct drgn_error *err;							\
-	enum drgn_object_encoding encoding;					\
-	uint64_t bit_size;							\
-										\
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);	\
+	struct drgn_object_type type;						\
+	err = drgn_object_type_operand(op_type, &type);				\
 	if (err)								\
 		return err;							\
-										\
-	switch (encoding) {							\
+	switch (type.encoding) {						\
 	case DRGN_OBJECT_ENCODING_SIGNED:					\
-		return BINARY_OP_SIGNED_2C(res, type, bit_size, lhs, op, rhs);	\
+		return BINARY_OP_SIGNED_2C(res, &type, lhs, op, rhs);		\
 	case DRGN_OBJECT_ENCODING_UNSIGNED:					\
-		return BINARY_OP_UNSIGNED(res, type, bit_size, lhs, op, rhs);	\
+		return BINARY_OP_UNSIGNED(res, &type, lhs, op, rhs);		\
 	case DRGN_OBJECT_ENCODING_FLOAT:					\
-		return BINARY_OP_FLOAT(res, type, bit_size, lhs, op, rhs);	\
+		return BINARY_OP_FLOAT(res, &type, lhs, op, rhs);		\
 	default:								\
 		return drgn_error_create(DRGN_ERROR_TYPE,			\
 					 "invalid result type for " #op_name);	\
@@ -1907,33 +1700,33 @@ ARITHMETIC_BINARY_OP(add, +)
 ARITHMETIC_BINARY_OP(sub, -)
 #undef ARITHMETIC_BINARY_OP
 
-struct drgn_error *drgn_op_add_to_pointer(struct drgn_object *res,
-					  const struct drgn_object_type *type,
-					  uint64_t referenced_size, bool negate,
-					  const struct drgn_object *ptr,
-					  const struct drgn_object *index)
+struct drgn_error *
+drgn_op_add_to_pointer(struct drgn_object *res,
+		       const struct drgn_operand_type *op_type,
+		       uint64_t referenced_size, bool negate,
+		       const struct drgn_object *ptr,
+		       const struct drgn_object *index)
 {
 	struct drgn_error *err;
-	uint64_t ptr_value, index_value;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
 
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(op_type, &type);
 	if (err)
 		return err;
-	if (encoding != DRGN_OBJECT_ENCODING_UNSIGNED) {
+	if (type.encoding != DRGN_OBJECT_ENCODING_UNSIGNED) {
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "invalid result type for pointer arithmetic");
 	}
 
+	uint64_t ptr_value;
 	err = pointer_operand(ptr, &ptr_value);
 	if (err)
 		return err;
 
+	uint64_t index_value;
 	switch (index->encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		int64_t svalue;
-
 		err = drgn_object_value_signed(index, &svalue);
 		if (err)
 			return err;
@@ -1959,35 +1752,33 @@ struct drgn_error *drgn_op_add_to_pointer(struct drgn_object *res,
 		ptr_value -= index_value * referenced_size;
 	else
 		ptr_value += index_value * referenced_size;
-	return drgn_object_set_unsigned_internal(res, type, bit_size,
-						 ptr_value);
+	drgn_object_set_unsigned_internal(res, &type, ptr_value);
+	return NULL;
 }
 
 struct drgn_error *drgn_op_sub_pointers(struct drgn_object *res,
-					const struct drgn_object_type *type,
+					const struct drgn_operand_type *op_type,
 					uint64_t referenced_size,
 					const struct drgn_object *lhs,
 					const struct drgn_object *rhs)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-	uint64_t lhs_value, rhs_value;
-	int64_t diff;
 
 	if (!referenced_size) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "object size must not be zero");
 	}
 
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(op_type, &type);
 	if (err)
 		return err;
-	if (encoding != DRGN_OBJECT_ENCODING_SIGNED) {
+	if (type.encoding != DRGN_OBJECT_ENCODING_SIGNED) {
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "invalid result type for pointer subtraction");
 	}
 
+	uint64_t lhs_value, rhs_value;
 	err = pointer_operand(lhs, &lhs_value);
 	if (err)
 		return err;
@@ -1995,37 +1786,31 @@ struct drgn_error *drgn_op_sub_pointers(struct drgn_object *res,
 	if (err)
 		return err;
 
+	int64_t diff;
 	if (lhs_value >= rhs_value)
 		diff = (lhs_value - rhs_value) / referenced_size;
 	else
 		diff = -((rhs_value - lhs_value) / referenced_size);
-	return drgn_object_set_signed_internal(res, type, bit_size, diff);
+	drgn_object_set_signed_internal(res, &type, diff);
+	return NULL;
 }
 
 struct drgn_error *drgn_op_mul_impl(struct drgn_object *res,
-				    const struct drgn_object_type *type,
+				    const struct drgn_operand_type *op_type,
 				    const struct drgn_object *lhs,
 				    const struct drgn_object *rhs)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
 
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(op_type, &type);
 	if (err)
 		return err;
 
-	switch (encoding) {
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		int64_t lhs_svalue, rhs_svalue;
-		uint64_t lhs_uvalue, rhs_uvalue;
-		bool lhs_negative, rhs_negative;
-		union {
-			int64_t svalue;
-			uint64_t uvalue;
-		} tmp;
-
-		err = binary_operands_signed(lhs, rhs, bit_size,
+		err = binary_operands_signed(lhs, rhs, type.bit_size,
 					     &lhs_svalue, &rhs_svalue);
 		if (err)
 			return err;
@@ -2034,20 +1819,24 @@ struct drgn_error *drgn_op_mul_impl(struct drgn_object *res,
 		 * Convert to sign and magnitude to avoid signed integer
 		 * overflow.
 		 */
-		lhs_negative = lhs_svalue < 0;
-		lhs_uvalue = lhs_negative ? -lhs_svalue : lhs_svalue;
-		rhs_negative = rhs_svalue < 0;
-		rhs_uvalue = rhs_negative ? -rhs_svalue : rhs_svalue;
+		bool lhs_negative = lhs_svalue < 0;
+		uint64_t lhs_uvalue = lhs_negative ? -lhs_svalue : lhs_svalue;
+		bool rhs_negative = rhs_svalue < 0;
+		uint64_t rhs_uvalue = rhs_negative ? -rhs_svalue : rhs_svalue;
+		union {
+			int64_t svalue;
+			uint64_t uvalue;
+		} tmp;
 		tmp.uvalue = lhs_uvalue * rhs_uvalue;
-		if (lhs_negative ^ rhs_negative)
+		if (lhs_negative != rhs_negative)
 			tmp.uvalue = -tmp.uvalue;
-		return drgn_object_set_signed_internal(res, type, bit_size,
-						       tmp.svalue);
+		drgn_object_set_signed_internal(res, &type, tmp.svalue);
+		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED:
-		return BINARY_OP_UNSIGNED(res, type, bit_size, lhs, *, rhs);
+		return BINARY_OP_UNSIGNED(res, &type, lhs, *, rhs);
 	case DRGN_OBJECT_ENCODING_FLOAT:
-		return BINARY_OP_FLOAT(res, type, bit_size, lhs, *, rhs);
+		return BINARY_OP_FLOAT(res, &type, lhs, *, rhs);
 	default:
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "invalid result type for mul");
@@ -2060,54 +1849,52 @@ static struct drgn_error drgn_zero_division = {
 };
 
 struct drgn_error *drgn_op_div_impl(struct drgn_object *res,
-				    const struct drgn_object_type *type,
+				    const struct drgn_operand_type *op_type,
 				    const struct drgn_object *lhs,
 				    const struct drgn_object *rhs)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
 
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(op_type, &type);
 	if (err)
 		return err;
 
-	switch (encoding) {
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		int64_t lhs_svalue, rhs_svalue;
-
-		err = binary_operands_signed(lhs, rhs, bit_size,
+		err = binary_operands_signed(lhs, rhs, type.bit_size,
 					     &lhs_svalue, &rhs_svalue);
 		if (err)
 			return err;
 		if (!rhs_svalue)
 			return &drgn_zero_division;
-		return drgn_object_set_signed_internal(res, type, bit_size,
-						       lhs_svalue / rhs_svalue);
+		drgn_object_set_signed_internal(res, &type,
+						lhs_svalue / rhs_svalue);
+		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		uint64_t lhs_uvalue, rhs_uvalue;
-
-		err = binary_operands_unsigned(lhs, rhs, bit_size, &lhs_uvalue,
-					       &rhs_uvalue);
+		err = binary_operands_unsigned(lhs, rhs, type.bit_size,
+					       &lhs_uvalue, &rhs_uvalue);
 		if (err)
 			return err;
 		if (!rhs_uvalue)
 			return &drgn_zero_division;
-		return drgn_object_set_unsigned_internal(res, type, bit_size,
-							 lhs_uvalue /
-							 rhs_uvalue);
+		drgn_object_set_unsigned_internal(res, &type,
+						  lhs_uvalue / rhs_uvalue);
+		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_FLOAT: {
 		double lhs_fvalue, rhs_fvalue;
-
 		err = binary_operands_float(lhs, rhs, &lhs_fvalue, &rhs_fvalue);
 		if (err)
 			return err;
 		if (!rhs_fvalue)
 			return &drgn_zero_division;
-		return drgn_object_set_float_internal(res, type, bit_size,
-						      lhs_fvalue / rhs_fvalue);
+		drgn_object_set_float_internal(res, &type,
+					       lhs_fvalue / rhs_fvalue);
+		return NULL;
 	}
 	default:
 		return drgn_error_create(DRGN_ERROR_TYPE,
@@ -2116,43 +1903,41 @@ struct drgn_error *drgn_op_div_impl(struct drgn_object *res,
 }
 
 struct drgn_error *drgn_op_mod_impl(struct drgn_object *res,
-				    const struct drgn_object_type *type,
+				    const struct drgn_operand_type *op_type,
 				    const struct drgn_object *lhs,
 				    const struct drgn_object *rhs)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
 
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(op_type, &type);
 	if (err)
 		return err;
 
-	switch (encoding) {
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		int64_t lhs_svalue, rhs_svalue;
-
-		err = binary_operands_signed(lhs, rhs, bit_size,
+		err = binary_operands_signed(lhs, rhs, type.bit_size,
 					     &lhs_svalue, &rhs_svalue);
 		if (err)
 			return err;
 		if (!rhs_svalue)
 			return &drgn_zero_division;
-		return drgn_object_set_signed_internal(res, type, bit_size,
-						       lhs_svalue % rhs_svalue);
+		drgn_object_set_signed_internal(res, &type,
+						lhs_svalue % rhs_svalue);
+		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		uint64_t lhs_uvalue, rhs_uvalue;
-
-		err = binary_operands_unsigned(lhs, rhs, bit_size,
+		err = binary_operands_unsigned(lhs, rhs, type.bit_size,
 					       &lhs_uvalue, &rhs_uvalue);
 		if (err)
 			return err;
 		if (!rhs_uvalue)
 			return &drgn_zero_division;
-		return drgn_object_set_unsigned_internal(res, type, bit_size,
-							 lhs_uvalue %
-							 rhs_uvalue);
+		drgn_object_set_unsigned_internal(res, &type,
+						  lhs_uvalue % rhs_uvalue);
+		return NULL;
 	}
 	default:
 		return drgn_error_create(DRGN_ERROR_TYPE,
@@ -2161,23 +1946,21 @@ struct drgn_error *drgn_op_mod_impl(struct drgn_object *res,
 }
 
 static struct drgn_error *shift_operand(const struct drgn_object *rhs,
-					const struct drgn_object_type *rhs_type,
+					const struct drgn_operand_type *rhs_type,
 					uint64_t *ret)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
 
-	err = drgn_object_type_encoding_and_size(rhs_type, &encoding,
-						 &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(rhs_type, &type);
 	if (err)
 		return err;
 
-	switch (encoding) {
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		int64_t rhs_svalue;
-
-		err = drgn_object_convert_signed(rhs, bit_size, &rhs_svalue);
+		err = drgn_object_convert_signed(rhs, type.bit_size,
+						 &rhs_svalue);
 		if (err)
 			return err;
 		if (rhs_svalue < 0) {
@@ -2188,7 +1971,7 @@ static struct drgn_error *shift_operand(const struct drgn_object *rhs,
 		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED:
-		return drgn_object_convert_unsigned(rhs, bit_size, ret);
+		return drgn_object_convert_unsigned(rhs, type.bit_size, ret);
 	default:
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "invalid rhs type for shift");
@@ -2197,54 +1980,52 @@ static struct drgn_error *shift_operand(const struct drgn_object *rhs,
 
 struct drgn_error *drgn_op_lshift_impl(struct drgn_object *res,
 				       const struct drgn_object *lhs,
-				       const struct drgn_object_type *lhs_type,
+				       const struct drgn_operand_type *lhs_type,
 				       const struct drgn_object *rhs,
-				       const struct drgn_object_type *rhs_type)
+				       const struct drgn_operand_type *rhs_type)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-	uint64_t shift;
 
-	err = drgn_object_type_encoding_and_size(lhs_type, &encoding,
-						 &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(lhs_type, &type);
 	if (err)
 		return err;
 
+	uint64_t shift;
 	err = shift_operand(rhs, rhs_type, &shift);
 	if (err)
 		return err;
 
-	switch (encoding) {
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		union {
 			int64_t svalue;
 			uint64_t uvalue;
 		} tmp;
-
-		err = drgn_object_convert_signed(lhs, bit_size, &tmp.svalue);
+		err = drgn_object_convert_signed(lhs, type.bit_size,
+						 &tmp.svalue);
 		if (err)
 			return err;
 		/* Left shift of a negative integer is undefined. */
-		if (shift < bit_size)
+		if (shift < type.bit_size)
 			tmp.uvalue <<= shift;
 		else
 			tmp.uvalue = 0;
-		return drgn_object_set_signed_internal(res, lhs_type, bit_size,
-						       tmp.svalue);
+		drgn_object_set_signed_internal(res, &type, tmp.svalue);
+		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		uint64_t uvalue;
-
-		err = drgn_object_convert_unsigned(lhs, bit_size, &uvalue);
+		err = drgn_object_convert_unsigned(lhs, type.bit_size,
+						   &uvalue);
 		if (err)
 			return err;
-		if (shift < bit_size)
+		if (shift < type.bit_size)
 			uvalue <<= shift;
 		else
 			uvalue = 0;
-		return drgn_object_set_unsigned_internal(res, lhs_type,
-							 bit_size, uvalue);
+		drgn_object_set_unsigned_internal(res, &type, uvalue);
+		return NULL;
 	}
 	default:
 		return drgn_error_create(DRGN_ERROR_TYPE,
@@ -2254,52 +2035,48 @@ struct drgn_error *drgn_op_lshift_impl(struct drgn_object *res,
 
 struct drgn_error *drgn_op_rshift_impl(struct drgn_object *res,
 				       const struct drgn_object *lhs,
-				       const struct drgn_object_type *lhs_type,
+				       const struct drgn_operand_type *lhs_type,
 				       const struct drgn_object *rhs,
-				       const struct drgn_object_type *rhs_type)
+				       const struct drgn_operand_type *rhs_type)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-	uint64_t shift;
 
-	err = drgn_object_type_encoding_and_size(lhs_type, &encoding,
-						 &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(lhs_type, &type);
 	if (err)
 		return err;
 
+	uint64_t shift;
 	err = shift_operand(rhs, rhs_type, &shift);
 	if (err)
 		return err;
 
-	switch (encoding) {
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED: {
 		int64_t svalue;
-
-		err = drgn_object_convert_signed(lhs, bit_size, &svalue);
+		err = drgn_object_convert_signed(lhs, type.bit_size, &svalue);
 		if (err)
 			return err;
-		if (shift < bit_size)
+		if (shift < type.bit_size)
 			svalue >>= shift;
 		else if (svalue >= 0)
 			svalue = 0;
 		else
 			svalue = -1;
-		return drgn_object_set_signed_internal(res, lhs_type, bit_size,
-						       svalue);
+		drgn_object_set_signed_internal(res, &type, svalue);
+		return NULL;
 	}
 	case DRGN_OBJECT_ENCODING_UNSIGNED: {
 		uint64_t uvalue;
-
-		err = drgn_object_convert_unsigned(lhs, bit_size, &uvalue);
+		err = drgn_object_convert_unsigned(lhs, type.bit_size, &uvalue);
 		if (err)
 			return err;
-		if (shift < bit_size)
+		if (shift < type.bit_size)
 			uvalue >>= shift;
 		else
 			uvalue = 0;
-		return drgn_object_set_unsigned_internal(res, lhs_type,
-							 bit_size, uvalue);
+		drgn_object_set_unsigned_internal(res, &type, uvalue);
+		return NULL;
 	}
 	default:
 		return drgn_error_create(DRGN_ERROR_TYPE,
@@ -2310,23 +2087,20 @@ struct drgn_error *drgn_op_rshift_impl(struct drgn_object *res,
 #define INTEGER_BINARY_OP(op_name, op)						\
 struct drgn_error *								\
 drgn_op_##op_name##_impl(struct drgn_object *res,				\
-			 const struct drgn_object_type *type,			\
+			 const struct drgn_operand_type *op_type,		\
 			 const struct drgn_object *lhs,				\
 			 const struct drgn_object *rhs)				\
 {										\
 	struct drgn_error *err;							\
-	enum drgn_object_encoding encoding;					\
-	uint64_t bit_size;							\
-										\
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);	\
+	struct drgn_object_type type;						\
+	err = drgn_object_type_operand(op_type, &type);				\
 	if (err)								\
 		return err;							\
-										\
-	switch (encoding) {							\
+	switch (type.encoding) {						\
 	case DRGN_OBJECT_ENCODING_SIGNED:					\
-		return BINARY_OP_SIGNED_2C(res, type, bit_size, lhs, op, rhs);	\
+		return BINARY_OP_SIGNED_2C(res, &type, lhs, op, rhs);		\
 	case DRGN_OBJECT_ENCODING_UNSIGNED:					\
-		return BINARY_OP_UNSIGNED(res, type, bit_size, lhs, op, rhs);	\
+		return BINARY_OP_UNSIGNED(res, &type, lhs, op, rhs);		\
 	default:								\
 		return drgn_error_create(DRGN_ERROR_TYPE,			\
 					 "invalid result type for " #op_name);	\
@@ -2338,65 +2112,53 @@ INTEGER_BINARY_OP(xor, ^)
 #undef INTEGER_BINARY_OP
 
 /* See BINARY_OP_SIGNED_2C. */
-#define UNARY_OP_SIGNED_2C(res, type, bit_size, op, obj) ({			\
+#define UNARY_OP_SIGNED_2C(res, type, op, obj) ({				\
 	struct drgn_error *_err;						\
-	uint64_t _bit_size = (bit_size);					\
+	const struct drgn_object_type *_type = (type);				\
 	union {									\
 		int64_t svalue;							\
 		uint64_t uvalue;						\
 	} tmp;									\
-										\
-	_err = drgn_object_convert_signed((obj), _bit_size, &tmp.svalue);	\
+	_err = drgn_object_convert_signed((obj), _type->bit_size, &tmp.svalue);	\
 	tmp.uvalue = op tmp.uvalue;						\
-	if (!_err) {								\
-		_err = drgn_object_set_signed_internal((res), (type),		\
-						       _bit_size,		\
-						       tmp.svalue);		\
-	}									\
+	if (!_err)								\
+		drgn_object_set_signed_internal((res), _type, tmp.svalue);	\
 	_err;									\
 })
 
-#define UNARY_OP_UNSIGNED(res, type, bit_size, op, obj) ({			\
+#define UNARY_OP_UNSIGNED(res, type, op, obj) ({				\
 	struct drgn_error *_err;						\
-	uint64_t _bit_size = (bit_size);					\
+	const struct drgn_object_type *_type = (type);				\
 	uint64_t uvalue;							\
-										\
-	_err = drgn_object_convert_unsigned((obj), bit_size, &uvalue);		\
-	if (!_err) {								\
-		_err = drgn_object_set_unsigned_internal((res), (type),		\
-							 _bit_size, op uvalue);	\
-										\
-	}									\
+	_err = drgn_object_convert_unsigned((obj), _type->bit_size, &uvalue);	\
+	if (!_err)								\
+		drgn_object_set_unsigned_internal((res), _type, op uvalue);	\
 	_err;									\
 })
 
 #define ARITHMETIC_UNARY_OP(op_name, op)					\
 struct drgn_error *								\
 drgn_op_##op_name##_impl(struct drgn_object *res,				\
-			 const struct drgn_object_type *type,			\
+			 const struct drgn_operand_type *op_type,		\
 			 const struct drgn_object *obj)				\
 {										\
 	struct drgn_error *err;							\
-	enum drgn_object_encoding encoding;					\
-	uint64_t bit_size;							\
-										\
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);	\
+	struct drgn_object_type type;						\
+	err = drgn_object_type_operand(op_type, &type);				\
 	if (err)								\
 		return err;							\
-										\
-	switch (encoding) {							\
+	switch (type.encoding) {						\
 	case DRGN_OBJECT_ENCODING_SIGNED:					\
-		return UNARY_OP_SIGNED_2C(res, type, bit_size, op, obj);	\
+		return UNARY_OP_SIGNED_2C(res, &type, op, obj);			\
 	case DRGN_OBJECT_ENCODING_UNSIGNED:					\
-		return UNARY_OP_UNSIGNED(res, type, bit_size, op, obj);		\
+		return UNARY_OP_UNSIGNED(res, &type, op, obj);			\
 	case DRGN_OBJECT_ENCODING_FLOAT: {					\
 		double fvalue;							\
-										\
 		err = drgn_object_convert_float(obj, &fvalue);			\
 		if (err)							\
 			return err;						\
-		return drgn_object_set_float_internal(res, type, bit_size,	\
-						      op fvalue);		\
+		drgn_object_set_float_internal(res, &type, op fvalue);		\
+		return NULL;							\
 										\
 	}									\
 	default:								\
@@ -2409,22 +2171,19 @@ ARITHMETIC_UNARY_OP(neg, -)
 #undef ARITHMETIC_UNARY_OP
 
 struct drgn_error *drgn_op_not_impl(struct drgn_object *res,
-				    const struct drgn_object_type *type,
+				    const struct drgn_operand_type *op_type,
 				    const struct drgn_object *obj)
 {
 	struct drgn_error *err;
-	enum drgn_object_encoding encoding;
-	uint64_t bit_size;
-
-	err = drgn_object_type_encoding_and_size(type, &encoding, &bit_size);
+	struct drgn_object_type type;
+	err = drgn_object_type_operand(op_type, &type);
 	if (err)
 		return err;
-
-	switch (encoding) {
+	switch (type.encoding) {
 	case DRGN_OBJECT_ENCODING_SIGNED:
-		return UNARY_OP_SIGNED_2C(res, type, bit_size, ~, obj);
+		return UNARY_OP_SIGNED_2C(res, &type, ~, obj);
 	case DRGN_OBJECT_ENCODING_UNSIGNED:
-		return UNARY_OP_UNSIGNED(res, type, bit_size, ~, obj);
+		return UNARY_OP_UNSIGNED(res, &type, ~, obj);
 	default:
 		return drgn_error_create(DRGN_ERROR_TYPE,
 					 "invalid result type for not");
