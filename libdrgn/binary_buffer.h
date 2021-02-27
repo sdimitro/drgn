@@ -16,8 +16,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #include "util.h"
@@ -110,7 +108,7 @@ static inline void binary_buffer_init(struct binary_buffer *bb, const void *buf,
 	bb->pos = buf;
 	bb->end = (const char *)buf + len;
 	bb->prev = NULL;
-	bb->bswap = little_endian != (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__);
+	bb->bswap = little_endian != HOST_LITTLE_ENDIAN;
 	bb->error_fn = error_fn;
 }
 

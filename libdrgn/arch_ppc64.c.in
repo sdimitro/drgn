@@ -5,10 +5,10 @@
 #include <byteswap.h>
 #include <elfutils/libdw.h>
 #include <elfutils/libdwfl.h>
+#include <string.h>
 
 #include "drgn.h"
 #include "error.h"
-#include "linux_kernel.h"
 #include "platform.h"
 #include "program.h"
 %}
@@ -112,10 +112,7 @@ set_initial_registers_from_struct_ppc64(struct drgn_program *prog,
 					 "registers are truncated");
 	}
 
-	bool bswap;
-	struct drgn_error *err = drgn_program_bswap(prog, &bswap);
-	if (err)
-		return err;
+	bool bswap = drgn_platform_bswap(&prog->platform);
 
 	Dwarf_Word dwarf_regs[32];
 

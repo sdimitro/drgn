@@ -5,6 +5,7 @@
 
 #include "drgnpy.h"
 #include "../lazy_object.h"
+#include "../platform.h"
 #include "../program.h"
 #include "../type.h"
 #include "../util.h"
@@ -549,14 +550,12 @@ static int append_field(PyObject *parts, bool *first, const char *format, ...)
 
 static PyObject *DrgnType_repr(DrgnType *self)
 {
-	struct drgn_error *err;
-	PyObject *parts, *ret = NULL;
-	bool first = true;
-
-	parts = PyList_New(0);
+	PyObject *parts = PyList_New(0);
 	if (!parts)
 		return NULL;
 
+	PyObject *ret = NULL;
+	bool first = true;
 	if (append_format(parts, "prog.%s_type(",
 			  drgn_type_kind_str(self->type)) == -1)
 		goto out;
@@ -572,50 +571,24 @@ static PyObject *DrgnType_repr(DrgnType *self)
 		goto out;
 	if (append_member(parts, self, &first, type) == -1)
 		goto out;
-	if (drgn_type_kind(self->type) == DRGN_TYPE_POINTER) {
-		bool print_size;
-		if (drgn_type_program(self->type)->has_platform) {
-			uint8_t word_size;
-			err = drgn_program_word_size(drgn_type_program(self->type),
-						     &word_size);
-			if (err) {
-				set_drgn_error(err);
-				goto out;
-			}
-			print_size = drgn_type_size(self->type) != word_size;
-		} else {
-			print_size = true;
-		}
-		if (print_size &&
-		    append_member(parts, self, &first, size) == -1)
+	if (drgn_type_kind(self->type) == DRGN_TYPE_POINTER &&
+	    (!drgn_type_program(self->type)->has_platform ||
+	     drgn_type_size(self->type) !=
+	     drgn_platform_address_size(&drgn_type_program(self->type)->platform)) &&
+	    append_member(parts, self, &first, size) == -1)
+		goto out;
+	if (drgn_type_has_little_endian(self->type) &&
+	    (!drgn_type_program(self->type)->has_platform ||
+	     drgn_type_little_endian(self->type) !=
+	     drgn_platform_is_little_endian(&drgn_type_program(self->type)->platform))) {
+		PyObject *obj = DrgnType_get_byteorder(self, NULL);
+		if (!obj)
 			goto out;
-	}
-	if (drgn_type_has_little_endian(self->type)) {
-		bool print_byteorder;
-		if (drgn_type_program(self->type)->has_platform) {
-			bool little_endian;
-			err = drgn_program_is_little_endian(drgn_type_program(self->type),
-							    &little_endian);
-			if (err) {
-				set_drgn_error(err);
-				goto out;
-			}
-			print_byteorder =
-				drgn_type_little_endian(self->type) != little_endian;
-		} else {
-			print_byteorder = true;
-		}
-		if (print_byteorder) {
-			PyObject *obj = DrgnType_get_byteorder(self, NULL);
-			if (!obj)
-				goto out;
-			if (append_field(parts, &first, "byteorder=%R",
-					 obj) == -1) {
-				Py_DECREF(obj);
-				goto out;
-			}
+		if (append_field(parts, &first, "byteorder=%R", obj) == -1) {
 			Py_DECREF(obj);
+			goto out;
 		}
+		Py_DECREF(obj);
 	}
 	if (append_member(parts, self, &first, length) == -1)
 		goto out;
@@ -1400,6 +1373,37 @@ DrgnType *Program_void_type(Program *self, PyObject *args, PyObject *kwds)
 	return (DrgnType *)DrgnType_wrap(qualified_type);
 }
 
+struct byteorder_arg {
+	bool allow_none;
+	bool is_none;
+	enum drgn_byte_order value;
+};
+
+static int byteorder_converter(PyObject *o, void *p)
+{
+	struct byteorder_arg *arg = p;
+
+	arg->is_none = o == Py_None;
+	if (arg->allow_none && o == Py_None)
+		return 1;
+
+	if (PyUnicode_Check(o)) {
+		const char *s = PyUnicode_AsUTF8(o);
+		if (strcmp(s, "little") == 0) {
+			arg->value = DRGN_LITTLE_ENDIAN;
+			return 1;
+		} else if (strcmp(s, "big") == 0) {
+			arg->value = DRGN_BIG_ENDIAN;
+			return 1;
+		}
+	}
+	PyErr_Format(PyExc_ValueError,
+		     "expected 'little'%s 'big'%s for byteorder",
+		     arg->allow_none ? "," : " or",
+		     arg->allow_none ? ", or None" : "");
+	return 0;
+}
+
 DrgnType *Program_int_type(Program *self, PyObject *args, PyObject *kwds)
 {
 	static char *keywords[] = {
@@ -2108,12 +2112,12 @@ DrgnType *Program_pointer_type(Program *self, PyObject *args, PyObject *kwds)
 		return NULL;
 
 	if (size.is_none) {
-		uint8_t word_size;
-		struct drgn_error *err = drgn_program_word_size(&self->prog,
-								&word_size);
+		uint8_t address_size;
+		struct drgn_error *err =
+			drgn_program_address_size(&self->prog, &address_size);
 		if (err)
 			return set_drgn_error(err);
-		size.uvalue = word_size;
+		size.uvalue = address_size;
 	}
 
 	struct drgn_qualified_type qualified_type;

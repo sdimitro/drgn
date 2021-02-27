@@ -737,8 +737,7 @@ static struct drgn_error *apply_elf_relocations(Elf *elf)
 	    ehdr->e_machine != EM_X86_64 ||
 	    ehdr->e_ident[EI_CLASS] != ELFCLASS64 ||
 	    ehdr->e_ident[EI_DATA] !=
-	    (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ?
-	     ELFDATA2LSB : ELFDATA2MSB)) {
+	    (HOST_LITTLE_ENDIAN ? ELFDATA2LSB : ELFDATA2MSB)) {
 		/* Unsupported; fall back to libdwfl. */
 		return NULL;
 	}
@@ -2138,11 +2137,11 @@ drgn_pointer_type_from_dwarf(struct drgn_debug_info *dbinfo,
 		}
 		size = word;
 	} else {
-		uint8_t word_size;
-		err = drgn_program_word_size(dbinfo->prog, &word_size);
+		uint8_t address_size;
+		err = drgn_program_address_size(dbinfo->prog, &address_size);
 		if (err)
 			return err;
-		size = word_size;
+		size = address_size;
 	}
 
 	/*

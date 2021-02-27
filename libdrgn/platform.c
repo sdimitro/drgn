@@ -7,9 +7,15 @@
 #include "platform.h"
 #include "util.h"
 
+static const struct drgn_register *register_by_name_unknown(const char *name)
+{
+	return NULL;
+}
+
 const struct drgn_architecture_info arch_info_unknown = {
 	.name = "unknown",
 	.arch = DRGN_ARCH_UNKNOWN,
+	.register_by_name = register_by_name_unknown,
 };
 
 LIBDRGN_PUBLIC const struct drgn_platform drgn_host_platform = {
@@ -21,8 +27,7 @@ LIBDRGN_PUBLIC const struct drgn_platform drgn_host_platform = {
 	.arch = &arch_info_unknown,
 #endif
 	.flags = ((sizeof(void *) == 8 ? DRGN_PLATFORM_IS_64_BIT : 0) |
-		  (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ ?
-		   DRGN_PLATFORM_IS_LITTLE_ENDIAN : 0)),
+		  (HOST_LITTLE_ENDIAN ? DRGN_PLATFORM_IS_LITTLE_ENDIAN : 0)),
 };
 
 LIBDRGN_PUBLIC struct drgn_error *
@@ -136,7 +141,7 @@ LIBDRGN_PUBLIC const struct drgn_register *
 drgn_platform_register_by_name(const struct drgn_platform *platform,
 			       const char *name)
 {
-	return drgn_architecture_register_by_name(platform->arch, name);
+	return platform->arch->register_by_name(name);
 }
 
 LIBDRGN_PUBLIC const char * const *
