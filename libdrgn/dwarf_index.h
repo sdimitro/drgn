@@ -80,7 +80,7 @@ struct drgn_dwarf_index_die {
 		struct drgn_dwarf_index_namespace *namespace;
 	};
 	struct drgn_debug_info_module *module;
-	size_t offset;
+	uintptr_t addr;
 };
 
 DEFINE_HASH_MAP_TYPE(drgn_dwarf_index_die_map, struct string, uint32_t)
@@ -110,9 +110,9 @@ struct drgn_dwarf_index_specification {
 	 * DW_AT_specification.
 	 */
 	uintptr_t declaration;
-	/* Module and offset of DIE. */
+	/* Module and address of DIE. */
 	struct drgn_debug_info_module *module;
-	size_t offset;
+	uintptr_t addr;
 };
 
 static inline uintptr_t
@@ -313,6 +313,25 @@ drgn_dwarf_index_iterator_next(struct drgn_dwarf_index_iterator *it);
  */
 struct drgn_error *drgn_dwarf_index_get_die(struct drgn_dwarf_index_die *die,
 					    Dwarf_Die *die_ret);
+
+
+/**
+ * Find a definition corresponding to a declaration DIE.
+ *
+ * This finds the address of a DIE with a @c DW_AT_specification attribute that
+ * refers to the given address.
+ *
+ * @param[in] die_addr The address of the declaration DIE.
+ * @param[out] module_ret Returned module containing the definition DIE.
+ * @param[out] addr_ret Returned address of the definition DIE.
+ * @return @c true if a definition DIE was found, @c false if not (in which case
+ * *@p module_ret and *@p addr_ret are not modified).
+ */
+bool
+drgn_dwarf_index_find_definition(struct drgn_dwarf_index *dindex,
+				 uintptr_t die_addr,
+				 struct drgn_debug_info_module **module_ret,
+				 uintptr_t *addr_ret);
 
 /** @} */
 
