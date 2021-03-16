@@ -4,15 +4,24 @@
 #ifndef DRGN_PLATFORM_H
 #define DRGN_PLATFORM_H
 
-#include <elfutils/libdwfl.h>
 #include <gelf.h>
 
+#include "cfi.h"
 #include "drgn.h"
 #include "util.h"
 
+struct drgn_register_state;
+
 struct drgn_register {
-	const char *name;
+	const char * const *names;
+	size_t num_names;
+	drgn_register_number regno;
 	uint64_t dwarf_number;
+};
+
+struct drgn_register_layout {
+	uint32_t offset;
+	uint32_t size;
 };
 
 /* Page table iterator. */
@@ -60,15 +69,26 @@ struct drgn_architecture_info {
 	const struct drgn_register *registers;
 	size_t num_registers;
 	const struct drgn_register *(*register_by_name)(const char *name);
+	const struct drgn_register_layout *register_layout;
+	drgn_register_number (*dwarf_regno_to_internal)(uint64_t);
+	/* CFI row containing default rules for DWARF CFI. */
+	struct drgn_cfi_row *default_dwarf_cfi_row;
+	/*
+	 * Try to unwind a stack frame if CFI wasn't found. Returns &drgn_stop
+	 * if we couldn't.
+	 */
+	struct drgn_error *(*fallback_unwind)(struct drgn_program *,
+					      struct drgn_register_state *,
+					      struct drgn_register_state **);
 	/* Given pt_regs as a value buffer object. */
-	struct drgn_error *(*pt_regs_set_initial_registers)(Dwfl_Thread *,
-							    const struct drgn_object *);
-	struct drgn_error *(*prstatus_set_initial_registers)(struct drgn_program *,
-							     Dwfl_Thread *,
+	struct drgn_error *(*pt_regs_get_initial_registers)(const struct drgn_object *,
+							    struct drgn_register_state **);
+	struct drgn_error *(*prstatus_get_initial_registers)(struct drgn_program *,
 							     const void *,
-							     size_t);
-	struct drgn_error *(*linux_kernel_set_initial_registers)(Dwfl_Thread *,
-								 const struct drgn_object *);
+							     size_t,
+							     struct drgn_register_state **);
+	struct drgn_error *(*linux_kernel_get_initial_registers)(const struct drgn_object *,
+								 struct drgn_register_state **);
 	struct drgn_error *(*linux_kernel_get_page_offset)(struct drgn_object *);
 	struct drgn_error *(*linux_kernel_get_vmemmap)(struct drgn_object *);
 	struct drgn_error *(*linux_kernel_live_direct_mapping_fallback)(struct drgn_program *,

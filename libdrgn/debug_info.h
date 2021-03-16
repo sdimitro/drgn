@@ -16,11 +16,15 @@
 #include <libelf.h>
 
 #include "binary_buffer.h"
+#include "cfi.h"
 #include "drgn.h"
 #include "dwarf_index.h"
 #include "hash_table.h"
+#include "platform.h"
 #include "string_builder.h"
 #include "vector.h"
+
+struct drgn_register_state;
 
 /**
  * @ingroup Internals
@@ -46,10 +50,24 @@ enum drgn_debug_info_module_state {
 } __attribute__((__packed__));
 
 enum drgn_debug_info_scn {
+	/* Sections whose data we should cache when loading the module. */
 	DRGN_SCN_DEBUG_INFO,
 	DRGN_SCN_DEBUG_ABBREV,
 	DRGN_SCN_DEBUG_STR,
 	DRGN_SCN_DEBUG_LINE,
+
+	DRGN_NUM_DEBUG_SCN_DATA_PRECACHE,
+
+	/* Sections whose data we should cache when it is first used. */
+	DRGN_SCN_DEBUG_FRAME = DRGN_NUM_DEBUG_SCN_DATA_PRECACHE,
+	DRGN_SCN_EH_FRAME,
+
+	DRGN_NUM_DEBUG_SCN_DATA,
+
+	/* Sections whose data doesn't need to be cached. */
+	DRGN_SCN_TEXT = DRGN_NUM_DEBUG_SCN_DATA,
+	DRGN_SCN_GOT,
+
 	DRGN_NUM_DEBUG_SCNS,
 };
 
@@ -73,7 +91,26 @@ struct drgn_debug_info_module {
 	char *name;
 
 	Dwfl_Module *dwfl_module;
-	Elf_Data *scns[DRGN_NUM_DEBUG_SCNS];
+	struct drgn_platform platform;
+	Elf_Scn *scns[DRGN_NUM_DEBUG_SCNS];
+	Elf_Data *scn_data[DRGN_NUM_DEBUG_SCN_DATA];
+
+	/** Base for `DW_EH_PE_pcrel`. */
+	uint64_t pcrel_base;
+	/** Base for `DW_EH_PE_textrel`. */
+	uint64_t textrel_base;
+	/** Base for `DW_EH_PE_datarel`. */
+	uint64_t datarel_base;
+	/** Array of DWARF Common Information Entries. */
+	struct drgn_dwarf_cie *cies;
+	/**
+	 * Array of DWARF Frame Description Entries sorted by initial_location.
+	 */
+	struct drgn_dwarf_fde *fdes;
+	/** Number of elements in @ref drgn_debug_info_module::fdes. */
+	size_t num_fdes;
+	/** Whether .debug_frame and .eh_frame have been parsed. */
+	bool parsed_frames;
 
 	/*
 	 * path, elf, and fd are used when an ELF file was reported with
@@ -84,7 +121,6 @@ struct drgn_debug_info_module {
 	Elf *elf;
 	int fd;
 	enum drgn_debug_info_module_state state;
-	bool little_endian;
 	/** Error while loading. */
 	struct drgn_error *err;
 	/**
@@ -98,9 +134,10 @@ struct drgn_debug_info_module {
 	struct drgn_debug_info_module *next;
 };
 
-struct drgn_error *drgn_error_debug_info(struct drgn_debug_info_module *module,
-					 enum drgn_debug_info_scn scn,
-					 const char *ptr, const char *message);
+struct drgn_error *
+drgn_error_debug_info_scn(struct drgn_debug_info_module *module,
+			  enum drgn_debug_info_scn scn, const char *ptr,
+			  const char *message);
 
 struct drgn_debug_info_buffer {
 	struct binary_buffer bb;
@@ -117,8 +154,9 @@ drgn_debug_info_buffer_init(struct drgn_debug_info_buffer *buffer,
 			    struct drgn_debug_info_module *module,
 			    enum drgn_debug_info_scn scn)
 {
-	binary_buffer_init(&buffer->bb, module->scns[scn]->d_buf,
-			   module->scns[scn]->d_size, module->little_endian,
+	binary_buffer_init(&buffer->bb, module->scn_data[scn]->d_buf,
+			   module->scn_data[scn]->d_size,
+			   drgn_platform_is_little_endian(&module->platform),
 			   drgn_debug_info_buffer_error);
 	buffer->module = module;
 	buffer->scn = scn;
@@ -301,6 +339,30 @@ drgn_debug_info_find_object(const char *name, size_t name_len,
 			    const char *filename,
 			    enum drgn_find_object_flags flags, void *arg,
 			    struct drgn_object *ret);
+
+/**
+ * Get the Call Frame Information in a @ref drgn_debug_info_module at a given
+ * program counter.
+ *
+ * @param[in] module Module containing @p pc.
+ * @param[in] pc Program counter.
+ * @param[in,out] row_ret Returned CFI row.
+ * @param[out] interrupted_ret Whether the found frame interrupted its caller.
+ * @param[out] ret_addr_regno_ret Returned return address register number.
+ * @return @c NULL on success, non-@c NULL on error. In particular, &@ref
+ * drgn_not_found if CFI wasn't found.
+ */
+struct drgn_error *
+drgn_debug_info_module_find_cfi(struct drgn_debug_info_module *module,
+				uint64_t pc, struct drgn_cfi_row **row_ret,
+				bool *interrupted_ret,
+				drgn_register_number *ret_addr_regno_ret);
+
+struct drgn_error *
+drgn_eval_cfi_dwarf_expression(struct drgn_program *prog,
+			       const struct drgn_cfi_rule *rule,
+			       const struct drgn_register_state *regs,
+			       void *buf, size_t size);
 
 struct drgn_error *open_elf_file(const char *path, int *fd_ret, Elf **elf_ret);
 

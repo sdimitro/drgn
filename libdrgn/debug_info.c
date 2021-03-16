@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <gelf.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,16 +20,50 @@
 
 #include "debug_info.h"
 #include "error.h"
-#include "hash_table.h"
 #include "language.h"
 #include "lazy_object.h"
 #include "linux_kernel.h"
 #include "object.h"
 #include "path.h"
 #include "program.h"
+#include "register_state.h"
+#include "serialize.h"
 #include "type.h"
 #include "util.h"
-#include "vector.h"
+
+struct drgn_dwarf_cie {
+	/* Whether this CIE is from .eh_frame. */
+	bool is_eh;
+	/* Size of an address in this CIE in bytes. */
+	uint8_t address_size;
+	/* DW_EH_PE_* encoding of addresses in this CIE. */
+	uint8_t address_encoding;
+	/* Whether this CIE has a 'z' augmentation. */
+	bool have_augmentation_length;
+	/* Whether this CIE is for a signal handler ('S' augmentation). */
+	bool signal_frame;
+	drgn_register_number return_address_register;
+	uint64_t code_alignment_factor;
+	int64_t data_alignment_factor;
+	const char *initial_instructions;
+	size_t initial_instructions_size;
+};
+
+struct drgn_dwarf_fde {
+	uint64_t initial_location;
+	uint64_t address_range;
+	/* CIE for this FDE as an index into drgn_debug_info_module::cies. */
+	size_t cie;
+	const char *instructions;
+	size_t instructions_size;
+};
+
+DEFINE_VECTOR(drgn_dwarf_fde_vector, struct drgn_dwarf_fde)
+DEFINE_VECTOR(drgn_dwarf_cie_vector, struct drgn_dwarf_cie)
+DEFINE_HASH_MAP(drgn_dwarf_cie_map, size_t, size_t, int_key_hash_pair,
+		scalar_key_eq)
+DEFINE_VECTOR(drgn_cfi_row_vector, struct drgn_cfi_row *)
+DEFINE_VECTOR(uint64_vector, uint64_t)
 
 #define DW_TAG_UNKNOWN_FORMAT "unknown DWARF tag 0x%02x"
 #define DW_TAG_BUF_LEN (sizeof(DW_TAG_UNKNOWN_FORMAT) - 4 + 2 * sizeof(int))
@@ -62,18 +97,22 @@ static const char * const drgn_debug_scn_names[] = {
 	[DRGN_SCN_DEBUG_ABBREV] = ".debug_abbrev",
 	[DRGN_SCN_DEBUG_STR] = ".debug_str",
 	[DRGN_SCN_DEBUG_LINE] = ".debug_line",
+	[DRGN_SCN_DEBUG_FRAME] = ".debug_frame",
+	[DRGN_SCN_EH_FRAME] = ".eh_frame",
+	[DRGN_SCN_TEXT] = ".text",
+	[DRGN_SCN_GOT] = ".got",
 };
 
-
-struct drgn_error *drgn_error_debug_info(struct drgn_debug_info_module *module,
-					 enum drgn_debug_info_scn scn,
-					 const char *ptr, const char *message)
+struct drgn_error *
+drgn_error_debug_info_scn(struct drgn_debug_info_module *module,
+			  enum drgn_debug_info_scn scn, const char *ptr,
+			  const char *message)
 {
 	const char *name = dwfl_module_info(module->dwfl_module, NULL, NULL,
 					    NULL, NULL, NULL, NULL, NULL);
 	return drgn_error_format(DRGN_ERROR_OTHER, "%s: %s+%#tx: %s",
 				 name, drgn_debug_scn_names[scn],
-				 ptr - (const char *)module->scns[scn]->d_buf,
+				 ptr - (const char *)module->scn_data[scn]->d_buf,
 				 message);
 }
 
@@ -83,7 +122,8 @@ struct drgn_error *drgn_debug_info_buffer_error(struct binary_buffer *bb,
 {
 	struct drgn_debug_info_buffer *buffer =
 		container_of(bb, struct drgn_debug_info_buffer, bb);
-	return drgn_error_debug_info(buffer->module, buffer->scn, pos, message);
+	return drgn_error_debug_info_scn(buffer->module, buffer->scn, pos,
+					 message);
 }
 
 DEFINE_VECTOR_FUNCTIONS(drgn_debug_info_module_vector)
@@ -223,6 +263,8 @@ drgn_debug_info_module_destroy(struct drgn_debug_info_module *module)
 {
 	if (module) {
 		drgn_error_destroy(module->err);
+		free(module->fdes);
+		free(module->cies);
 		elf_end(module->elf);
 		if (module->fd != -1)
 			close(module->fd);
@@ -458,6 +500,14 @@ drgn_debug_info_report_module(struct drgn_debug_info_load_state *load,
 	}
 	module->dwfl_module = dwfl_module;
 	memset(module->scns, 0, sizeof(module->scns));
+	memset(module->scn_data, 0, sizeof(module->scn_data));
+	module->pcrel_base = 0;
+	module->textrel_base = 0;
+	module->datarel_base = 0;
+	module->cies = NULL;
+	module->fdes = NULL;
+	module->num_fdes = 0;
+	module->parsed_frames = false;
 	module->path = path_key;
 	module->fd = fd;
 	module->elf = elf;
@@ -819,7 +869,7 @@ out:
 }
 
 static struct drgn_error *
-drgn_get_debug_sections(struct drgn_debug_info_module *module)
+drgn_debug_info_find_sections(struct drgn_debug_info_module *module)
 {
 	struct drgn_error *err;
 
@@ -840,8 +890,10 @@ drgn_get_debug_sections(struct drgn_debug_info_module *module)
 	Elf *elf = dwarf_getelf(dwarf);
 	if (!elf)
 		return drgn_error_libdw();
-
-	module->little_endian = elf_getident(elf, NULL)[EI_DATA] == ELFDATA2LSB;
+	GElf_Ehdr ehdr_mem, *ehdr = gelf_getehdr(elf, &ehdr_mem);
+	if (!ehdr)
+		return drgn_error_libelf();
+	drgn_platform_from_elf(ehdr, &module->platform);
 
 	size_t shstrndx;
 	if (elf_getshdrstrndx(elf, &shstrndx))
@@ -854,9 +906,8 @@ drgn_get_debug_sections(struct drgn_debug_info_module *module)
 		if (!shdr)
 			return drgn_error_libelf();
 
-		if (shdr->sh_type == SHT_NOBITS || (shdr->sh_flags & SHF_GROUP))
+		if (shdr->sh_type != SHT_PROGBITS)
 			continue;
-
 		const char *scnname = elf_strptr(elf, shstrndx, shdr->sh_name);
 		if (!scnname)
 			continue;
@@ -864,11 +915,25 @@ drgn_get_debug_sections(struct drgn_debug_info_module *module)
 		for (size_t i = 0; i < DRGN_NUM_DEBUG_SCNS; i++) {
 			if (!module->scns[i] &&
 			    strcmp(scnname, drgn_debug_scn_names[i]) == 0) {
-				err = read_elf_section(scn, &module->scns[i]);
-				if (err)
-					return err;
+				module->scns[i] = scn;
 				break;
 			}
+		}
+	}
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_debug_info_precache_sections(struct drgn_debug_info_module *module)
+{
+	struct drgn_error *err;
+
+	for (size_t i = 0; i < DRGN_NUM_DEBUG_SCN_DATA_PRECACHE; i++) {
+		if (module->scns[i]) {
+			err = read_elf_section(module->scns[i],
+					       &module->scn_data[i]);
+			if (err)
+				return err;
 		}
 	}
 
@@ -876,7 +941,7 @@ drgn_get_debug_sections(struct drgn_debug_info_module *module)
 	 * Truncate any extraneous bytes so that we can assume that a pointer
 	 * within .debug_str is always null-terminated.
 	 */
-	Elf_Data *debug_str = module->scns[DRGN_SCN_DEBUG_STR];
+	Elf_Data *debug_str = module->scn_data[DRGN_SCN_DEBUG_STR];
 	if (debug_str) {
 		const char *buf = debug_str->d_buf;
 		const char *nul = memrchr(buf, '\0', debug_str->d_size);
@@ -884,7 +949,6 @@ drgn_get_debug_sections(struct drgn_debug_info_module *module)
 			debug_str->d_size = nul - buf + 1;
 		else
 			debug_str->d_size = 0;
-
 	}
 	return NULL;
 }
@@ -897,13 +961,18 @@ drgn_debug_info_read_module(struct drgn_debug_info_load_state *load,
 	struct drgn_error *err;
 	struct drgn_debug_info_module *module;
 	for (module = head; module; module = module->next) {
-		err = drgn_get_debug_sections(module);
+		err = drgn_debug_info_find_sections(module);
 		if (err) {
 			module->err = err;
 			continue;
 		}
 		if (module->scns[DRGN_SCN_DEBUG_INFO] &&
 		    module->scns[DRGN_SCN_DEBUG_ABBREV]) {
+			err = drgn_debug_info_precache_sections(module);
+			if (err) {
+				module->err = err;
+				continue;
+			}
 			module->state = DRGN_DEBUG_INFO_MODULE_INDEXING;
 			drgn_dwarf_index_read_module(dindex_state, module);
 			return NULL;
@@ -1066,6 +1135,476 @@ bool drgn_debug_info_is_indexed(struct drgn_debug_info *dbinfo,
 				const char *name)
 {
 	return c_string_set_search(&dbinfo->module_names, &name).entry != NULL;
+}
+
+struct drgn_dwarf_expression_buffer {
+	struct binary_buffer bb;
+	const char *start;
+	struct drgn_debug_info_module *module;
+};
+
+static struct drgn_error *
+drgn_error_debug_info(struct drgn_debug_info_module *module, const char *ptr,
+		      const char *message)
+{
+	uintptr_t p = (uintptr_t)ptr;
+	int end_match = -1;
+	for (int i = 0; i < ARRAY_SIZE(module->scn_data); i++) {
+		if (!module->scn_data[i])
+			continue;
+		uintptr_t start = (uintptr_t)module->scn_data[i]->d_buf;
+		uintptr_t end = start + module->scn_data[i]->d_size;
+		if (start <= p) {
+			if (p < end) {
+				return drgn_error_debug_info_scn(module, i, ptr,
+								 message);
+			} else if (p == end) {
+				end_match = i;
+			}
+		}
+	}
+	if (end_match != -1) {
+		/*
+		 * The pointer doesn't lie within a section, but it does point
+		 * to the end of a section.
+		 */
+		return drgn_error_debug_info_scn(module, end_match, ptr,
+						 message);
+	}
+	/* We couldn't find the section containing the pointer. */
+	const char *name = dwfl_module_info(module->dwfl_module, NULL, NULL,
+					    NULL, NULL, NULL, NULL, NULL);
+	return drgn_error_format(DRGN_ERROR_OTHER, "%s: %s", name, message);
+}
+
+static struct drgn_error *
+drgn_dwarf_expression_buffer_error(struct binary_buffer *bb, const char *pos,
+				   const char *message)
+{
+	struct drgn_dwarf_expression_buffer *buffer =
+		container_of(bb, struct drgn_dwarf_expression_buffer, bb);
+	return drgn_error_debug_info(buffer->module, pos, message);
+}
+
+static void
+drgn_dwarf_expression_buffer_init(struct drgn_dwarf_expression_buffer *buffer,
+				  struct drgn_debug_info_module *module,
+				  const char *expr, size_t expr_size)
+{
+	binary_buffer_init(&buffer->bb, expr, expr_size,
+			   drgn_platform_is_little_endian(&module->platform),
+			   drgn_dwarf_expression_buffer_error);
+	buffer->start = expr;
+	buffer->module = module;
+}
+
+/* Returns &drgn_not_found if it tried to use an unknown register value. */
+static struct drgn_error *
+drgn_eval_dwarf_expression(struct drgn_program *prog,
+			   struct drgn_dwarf_expression_buffer *expr,
+			   struct uint64_vector *stack,
+			   const struct drgn_register_state *regs)
+{
+	struct drgn_error *err;
+	const struct drgn_platform *platform = &expr->module->platform;
+	bool little_endian = drgn_platform_is_little_endian(platform);
+	uint8_t address_size = drgn_platform_address_size(platform);
+	uint8_t address_bits = address_size * CHAR_BIT;
+	uint64_t address_mask = uint_max(address_size);
+	drgn_register_number (*dwarf_regno_to_internal)(uint64_t) =
+		platform->arch->dwarf_regno_to_internal;
+
+#define CHECK(n) do {								\
+	size_t _n = (n);							\
+	if (stack->size < _n) {							\
+		return binary_buffer_error(&expr->bb,				\
+					   "DWARF expression stack underflow");	\
+	}									\
+} while (0)
+
+#define ELEM(i) stack->data[stack->size - 1 - (i)]
+
+#define PUSH(x) do {					\
+	uint64_t push = x;				\
+	if (!uint64_vector_append(stack, &push))	\
+		return &drgn_enomem;			\
+} while (0)
+
+#define PUSH_MASK(x) PUSH((x) & address_mask)
+
+	while (binary_buffer_has_next(&expr->bb)) {
+		uint8_t opcode;
+		if ((err = binary_buffer_next_u8(&expr->bb, &opcode)))
+			return err;
+		uint64_t uvalue;
+		uint64_t dwarf_regno;
+		uint8_t deref_size;
+		switch (opcode) {
+		/* Literal encodings. */
+		case DW_OP_lit0 ... DW_OP_lit31:
+			PUSH(opcode - DW_OP_lit0);
+			break;
+		case DW_OP_addr:
+			if ((err = binary_buffer_next_uint(&expr->bb,
+							   address_size,
+							   &uvalue)))
+				return err;
+			PUSH(uvalue);
+			break;
+		case DW_OP_const1u:
+			if ((err = binary_buffer_next_u8_into_u64(&expr->bb,
+								  &uvalue)))
+				return err;
+			PUSH(uvalue);
+			break;
+		case DW_OP_const2u:
+			if ((err = binary_buffer_next_u16_into_u64(&expr->bb,
+								   &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		case DW_OP_const4u:
+			if ((err = binary_buffer_next_u32_into_u64(&expr->bb,
+								   &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		case DW_OP_const8u:
+			if ((err = binary_buffer_next_u64(&expr->bb, &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		case DW_OP_const1s:
+			if ((err = binary_buffer_next_s8_into_u64(&expr->bb,
+								  &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		case DW_OP_const2s:
+			if ((err = binary_buffer_next_s16_into_u64(&expr->bb,
+								   &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		case DW_OP_const4s:
+			if ((err = binary_buffer_next_s32_into_u64(&expr->bb,
+								   &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		case DW_OP_const8s:
+			if ((err = binary_buffer_next_s64_into_u64(&expr->bb,
+								   &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		case DW_OP_constu:
+			if ((err = binary_buffer_next_uleb128(&expr->bb,
+							      &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		case DW_OP_consts:
+			if ((err = binary_buffer_next_sleb128_into_u64(&expr->bb,
+								       &uvalue)))
+				return err;
+			PUSH_MASK(uvalue);
+			break;
+		/* Register values. */
+		case DW_OP_breg0 ... DW_OP_breg31:
+			dwarf_regno = opcode - DW_OP_breg0;
+			goto breg;
+		case DW_OP_bregx:
+			if ((err = binary_buffer_next_uleb128(&expr->bb,
+							      &dwarf_regno)))
+				return err;
+breg:
+		{
+			if (!regs)
+				return &drgn_not_found;
+			drgn_register_number regno =
+				dwarf_regno_to_internal(dwarf_regno);
+			if (!drgn_register_state_has_register(regs, regno))
+				return &drgn_not_found;
+			const struct drgn_register_layout *layout =
+				&platform->arch->register_layout[regno];
+			copy_lsbytes(&uvalue, sizeof(uvalue),
+				     HOST_LITTLE_ENDIAN,
+				     &regs->buf[layout->offset], layout->size,
+				     little_endian);
+			int64_t svalue;
+			if ((err = binary_buffer_next_sleb128(&expr->bb,
+							      &svalue)))
+				return err;
+			PUSH_MASK(uvalue + svalue);
+			break;
+		}
+		/* Stack operations. */
+		case DW_OP_dup:
+			CHECK(1);
+			PUSH(ELEM(0));
+			break;
+		case DW_OP_drop:
+			CHECK(1);
+			stack->size--;
+			break;
+		case DW_OP_pick: {
+			uint8_t index;
+			if ((err = binary_buffer_next_u8(&expr->bb, &index)))
+				return err;
+			CHECK(index + 1);
+			PUSH(ELEM(index));
+			break;
+		}
+		case DW_OP_over:
+			CHECK(2);
+			PUSH(ELEM(1));
+			break;
+		case DW_OP_swap:
+			CHECK(2);
+			uvalue = ELEM(0);
+			ELEM(0) = ELEM(1);
+			ELEM(1) = uvalue;
+			break;
+		case DW_OP_rot:
+			CHECK(3);
+			uvalue = ELEM(0);
+			ELEM(0) = ELEM(1);
+			ELEM(1) = ELEM(2);
+			ELEM(2) = uvalue;
+			break;
+		case DW_OP_deref:
+			deref_size = address_size;
+			goto deref;
+		case DW_OP_deref_size:
+			CHECK(1);
+			if ((err = binary_buffer_next_u8(&expr->bb,
+							 &deref_size)))
+				return err;
+			if (deref_size > address_size) {
+				return binary_buffer_error(&expr->bb,
+							   "DW_OP_deref_size has invalid size");
+			}
+deref:
+		{
+			char deref_buf[8];
+			err = drgn_program_read_memory(prog, deref_buf, ELEM(0),
+						       deref_size, false);
+			if (err)
+				return err;
+			copy_lsbytes(&ELEM(0), sizeof(ELEM(0)),
+				     HOST_LITTLE_ENDIAN, deref_buf, deref_size,
+				     little_endian);
+			break;
+		}
+		case DW_OP_call_frame_cfa: {
+			if (!regs)
+				return &drgn_not_found;
+			/*
+			 * The DWARF 5 specification says that
+			 * DW_OP_call_frame_cfa cannot be used for CFI. For
+			 * DW_CFA_def_cfa_expression, it is clearly invalid to
+			 * define the CFA in terms of the CFA, and it will fail
+			 * naturally below. This restriction doesn't make sense
+			 * for DW_CFA_expression and DW_CFA_val_expression, as
+			 * they push the CFA and thus depend on it anyways, so
+			 * we don't bother enforcing it.
+			 */
+			struct optional_uint64 cfa =
+				drgn_register_state_get_cfa(regs);
+			if (!cfa.has_value)
+				return &drgn_not_found;
+			PUSH(cfa.value);
+			break;
+		}
+		/* Arithmetic and logical operations. */
+#define UNOP_MASK(op) do {			\
+	CHECK(1);				\
+	ELEM(0) = (op ELEM(0)) & address_mask;	\
+} while (0)
+#define BINOP(op) do {			\
+	CHECK(2);			\
+	ELEM(1) = ELEM(1) op ELEM(0);	\
+	stack->size--;			\
+} while (0)
+#define BINOP_MASK(op) do {				\
+	CHECK(2);					\
+	ELEM(1) = (ELEM(1) op ELEM(0)) & address_mask;	\
+	stack->size--;					\
+} while (0)
+		case DW_OP_abs:
+			CHECK(1);
+			if (ELEM(0) & (UINT64_C(1) << (address_bits - 1)))
+				ELEM(0) = -ELEM(0) & address_mask;
+			break;
+		case DW_OP_and:
+			BINOP(&);
+			break;
+		case DW_OP_div:
+			CHECK(2);
+			if (ELEM(0) == 0) {
+				return binary_buffer_error(&expr->bb,
+							   "division by zero in DWARF expression");
+			}
+			ELEM(1) = ((truncate_signed(ELEM(1), address_bits)
+				    / truncate_signed(ELEM(0), address_bits))
+				   & address_mask);
+			stack->size--;
+			break;
+		case DW_OP_minus:
+			BINOP_MASK(-);
+			break;
+		case DW_OP_mod:
+			CHECK(2);
+			if (ELEM(0) == 0) {
+				return binary_buffer_error(&expr->bb,
+							   "modulo by zero in DWARF expression");
+			}
+			ELEM(1) = ELEM(1) % ELEM(0);
+			stack->size--;
+			break;
+		case DW_OP_mul:
+			BINOP_MASK(*);
+			break;
+		case DW_OP_neg:
+			UNOP_MASK(-);
+			break;
+		case DW_OP_not:
+			UNOP_MASK(~);
+			break;
+		case DW_OP_or:
+			BINOP(|);
+			break;
+		case DW_OP_plus:
+			BINOP_MASK(+);
+			break;
+		case DW_OP_plus_uconst:
+			CHECK(1);
+			if ((err = binary_buffer_next_uleb128(&expr->bb,
+							      &uvalue)))
+				return err;
+			ELEM(0) = (ELEM(0) + uvalue) & address_mask;
+			break;
+		case DW_OP_shl:
+			CHECK(2);
+			if (ELEM(0) < address_bits)
+				ELEM(1) = (ELEM(1) << ELEM(0)) & address_mask;
+			else
+				ELEM(1) = 0;
+			stack->size--;
+			break;
+		case DW_OP_shr:
+			CHECK(2);
+			if (ELEM(0) < address_bits)
+				ELEM(1) >>= ELEM(0);
+			else
+				ELEM(1) = 0;
+			stack->size--;
+			break;
+		case DW_OP_shra:
+			CHECK(2);
+			if (ELEM(0) < address_bits) {
+				ELEM(1) = ((truncate_signed(ELEM(1), address_bits)
+					    >> ELEM(0))
+					   & address_mask);
+			} else if (ELEM(1) & (UINT64_C(1) << (address_bits - 1))) {
+				ELEM(1) = -INT64_C(1) & address_mask;
+			} else {
+				ELEM(1) = 0;
+			}
+			stack->size--;
+			break;
+		case DW_OP_xor:
+			BINOP(^);
+			break;
+#undef BINOP_MASK
+#undef BINOP
+#undef UNOP_MASK
+		/* Control flow operations. */
+#define RELOP(op) do {						\
+	CHECK(2);						\
+	ELEM(1) = (truncate_signed(ELEM(1), address_bits) op	\
+		   truncate_signed(ELEM(0), address_bits));	\
+	stack->size--;						\
+} while (0)
+		case DW_OP_le:
+			RELOP(<=);
+			break;
+		case DW_OP_ge:
+			RELOP(>=);
+			break;
+		case DW_OP_eq:
+			RELOP(==);
+			break;
+		case DW_OP_lt:
+			RELOP(<);
+			break;
+		case DW_OP_gt:
+			RELOP(>);
+			break;
+		case DW_OP_ne:
+			RELOP(!=);
+			break;
+#undef RELOP
+		case DW_OP_skip:
+branch:
+		{
+			int16_t skip;
+			if ((err = binary_buffer_next_s16(&expr->bb, &skip)))
+				return err;
+			if ((skip >= 0 && skip > expr->bb.end - expr->bb.pos) ||
+			    (skip < 0 && -skip > expr->bb.pos - expr->start)) {
+				return binary_buffer_error(&expr->bb,
+							   "DWARF expression branch is out of bounds");
+			}
+			expr->bb.pos += skip;
+			break;
+		}
+		case DW_OP_bra:
+			CHECK(1);
+			if (ELEM(0)) {
+				stack->size--;
+				goto branch;
+			} else {
+				stack->size--;
+				if ((err = binary_buffer_skip(&expr->bb, 2)))
+					return err;
+			}
+			break;
+		/* Special operations. */
+		case DW_OP_nop:
+			break;
+		/*
+		 * We don't yet support:
+		 *
+		 * - DW_OP_fbreg
+		 * - DW_OP_push_object_address
+		 * - DW_OP_form_tls_address
+		 * - DW_OP_entry_value
+		 * - Procedure calls: DW_OP_call2, DW_OP_call4, DW_OP_call_ref.
+		 * - Location description operations: DW_OP_reg0-DW_OP_reg31,
+		 *   DW_OP_regx, DW_OP_implicit_value, DW_OP_stack_value,
+		 *   DW_OP_implicit_pointer, DW_OP_piece, DW_OP_bit_piece.
+		 * - Operations that use .debug_addr: DW_OP_addrx,
+		 *   DW_OP_constx.
+		 * - Typed operations: DW_OP_const_type, DW_OP_regval_type,
+		 *   DW_OP_deref_type, DW_OP_convert, DW_OP_reinterpret.
+		 * - Operations for multiple address spaces: DW_OP_xderef,
+		 *   DW_OP_xderef_size, DW_OP_xderef_type.
+		 */
+		default:
+			return binary_buffer_error(&expr->bb,
+						   "unknown DWARF expression opcode %#x",
+						   opcode);
+		}
+	}
+
+#undef PUSH_MASK
+#undef PUSH
+#undef ELEM
+#undef CHECK
+
+	return NULL;
 }
 
 DEFINE_HASH_TABLE_FUNCTIONS(drgn_dwarf_type_map, ptr_key_hash_pair,
@@ -2447,7 +2986,8 @@ drgn_type_from_dwarf_internal(struct drgn_debug_info *dbinfo,
 							    &bias);
 			if (!dwarf)
 				return drgn_error_libdwfl();
-			uintptr_t start = (uintptr_t)module->scns[DRGN_SCN_DEBUG_INFO]->d_buf;
+			uintptr_t start =
+				(uintptr_t)module->scn_data[DRGN_SCN_DEBUG_INFO]->d_buf;
 			if (!dwarf_offdie(dwarf, die_addr - start, die))
 				return drgn_error_libdw();
 		}
@@ -2761,6 +3301,1020 @@ void drgn_debug_info_destroy(struct drgn_debug_info *dbinfo)
 	drgn_debug_info_module_table_deinit(&dbinfo->modules);
 	dwfl_end(dbinfo->dwfl);
 	free(dbinfo);
+}
+
+static struct drgn_error *
+drgn_dwarf_cfi_next_encoded(struct drgn_debug_info_buffer *buffer,
+			    uint8_t address_size, uint8_t encoding,
+			    uint64_t func_addr, uint64_t *ret)
+{
+	struct drgn_error *err;
+
+	/* Not currently used for CFI. */
+	if (encoding & DW_EH_PE_indirect) {
+unknown_fde_encoding:
+		return binary_buffer_error(&buffer->bb,
+					   "unknown EH encoding %#x", encoding);
+	}
+
+	size_t pos = (buffer->bb.pos -
+		      (char *)buffer->module->scn_data[buffer->scn]->d_buf);
+	uint64_t base;
+	switch (encoding & 0x70) {
+	case DW_EH_PE_absptr:
+		base = 0;
+		break;
+	case DW_EH_PE_pcrel:
+		base = buffer->module->pcrel_base + pos;
+		break;
+	case DW_EH_PE_textrel:
+		base = buffer->module->textrel_base;
+		break;
+	case DW_EH_PE_datarel:
+		base = buffer->module->datarel_base;
+		break;
+	case DW_EH_PE_funcrel:
+		/* Relative to the FDE's initial location. */
+		base = func_addr;
+		break;
+	case DW_EH_PE_aligned:
+		base = 0;
+		if (pos % address_size != 0 &&
+		    (err = binary_buffer_skip(&buffer->bb,
+					      address_size - pos % address_size)))
+			return err;
+		break;
+	default:
+		goto unknown_fde_encoding;
+	}
+
+	uint64_t offset;
+	switch (encoding & 0xf) {
+	case DW_EH_PE_absptr:
+		if ((err = binary_buffer_next_uint(&buffer->bb, address_size,
+						   &offset)))
+			return err;
+		break;
+	case DW_EH_PE_uleb128:
+		if ((err = binary_buffer_next_uleb128(&buffer->bb, &offset)))
+			return err;
+		break;
+	case DW_EH_PE_udata2:
+		if ((err = binary_buffer_next_u16_into_u64(&buffer->bb,
+							   &offset)))
+			return err;
+		break;
+	case DW_EH_PE_udata4:
+		if ((err = binary_buffer_next_u32_into_u64(&buffer->bb,
+							   &offset)))
+			return err;
+		break;
+	case DW_EH_PE_udata8:
+		if ((err = binary_buffer_next_u64(&buffer->bb, &offset)))
+			return err;
+		break;
+	case DW_EH_PE_sleb128:
+		if ((err = binary_buffer_next_sleb128_into_u64(&buffer->bb,
+							       &offset)))
+			return err;
+		break;
+	case DW_EH_PE_sdata2:
+		if ((err = binary_buffer_next_s16_into_u64(&buffer->bb,
+							   &offset)))
+			return err;
+		break;
+	case DW_EH_PE_sdata4:
+		if ((err = binary_buffer_next_s32_into_u64(&buffer->bb,
+							   &offset)))
+			return err;
+		break;
+	case DW_EH_PE_sdata8:
+		if ((err = binary_buffer_next_s64_into_u64(&buffer->bb,
+							   &offset)))
+			return err;
+		break;
+	default:
+		goto unknown_fde_encoding;
+	}
+	*ret = (base + offset) & uint_max(address_size);
+
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_parse_dwarf_cie(struct drgn_debug_info_module *module,
+		     enum drgn_debug_info_scn scn, size_t cie_pointer,
+		     struct drgn_dwarf_cie *cie)
+{
+	bool is_eh = scn == DRGN_SCN_EH_FRAME;
+	struct drgn_error *err;
+
+	cie->is_eh = is_eh;
+
+	struct drgn_debug_info_buffer buffer;
+	drgn_debug_info_buffer_init(&buffer, module, scn);
+	buffer.bb.pos += cie_pointer;
+
+	uint32_t tmp;
+	if ((err = binary_buffer_next_u32(&buffer.bb, &tmp)))
+		return err;
+	bool is_64_bit = tmp == UINT32_C(0xffffffff);
+	uint64_t length;
+	if (is_64_bit) {
+		if ((err = binary_buffer_next_u64(&buffer.bb, &length)))
+			return err;
+	} else {
+		length = tmp;
+	}
+	if (length > buffer.bb.end - buffer.bb.pos) {
+		return binary_buffer_error(&buffer.bb,
+					   "entry length is out of bounds");
+	}
+	buffer.bb.end = buffer.bb.pos + length;
+
+	uint64_t cie_id, expected_cie_id;
+	if (is_64_bit) {
+		if ((err = binary_buffer_next_u64(&buffer.bb, &cie_id)))
+			return err;
+		expected_cie_id = is_eh ? 0 : UINT64_C(0xffffffffffffffff);
+	} else {
+		if ((err = binary_buffer_next_u32_into_u64(&buffer.bb,
+							   &cie_id)))
+			return err;
+		expected_cie_id = is_eh ? 0 : UINT64_C(0xffffffff);
+	}
+	if (cie_id != expected_cie_id)
+		return binary_buffer_error(&buffer.bb, "invalid CIE ID");
+
+	uint8_t version;
+	if ((err = binary_buffer_next_u8(&buffer.bb, &version)))
+		return err;
+	if (version < 1 || version == 2 || version > 4) {
+		return binary_buffer_error(&buffer.bb,
+					   "unknown CIE version %" PRIu8,
+					   version);
+	}
+
+	const char *augmentation;
+	size_t augmentation_len;
+	if ((err = binary_buffer_next_string(&buffer.bb, &augmentation,
+					     &augmentation_len)))
+		return err;
+	cie->have_augmentation_length = augmentation[0] == 'z';
+	cie->signal_frame = false;
+	for (size_t i = 0; i < augmentation_len; i++) {
+		switch (augmentation[i]) {
+		case 'z':
+			if (i != 0)
+				goto unknown_augmentation;
+			break;
+		case 'L':
+		case 'P':
+		case 'R':
+			if (augmentation[0] != 'z')
+				goto unknown_augmentation;
+			break;
+		case 'S':
+			cie->signal_frame = true;
+			break;
+		default:
+unknown_augmentation:
+			/*
+			 * We could ignore this CIE and all FDEs that reference
+			 * it or skip the augmentation if we have its length,
+			 * but let's fail loudly so that we find out about
+			 * missing support.
+			 */
+			return binary_buffer_error_at(&buffer.bb,
+						      &augmentation[i],
+						      "unknown CFI augmentation %s",
+						      augmentation);
+		}
+	}
+
+	if (version >= 4) {
+		if ((err = binary_buffer_next_u8(&buffer.bb,
+						 &cie->address_size)))
+			return err;
+		if (cie->address_size < 1 || cie->address_size > 8) {
+			return binary_buffer_error(&buffer.bb,
+						   "unsupported address size %" PRIu8,
+						   cie->address_size);
+		}
+		uint8_t segment_selector_size;
+		if ((err = binary_buffer_next_u8(&buffer.bb,
+						 &segment_selector_size)))
+			return err;
+		if (segment_selector_size) {
+			return binary_buffer_error(&buffer.bb,
+						   "unsupported segment selector size %" PRIu8,
+						   segment_selector_size);
+		}
+	} else {
+		if (module->platform.flags & DRGN_PLATFORM_IS_64_BIT)
+			cie->address_size = 8;
+		else
+			cie->address_size = 4;
+	}
+	if ((err = binary_buffer_next_uleb128(&buffer.bb,
+					      &cie->code_alignment_factor)) ||
+	    (err = binary_buffer_next_sleb128(&buffer.bb,
+					      &cie->data_alignment_factor)))
+		return err;
+	uint64_t return_address_register;
+	if (version >= 3) {
+		if ((err = binary_buffer_next_uleb128(&buffer.bb,
+						      &return_address_register)))
+			return err;
+	} else {
+		if ((err = binary_buffer_next_u8_into_u64(&buffer.bb,
+							  &return_address_register)))
+			return err;
+	}
+	cie->return_address_register =
+		module->platform.arch->dwarf_regno_to_internal(return_address_register);
+	if (cie->return_address_register == DRGN_REGISTER_NUMBER_UNKNOWN) {
+		return binary_buffer_error(&buffer.bb,
+					   "unknown return address register");
+	}
+	cie->address_encoding = DW_EH_PE_absptr;
+	if (augmentation[0] == 'z') {
+		for (size_t i = 0; i < augmentation_len; i++) {
+			switch (augmentation[i]) {
+			case 'z':
+				if ((err = binary_buffer_skip_leb128(&buffer.bb)))
+					return err;
+				break;
+			case 'L':
+				if ((err = binary_buffer_skip(&buffer.bb, 1)))
+					return err;
+				break;
+			case 'P': {
+				uint8_t encoding;
+				if ((err = binary_buffer_next_u8(&buffer.bb, &encoding)))
+					return err;
+				/*
+				 * We don't need the result, so don't bother
+				 * dereferencing.
+				 */
+				encoding &= ~DW_EH_PE_indirect;
+				uint64_t unused;
+				if ((err = drgn_dwarf_cfi_next_encoded(&buffer,
+								       cie->address_size,
+								       encoding,
+								       0,
+								       &unused)))
+					return err;
+				break;
+			}
+			case 'R':
+				if ((err = binary_buffer_next_u8(&buffer.bb,
+								 &cie->address_encoding)))
+					return err;
+				break;
+			}
+		}
+	}
+	cie->initial_instructions = buffer.bb.pos;
+	cie->initial_instructions_size = buffer.bb.end - buffer.bb.pos;
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_parse_dwarf_frames(struct drgn_debug_info_module *module,
+			enum drgn_debug_info_scn scn,
+			struct drgn_dwarf_cie_vector *cies,
+			struct drgn_dwarf_fde_vector *fdes)
+{
+	bool is_eh = scn == DRGN_SCN_EH_FRAME;
+	struct drgn_error *err;
+
+	if (!module->scns[scn])
+		return NULL;
+	err = read_elf_section(module->scns[scn], &module->scn_data[scn]);
+	if (err)
+		return err;
+	Elf_Data *data = module->scn_data[scn];
+	struct drgn_debug_info_buffer buffer;
+	drgn_debug_info_buffer_init(&buffer, module, scn);
+
+	struct drgn_dwarf_cie_map cie_map = HASH_TABLE_INIT;
+	while (binary_buffer_has_next(&buffer.bb)) {
+		uint32_t tmp;
+		if ((err = binary_buffer_next_u32(&buffer.bb, &tmp)))
+			goto out;
+		bool is_64_bit = tmp == UINT32_C(0xffffffff);
+		uint64_t length;
+		if (is_64_bit) {
+			if ((err = binary_buffer_next_u64(&buffer.bb, &length)))
+				goto out;
+		} else {
+			length = tmp;
+		}
+		/*
+		 * Technically, a length of zero is only a terminator in
+		 * .eh_frame, but other consumers (binutils, elfutils, GDB)
+		 * handle it the same way in .debug_frame.
+		 */
+		if (length == 0)
+			break;
+		if (length > buffer.bb.end - buffer.bb.pos) {
+			err = binary_buffer_error(&buffer.bb,
+						  "entry length is out of bounds");
+			goto out;
+		}
+		buffer.bb.end = buffer.bb.pos + length;
+
+		/*
+		 * The Linux Standard Base Core Specification [1] states that
+		 * the CIE ID in .eh_frame is always 4 bytes. However, other
+		 * consumers handle it the same as in .debug_frame (8 bytes for
+		 * the 64-bit format).
+		 *
+		 * 1: https://refspecs.linuxfoundation.org/LSB_5.0.0/LSB-Core-generic/LSB-Core-generic/ehframechpt.html
+		 */
+		uint64_t cie_pointer, cie_id;
+		if (is_64_bit) {
+			if ((err = binary_buffer_next_u64(&buffer.bb,
+							  &cie_pointer)))
+				goto out;
+			cie_id = is_eh ? 0 : UINT64_C(0xffffffffffffffff);
+		} else {
+			if ((err = binary_buffer_next_u32_into_u64(&buffer.bb,
+								   &cie_pointer)))
+				goto out;
+			cie_id = is_eh ? 0 : UINT64_C(0xffffffff);
+		}
+
+		if (cie_pointer != cie_id) {
+			if (is_eh) {
+				size_t pointer_offset =
+					(buffer.bb.pos
+					 - (is_64_bit ? 8 : 4)
+					 - (char *)data->d_buf);
+				if (cie_pointer > pointer_offset) {
+					err = binary_buffer_error(&buffer.bb,
+								  "CIE pointer is out of bounds");
+					goto out;
+				}
+				cie_pointer = pointer_offset - cie_pointer;
+			} else if (cie_pointer > data->d_size) {
+				err = binary_buffer_error(&buffer.bb,
+							  "CIE pointer is out of bounds");
+				goto out;
+			}
+			struct drgn_dwarf_fde *fde =
+				drgn_dwarf_fde_vector_append_entry(fdes);
+			if (!fde) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			struct drgn_dwarf_cie_map_entry entry = {
+				.key = cie_pointer,
+				.value = cies->size,
+			};
+			struct drgn_dwarf_cie_map_iterator it;
+			int r = drgn_dwarf_cie_map_insert(&cie_map, &entry,
+							  &it);
+			struct drgn_dwarf_cie *cie;
+			if (r > 0) {
+				cie = drgn_dwarf_cie_vector_append_entry(cies);
+				if (!cie) {
+					err = &drgn_enomem;
+					goto out;
+				}
+				err = drgn_parse_dwarf_cie(module, scn,
+							   cie_pointer, cie);
+				if (err)
+					goto out;
+			} else if (r == 0) {
+				cie = &cies->data[it.entry->value];
+			} else {
+				err = &drgn_enomem;
+				goto out;
+			}
+			if ((err = drgn_dwarf_cfi_next_encoded(&buffer,
+							       cie->address_size,
+							       cie->address_encoding,
+							       0,
+							       &fde->initial_location)) ||
+			    (err = drgn_dwarf_cfi_next_encoded(&buffer,
+							       cie->address_size,
+							       cie->address_encoding & 0xf,
+							       0,
+							       &fde->address_range)))
+				goto out;
+			if (cie->have_augmentation_length) {
+				uint64_t augmentation_length;
+				if ((err = binary_buffer_next_uleb128(&buffer.bb,
+								      &augmentation_length)))
+					goto out;
+				if (augmentation_length >
+				    buffer.bb.end - buffer.bb.pos) {
+					err = binary_buffer_error(&buffer.bb,
+								  "augmentation length is out of bounds");
+					goto out;
+				}
+				buffer.bb.pos += augmentation_length;
+			}
+			fde->cie = it.entry->value;
+			fde->instructions = buffer.bb.pos;
+			fde->instructions_size = buffer.bb.end - buffer.bb.pos;
+		}
+
+		buffer.bb.pos = buffer.bb.end;
+		buffer.bb.end = (const char *)data->d_buf + data->d_size;
+	}
+
+	err = NULL;
+out:
+	drgn_dwarf_cie_map_deinit(&cie_map);
+	return err;
+}
+
+static void drgn_debug_info_cache_sh_addr(struct drgn_debug_info_module *module,
+					  enum drgn_debug_info_scn scn,
+					  uint64_t *addr)
+{
+	if (module->scns[scn]) {
+		GElf_Shdr shdr_mem;
+		GElf_Shdr *shdr = gelf_getshdr(module->scns[scn], &shdr_mem);
+		if (shdr)
+			*addr = shdr->sh_addr;
+	}
+}
+
+static int drgn_dwarf_fde_compar(const void *_a, const void *_b, void *arg)
+{
+	const struct drgn_dwarf_fde *a = _a;
+	const struct drgn_dwarf_fde *b = _b;
+	const struct drgn_dwarf_cie *cies = arg;
+	if (a->initial_location < b->initial_location)
+		return -1;
+	else if (a->initial_location > b->initial_location)
+		return 1;
+	else
+		return cies[a->cie].is_eh - cies[b->cie].is_eh;
+}
+
+static struct drgn_error *
+drgn_debug_info_parse_frames(struct drgn_debug_info_module *module)
+{
+	struct drgn_error *err;
+
+	drgn_debug_info_cache_sh_addr(module, DRGN_SCN_EH_FRAME,
+				      &module->pcrel_base);
+	drgn_debug_info_cache_sh_addr(module, DRGN_SCN_TEXT,
+				      &module->textrel_base);
+	drgn_debug_info_cache_sh_addr(module, DRGN_SCN_GOT,
+				      &module->datarel_base);
+
+	struct drgn_dwarf_cie_vector cies = VECTOR_INIT;
+	struct drgn_dwarf_fde_vector fdes = VECTOR_INIT;
+
+	err = drgn_parse_dwarf_frames(module, DRGN_SCN_DEBUG_FRAME, &cies,
+				      &fdes);
+	if (err)
+		goto err;
+	err = drgn_parse_dwarf_frames(module, DRGN_SCN_EH_FRAME, &cies, &fdes);
+	if (err)
+		goto err;
+
+	drgn_dwarf_cie_vector_shrink_to_fit(&cies);
+
+	/*
+	 * Sort FDEs and remove duplicates, preferring .debug_frame over
+	 * .eh_frame.
+	 */
+	qsort_r(fdes.data, fdes.size, sizeof(fdes.data[0]),
+		drgn_dwarf_fde_compar, cies.data);
+	if (fdes.size > 0) {
+		size_t src = 1, dst = 1;
+		for (; src < fdes.size; src++) {
+			if (fdes.data[src].initial_location !=
+			    fdes.data[dst - 1].initial_location) {
+				if (src != dst)
+					fdes.data[dst] = fdes.data[src];
+				dst++;
+			}
+		}
+		fdes.size = dst;
+	}
+	drgn_dwarf_fde_vector_shrink_to_fit(&fdes);
+
+	module->cies = cies.data;
+	module->fdes = fdes.data;
+	module->num_fdes = fdes.size;
+	return NULL;
+
+err:
+	drgn_dwarf_fde_vector_deinit(&fdes);
+	drgn_dwarf_cie_vector_deinit(&cies);
+	return err;
+}
+
+static struct drgn_error *
+drgn_debug_info_find_fde(struct drgn_debug_info_module *module,
+			 uint64_t unbiased_pc, struct drgn_dwarf_fde **ret)
+{
+	struct drgn_error *err;
+
+	if (!module->parsed_frames) {
+		err = drgn_debug_info_parse_frames(module);
+		if (err)
+			return err;
+		module->parsed_frames = true;
+	}
+
+	/* Binary search for the containing FDE. */
+	size_t lo = 0, hi = module->num_fdes;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		struct drgn_dwarf_fde *fde = &module->fdes[mid];
+		if (unbiased_pc < fde->initial_location) {
+			hi = mid;
+		} else if (unbiased_pc - fde->initial_location >=
+			   fde->address_range) {
+			lo = mid + 1;
+		} else {
+			*ret = fde;
+			return NULL;
+		}
+	}
+	*ret = NULL;
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_dwarf_cfi_next_offset(struct drgn_debug_info_buffer *buffer, int64_t *ret)
+{
+	struct drgn_error *err;
+	uint64_t offset;
+	if ((err = binary_buffer_next_uleb128(&buffer->bb, &offset)))
+		return err;
+	if (offset > INT64_MAX)
+		return binary_buffer_error(&buffer->bb, "offset is too large");
+	*ret = offset;
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_dwarf_cfi_next_offset_sf(struct drgn_debug_info_buffer *buffer,
+			      struct drgn_dwarf_cie *cie, int64_t *ret)
+{
+	struct drgn_error *err;
+	int64_t factored;
+	if ((err = binary_buffer_next_sleb128(&buffer->bb, &factored)))
+		return err;
+	if (__builtin_mul_overflow(factored, cie->data_alignment_factor, ret))
+		return binary_buffer_error(&buffer->bb, "offset is too large");
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_dwarf_cfi_next_offset_f(struct drgn_debug_info_buffer *buffer,
+			     struct drgn_dwarf_cie *cie, int64_t *ret)
+{
+	struct drgn_error *err;
+	uint64_t factored;
+	if ((err = binary_buffer_next_uleb128(&buffer->bb, &factored)))
+		return err;
+	if (__builtin_mul_overflow(factored, cie->data_alignment_factor, ret))
+		return binary_buffer_error(&buffer->bb, "offset is too large");
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_dwarf_cfi_next_block(struct drgn_debug_info_buffer *buffer,
+			  const char **buf_ret, size_t *size_ret)
+{
+	struct drgn_error *err;
+	uint64_t size;
+	if ((err = binary_buffer_next_uleb128(&buffer->bb, &size)))
+		return err;
+	if (size > buffer->bb.end - buffer->bb.pos) {
+		return binary_buffer_error(&buffer->bb,
+					   "block is out of bounds");
+	}
+	*buf_ret = buffer->bb.pos;
+	buffer->bb.pos += size;
+	*size_ret = size;
+	return NULL;
+}
+
+static struct drgn_error *
+drgn_eval_dwarf_cfi(struct drgn_debug_info_module *module,
+		    struct drgn_dwarf_fde *fde,
+		    const struct drgn_cfi_row *initial_row, uint64_t target,
+		    const char *instructions, size_t instructions_size,
+		    struct drgn_cfi_row **row)
+{
+	struct drgn_error *err;
+	drgn_register_number (*dwarf_regno_to_internal)(uint64_t) =
+		module->platform.arch->dwarf_regno_to_internal;
+	struct drgn_dwarf_cie *cie = &module->cies[fde->cie];
+	uint64_t pc = fde->initial_location;
+
+	struct drgn_cfi_row_vector state_stack = VECTOR_INIT;
+	struct drgn_debug_info_buffer buffer;
+	drgn_debug_info_buffer_init(&buffer, module,
+				    cie->is_eh ?
+				    DRGN_SCN_EH_FRAME : DRGN_SCN_DEBUG_FRAME);
+	buffer.bb.pos = instructions;
+	buffer.bb.end = instructions + instructions_size;
+	while (binary_buffer_has_next(&buffer.bb)) {
+		uint8_t opcode;
+		if ((err = binary_buffer_next_u8(&buffer.bb, &opcode)))
+			goto out;
+
+		uint64_t dwarf_regno;
+		drgn_register_number regno;
+		struct drgn_cfi_rule rule;
+		uint64_t tmp;
+		switch ((opcode & 0xc0) ? (opcode & 0xc0) : opcode) {
+		case DW_CFA_set_loc:
+			if (!initial_row)
+				goto invalid_for_initial;
+			if ((err = drgn_dwarf_cfi_next_encoded(&buffer,
+							       cie->address_size,
+							       cie->address_encoding,
+							       fde->initial_location,
+							       &tmp)))
+				goto out;
+			if (tmp <= pc) {
+				err = binary_buffer_error(&buffer.bb,
+							  "DW_CFA_set_loc location is not greater than current location");
+				goto out;
+			}
+			pc = tmp;
+			if (pc > target)
+				goto found;
+			break;
+		case DW_CFA_advance_loc:
+			if (!initial_row)
+				goto invalid_for_initial;
+			tmp = opcode & 0x3f;
+			goto advance_loc;
+		case DW_CFA_advance_loc1:
+			if (!initial_row)
+				goto invalid_for_initial;
+			if ((err = binary_buffer_next_u8_into_u64(&buffer.bb,
+								  &tmp)))
+				goto out;
+			goto advance_loc;
+		case DW_CFA_advance_loc2:
+			if (!initial_row)
+				goto invalid_for_initial;
+			if ((err = binary_buffer_next_u16_into_u64(&buffer.bb,
+								   &tmp)))
+				goto out;
+			goto advance_loc;
+		case DW_CFA_advance_loc4:
+			if (!initial_row)
+				goto invalid_for_initial;
+			if ((err = binary_buffer_next_u32_into_u64(&buffer.bb,
+								   &tmp)))
+				goto out;
+advance_loc:
+			if (__builtin_mul_overflow(tmp,
+						   cie->code_alignment_factor,
+						   &tmp) ||
+			    __builtin_add_overflow(pc, tmp, &pc) ||
+			    pc > uint_max(cie->address_size)) {
+				err = drgn_error_create(DRGN_ERROR_OTHER,
+							"DW_CFA_advance_loc* overflows location");
+				goto out;
+			}
+			if (pc > target)
+				goto found;
+			break;
+		case DW_CFA_def_cfa:
+			rule.kind = DRGN_CFI_RULE_REGISTER_PLUS_OFFSET;
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)) ||
+			    (err = drgn_dwarf_cfi_next_offset(&buffer, &rule.offset)))
+				goto out;
+			if ((rule.regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				rule.kind = DRGN_CFI_RULE_UNDEFINED;
+			goto set_cfa;
+		case DW_CFA_def_cfa_sf:
+			rule.kind = DRGN_CFI_RULE_REGISTER_PLUS_OFFSET;
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)) ||
+			    (err = drgn_dwarf_cfi_next_offset_sf(&buffer, cie,
+								 &rule.offset)))
+				goto out;
+			if ((rule.regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				rule.kind = DRGN_CFI_RULE_UNDEFINED;
+			goto set_cfa;
+		case DW_CFA_def_cfa_register:
+			drgn_cfi_row_get_cfa(*row, &rule);
+			if (rule.kind != DRGN_CFI_RULE_REGISTER_PLUS_OFFSET) {
+				err = binary_buffer_error(&buffer.bb,
+							  "DW_CFA_def_cfa_register with incompatible CFA rule");
+				goto out;
+			}
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)))
+				goto out;
+			if ((rule.regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				rule.kind = DRGN_CFI_RULE_UNDEFINED;
+			goto set_cfa;
+		case DW_CFA_def_cfa_offset:
+			drgn_cfi_row_get_cfa(*row, &rule);
+			if (rule.kind != DRGN_CFI_RULE_REGISTER_PLUS_OFFSET) {
+				err = binary_buffer_error(&buffer.bb,
+							  "DW_CFA_def_cfa_offset with incompatible CFA rule");
+				goto out;
+			}
+			if ((err = drgn_dwarf_cfi_next_offset(&buffer,
+							      &rule.offset)))
+				goto out;
+			goto set_cfa;
+		case DW_CFA_def_cfa_offset_sf:
+			drgn_cfi_row_get_cfa(*row, &rule);
+			if (rule.kind != DRGN_CFI_RULE_REGISTER_PLUS_OFFSET) {
+				err = binary_buffer_error(&buffer.bb,
+							  "DW_CFA_def_cfa_offset_sf with incompatible CFA rule");
+				goto out;
+			}
+			if ((err = drgn_dwarf_cfi_next_offset_sf(&buffer, cie,
+								 &rule.offset)))
+				goto out;
+			goto set_cfa;
+		case DW_CFA_def_cfa_expression:
+			rule.kind = DRGN_CFI_RULE_DWARF_EXPRESSION;
+			rule.push_cfa = false;
+			if ((err = drgn_dwarf_cfi_next_block(&buffer,
+							     &rule.expr,
+							     &rule.expr_size)))
+				goto out;
+set_cfa:
+			if (!drgn_cfi_row_set_cfa(row, &rule)) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			break;
+		case DW_CFA_undefined:
+			rule.kind = DRGN_CFI_RULE_UNDEFINED;
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)))
+				goto out;
+			if ((regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				break;
+			goto set_reg;
+		case DW_CFA_same_value:
+			rule.kind = DRGN_CFI_RULE_REGISTER_PLUS_OFFSET;
+			rule.offset = 0;
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)))
+				goto out;
+			if ((regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				break;
+			rule.regno = regno;
+			goto set_reg;
+		case DW_CFA_offset:
+			rule.kind = DRGN_CFI_RULE_AT_CFA_PLUS_OFFSET;
+			if ((err = drgn_dwarf_cfi_next_offset_f(&buffer, cie,
+								&rule.offset)))
+				goto out;
+			if ((regno = dwarf_regno_to_internal(opcode & 0x3f)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				break;
+			goto set_reg;
+		case DW_CFA_offset_extended:
+			rule.kind = DRGN_CFI_RULE_AT_CFA_PLUS_OFFSET;
+			goto reg_offset_f;
+		case DW_CFA_offset_extended_sf:
+			rule.kind = DRGN_CFI_RULE_AT_CFA_PLUS_OFFSET;
+			goto reg_offset_sf;
+		case DW_CFA_val_offset:
+			rule.kind = DRGN_CFI_RULE_CFA_PLUS_OFFSET;
+reg_offset_f:
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)) ||
+			    (err = drgn_dwarf_cfi_next_offset_f(&buffer, cie,
+								&rule.offset)))
+				goto out;
+			if ((regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				break;
+			goto set_reg;
+		case DW_CFA_val_offset_sf:
+			rule.kind = DRGN_CFI_RULE_CFA_PLUS_OFFSET;
+reg_offset_sf:
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)) ||
+			    (err = drgn_dwarf_cfi_next_offset_sf(&buffer, cie,
+								 &rule.offset)))
+				goto out;
+			if ((regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				break;
+			goto set_reg;
+		case DW_CFA_register: {
+			rule.kind = DRGN_CFI_RULE_REGISTER_PLUS_OFFSET;
+			rule.offset = 0;
+			uint64_t dwarf_regno2;
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)) ||
+			    (err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno2)))
+				goto out;
+			if ((regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				break;
+			if ((rule.regno = dwarf_regno_to_internal(dwarf_regno2)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				rule.kind = DRGN_CFI_RULE_UNDEFINED;
+			goto set_reg;
+		}
+		case DW_CFA_expression:
+			rule.kind = DRGN_CFI_RULE_AT_DWARF_EXPRESSION;
+			goto reg_expression;
+		case DW_CFA_val_expression:
+			rule.kind = DRGN_CFI_RULE_DWARF_EXPRESSION;
+reg_expression:
+			rule.push_cfa = true;
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)) ||
+			    (err = drgn_dwarf_cfi_next_block(&buffer,
+							     &rule.expr,
+							     &rule.expr_size)))
+				goto out;
+			if ((regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				break;
+			goto set_reg;
+		case DW_CFA_restore:
+			if (!initial_row)
+				goto invalid_for_initial;
+			dwarf_regno = opcode & 0x3f;
+			goto restore;
+		case DW_CFA_restore_extended:
+			if (!initial_row) {
+invalid_for_initial:
+				err = binary_buffer_error(&buffer.bb,
+							  "invalid initial DWARF CFI opcode %#x",
+							  opcode);
+				goto out;
+			}
+			if ((err = binary_buffer_next_uleb128(&buffer.bb,
+							      &dwarf_regno)))
+				goto out;
+restore:
+			if ((regno = dwarf_regno_to_internal(dwarf_regno)) ==
+			    DRGN_REGISTER_NUMBER_UNKNOWN)
+				break;
+			drgn_cfi_row_get_register(initial_row, regno, &rule);
+set_reg:
+			if (!drgn_cfi_row_set_register(row, regno, &rule)) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			break;
+		case DW_CFA_remember_state: {
+			struct drgn_cfi_row **state =
+				drgn_cfi_row_vector_append_entry(&state_stack);
+			if (!state) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			*state = drgn_empty_cfi_row;
+			if (!drgn_cfi_row_copy(state, *row)) {
+				err = &drgn_enomem;
+				goto out;
+			}
+			break;
+		}
+		case DW_CFA_restore_state:
+			if (state_stack.size == 0) {
+				err = binary_buffer_error(&buffer.bb,
+							  "DW_CFA_restore_state with empty state stack");
+				goto out;
+			}
+			drgn_cfi_row_destroy(*row);
+			*row = state_stack.data[--state_stack.size];
+			break;
+		case DW_CFA_nop:
+			break;
+		default:
+			err = binary_buffer_error(&buffer.bb,
+						  "unknown DWARF CFI opcode %#x",
+						  opcode);
+			goto out;
+		}
+	}
+found:
+	err = NULL;
+out:
+	for (size_t i = 0; i < state_stack.size; i++)
+		drgn_cfi_row_destroy(state_stack.data[i]);
+	drgn_cfi_row_vector_deinit(&state_stack);
+	return err;
+}
+
+static struct drgn_error *
+drgn_debug_info_find_cfi_in_fde(struct drgn_debug_info_module *module,
+				struct drgn_dwarf_fde *fde,
+				uint64_t unbiased_pc, struct drgn_cfi_row **ret)
+{
+	struct drgn_error *err;
+	struct drgn_dwarf_cie *cie = &module->cies[fde->cie];
+	struct drgn_cfi_row *initial_row =
+		module->platform.arch->default_dwarf_cfi_row;
+	err = drgn_eval_dwarf_cfi(module, fde, NULL, unbiased_pc,
+				  cie->initial_instructions,
+				  cie->initial_instructions_size, &initial_row);
+	if (err)
+		goto out;
+	if (!drgn_cfi_row_copy(ret, initial_row)) {
+		err = &drgn_enomem;
+		goto out;
+	}
+	err = drgn_eval_dwarf_cfi(module, fde, initial_row, unbiased_pc,
+				  fde->instructions, fde->instructions_size,
+				  ret);
+out:
+	drgn_cfi_row_destroy(initial_row);
+	return err;
+}
+
+struct drgn_error *
+drgn_debug_info_module_find_cfi(struct drgn_debug_info_module *module,
+				uint64_t pc, struct drgn_cfi_row **row_ret,
+				bool *interrupted_ret,
+				drgn_register_number *ret_addr_regno_ret)
+{
+	struct drgn_error *err;
+
+	Dwarf_Addr bias;
+	dwfl_module_info(module->dwfl_module, NULL, NULL, NULL, &bias, NULL,
+			 NULL, NULL);
+
+	struct drgn_dwarf_fde *fde;
+	err = drgn_debug_info_find_fde(module, pc - bias, &fde);
+	if (err)
+		return err;
+	if (!fde)
+		return &drgn_not_found;
+	err = drgn_debug_info_find_cfi_in_fde(module, fde, pc - bias, row_ret);
+	if (err)
+		return err;
+	*interrupted_ret = module->cies[fde->cie].signal_frame;
+	*ret_addr_regno_ret = module->cies[fde->cie].return_address_register;
+	return NULL;
+}
+
+struct drgn_error *
+drgn_eval_cfi_dwarf_expression(struct drgn_program *prog,
+			       const struct drgn_cfi_rule *rule,
+			       const struct drgn_register_state *regs,
+			       void *buf, size_t size)
+{
+	struct drgn_error *err;
+	struct uint64_vector stack = VECTOR_INIT;
+
+	if (rule->push_cfa) {
+		struct optional_uint64 cfa = drgn_register_state_get_cfa(regs);
+		if (!cfa.has_value) {
+			err = &drgn_not_found;
+			goto out;
+		}
+		if (!uint64_vector_append(&stack, &cfa.value)) {
+			err = &drgn_enomem;
+			goto out;
+		}
+	}
+
+	struct drgn_dwarf_expression_buffer buffer;
+	drgn_dwarf_expression_buffer_init(&buffer, regs->module, rule->expr,
+					  rule->expr_size);
+	err = drgn_eval_dwarf_expression(prog, &buffer, &stack, regs);
+	if (err)
+		goto out;
+	if (stack.size == 0) {
+		err = &drgn_not_found;
+	} else if (rule->kind == DRGN_CFI_RULE_AT_DWARF_EXPRESSION) {
+		err = drgn_program_read_memory(prog, buf,
+					       stack.data[stack.size - 1], size,
+					       false);
+	} else {
+		copy_lsbytes(buf, size,
+			     drgn_platform_is_little_endian(&prog->platform),
+			     &stack.data[stack.size - 1], sizeof(uint64_t),
+			     HOST_LITTLE_ENDIAN);
+		err = NULL;
+	}
+
+out:
+	uint64_vector_deinit(&stack);
+	return err;
 }
 
 struct drgn_error *open_elf_file(const char *path, int *fd_ret, Elf **elf_ret)

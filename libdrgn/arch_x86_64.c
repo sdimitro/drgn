@@ -1,319 +1,221 @@
-%{
 // Copyright (c) Facebook, Inc. and its affiliates.
 // SPDX-License-Identifier: GPL-3.0+
 
 #include <byteswap.h>
-#include <elfutils/libdw.h>
-#include <elfutils/libdwfl.h>
 #include <string.h>
 
 #include "drgn.h"
 #include "error.h"
 #include "linux_kernel.h"
-#include "platform.h"
+#include "platform.h" // IWYU pragma: associated
 #include "program.h"
+#include "register_state.h"
+#include "serialize.h"
 #include "type.h"
 #include "util.h"
-%}
 
-x86-64
-%%
-rax
-rdx
-rcx
-rbx
-rsi
-rdi
-rbp
-rsp
-r8
-r9
-r10
-r11
-r12
-r13
-r14
-r15
-# The System V ABI calls this the return address (RA) register, but it's
-# effectively the instruction pointer.
-rip
-xmm0
-xmm1
-xmm2
-xmm3
-xmm4
-xmm5
-xmm6
-xmm7
-xmm8
-xmm9
-xmm10
-xmm11
-xmm12
-xmm13
-xmm14
-xmm15
-st0
-st1
-st2
-st3
-st4
-st5
-st6
-st7
-mm0
-mm1
-mm2
-mm3
-mm4
-mm5
-mm6
-mm7
-rFLAGS
-es
-cs
-ss
-ds
-fs
-gs
-fs.base, 58
-gs.base
-tr, 62
-ldtr
-mxcsr
-fcw
-fsw
-xmm16
-xmm17
-xmm18
-xmm19
-xmm20
-xmm21
-xmm22
-xmm23
-xmm24
-xmm25
-xmm26
-xmm27
-xmm28
-xmm29
-xmm30
-xmm31
-k0, 118
-k1
-k2
-k3
-k4
-k5
-k6
-k7
-bnd0
-bnd1
-bnd2
-bnd3
-%%
+#define DRGN_ARCH_REGISTER_LAYOUT					\
+	/* The psABI calls this the return address (RA) register. */	\
+	DRGN_REGISTER_LAYOUT(rip, 8, 16)				\
+	DRGN_REGISTER_LAYOUT(rsp, 8, 7)					\
+	/* The remaining layout matches struct pt_regs. */		\
+	DRGN_REGISTER_LAYOUT(r15, 8, 15)				\
+	DRGN_REGISTER_LAYOUT(r14, 8, 14)				\
+	DRGN_REGISTER_LAYOUT(r13, 8, 13)				\
+	DRGN_REGISTER_LAYOUT(r12, 8, 12)				\
+	DRGN_REGISTER_LAYOUT(rbp, 8, 6)					\
+	DRGN_REGISTER_LAYOUT(rbx, 8, 3)					\
+	DRGN_REGISTER_LAYOUT(r11, 8, 11)				\
+	DRGN_REGISTER_LAYOUT(r10, 8, 10)				\
+	DRGN_REGISTER_LAYOUT(r9, 8, 9)					\
+	DRGN_REGISTER_LAYOUT(r8, 8, 8)					\
+	DRGN_REGISTER_LAYOUT(rax, 8, 0)					\
+	DRGN_REGISTER_LAYOUT(rcx, 8, 2)					\
+	DRGN_REGISTER_LAYOUT(rdx, 8, 1)					\
+	DRGN_REGISTER_LAYOUT(rsi, 8, 4)					\
+	DRGN_REGISTER_LAYOUT(rdi, 8, 5)
+
+#include "arch_x86_64.inc"
+
+static struct drgn_error *
+get_registers_from_frame_pointer(struct drgn_program *prog,
+				 uint64_t frame_pointer,
+				 struct drgn_register_state **ret)
+{
+	struct drgn_error *err;
+	uint64_t frame[2];
+	err = drgn_program_read_memory(prog, frame, frame_pointer,
+				       sizeof(frame), false);
+	if (err)
+		return err;
+
+	uint64_t unwound_frame_pointer =
+		drgn_platform_bswap(&prog->platform) ? bswap_64(frame[0]) : frame[0];
+	if (unwound_frame_pointer <= frame_pointer) {
+		/*
+		 * The next frame pointer isn't valid. Maybe frame pointers are
+		 * not enabled or we're in the middle of a prologue or epilogue.
+		 */
+		return &drgn_stop;
+	}
+
+	struct drgn_register_state *regs =
+		drgn_register_state_create(rbp, false);
+	if (!regs)
+		return &drgn_enomem;
+	drgn_register_state_set_from_buffer(regs, rip, &frame[1]);
+	drgn_register_state_set_from_integer(prog, regs, rsp,
+					     frame_pointer + sizeof(frame));
+	drgn_register_state_set_from_buffer(regs, rbp, &frame[0]);
+	drgn_register_state_set_pc_from_register(prog, regs, rip);
+	*ret = regs;
+	return NULL;
+}
+
+static struct drgn_error *
+fallback_unwind_x86_64(struct drgn_program *prog,
+		       struct drgn_register_state *regs,
+		       struct drgn_register_state **ret)
+{
+	struct drgn_error *err;
+
+	if (!drgn_register_state_has_register(regs, DRGN_REGISTER_NUMBER(rbp)))
+		return &drgn_stop;
+	bool little_endian = drgn_platform_is_little_endian(&prog->platform);
+	uint64_t rbp;
+	copy_lsbytes(&rbp, sizeof(rbp), HOST_LITTLE_ENDIAN,
+		     &regs->buf[DRGN_REGISTER_OFFSET(rbp)],
+		     DRGN_REGISTER_SIZE(rbp), little_endian);
+
+	err = get_registers_from_frame_pointer(prog, rbp, ret);
+	if (err) {
+		if (err->code == DRGN_ERROR_FAULT) {
+			drgn_error_destroy(err);
+			err = &drgn_stop;
+		}
+		return err;
+	}
+	drgn_register_state_set_cfa(prog, regs, rbp + 16);
+	return NULL;
+}
 
 /*
  * The in-kernel struct pt_regs, UAPI struct pt_regs, elf_gregset_t, and struct
  * user_regs_struct all have the same layout.
  */
 static struct drgn_error *
-set_initial_registers_from_struct_x86_64(struct drgn_program *prog,
-					 Dwfl_Thread *thread, const void *regs,
-					 size_t size)
+get_initial_registers_from_struct_x86_64(struct drgn_program *prog,
+					 const void *buf, size_t size,
+					 struct drgn_register_state **ret)
 {
 	if (size < 160) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "registers are truncated");
 	}
 
-	bool bswap = drgn_platform_bswap(&prog->platform);
+	struct drgn_register_state *regs =
+		drgn_register_state_create(rdi, true);
+	if (!regs)
+		return &drgn_enomem;
 
-	Dwarf_Word dwarf_regs[17];
-#define READ_REGISTER(n) ({					\
-	uint64_t reg;						\
-	memcpy(&reg, (uint64_t *)regs + n, sizeof(reg));	\
-	bswap ? bswap_64(reg) : reg;				\
-})
-	dwarf_regs[0] = READ_REGISTER(10); /* rax */
-	dwarf_regs[1] = READ_REGISTER(12); /* rdx */
-	dwarf_regs[2] = READ_REGISTER(11); /* rcx */
-	dwarf_regs[3] = READ_REGISTER(5); /* rbx */
-	dwarf_regs[4] = READ_REGISTER(13); /* rsi */
-	dwarf_regs[5] = READ_REGISTER(14); /* rdi */
-	dwarf_regs[6] = READ_REGISTER(4); /* rbp */
-	dwarf_regs[7] = READ_REGISTER(19); /* rsp */
-	dwarf_regs[8] = READ_REGISTER(9); /* r8 */
-	dwarf_regs[9] = READ_REGISTER(8); /* r9 */
-	dwarf_regs[10] = READ_REGISTER(7); /* r10 */
-	dwarf_regs[11] = READ_REGISTER(6); /* r11 */
-	dwarf_regs[12] = READ_REGISTER(3); /* r12 */
-	dwarf_regs[13] = READ_REGISTER(2); /* r13 */
-	dwarf_regs[14] = READ_REGISTER(1); /* r14 */
-	dwarf_regs[15] = READ_REGISTER(0); /* r15 */
-	dwarf_regs[16] = READ_REGISTER(16); /* rip */
-#undef READ_REGISTER
+	drgn_register_state_set_from_buffer(regs, rip, (uint64_t *)buf + 16);
+	drgn_register_state_set_from_buffer(regs, rsp, (uint64_t *)buf + 19);
+	drgn_register_state_set_range_from_buffer(regs, r15, rdi, buf);
+	drgn_register_state_set_pc_from_register(prog, regs, rip);
 
-	if (!dwfl_thread_state_registers(thread, 0, 17, dwarf_regs))
-		return drgn_error_libdwfl();
+	*ret = regs;
 	return NULL;
 }
 
 static struct drgn_error *
-pt_regs_set_initial_registers_x86_64(Dwfl_Thread *thread,
-				     const struct drgn_object *obj)
+pt_regs_get_initial_registers_x86_64(const struct drgn_object *obj,
+				     struct drgn_register_state **ret)
 {
-	return set_initial_registers_from_struct_x86_64(drgn_object_program(obj),
-							thread,
+	return get_initial_registers_from_struct_x86_64(drgn_object_program(obj),
 							drgn_object_buffer(obj),
-							drgn_object_size(obj));
+							drgn_object_size(obj),
+							ret);
 }
 
 static struct drgn_error *
-prstatus_set_initial_registers_x86_64(struct drgn_program *prog,
-				      Dwfl_Thread *thread, const void *prstatus,
-				      size_t size)
+prstatus_get_initial_registers_x86_64(struct drgn_program *prog,
+				      const void *prstatus, size_t size,
+				      struct drgn_register_state **ret)
 {
 	if (size < 112) {
 		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
 					 "NT_PRSTATUS is truncated");
 	}
-	return set_initial_registers_from_struct_x86_64(prog, thread,
+	return get_initial_registers_from_struct_x86_64(prog,
 							(char *)prstatus + 112,
-							size - 112);
+							size - 112, ret);
 }
 
-static inline struct drgn_error *
-read_register(struct drgn_object *reg_obj, const struct drgn_object *frame_obj,
-	      const char *name, Dwarf_Addr *ret)
+static struct drgn_error *
+get_initial_registers_inactive_task_frame(struct drgn_object *frame_obj,
+					  struct drgn_register_state **ret)
 {
 	struct drgn_error *err;
-	uint64_t reg;
+	struct drgn_program *prog = drgn_object_program(frame_obj);
 
-	err = drgn_object_member(reg_obj, frame_obj, name);
+	uint64_t address = frame_obj->address;
+	err = drgn_object_read(frame_obj, frame_obj);
 	if (err)
 		return err;
-	err = drgn_object_read_unsigned(reg_obj, &reg);
-	if (err)
-		return err;
-	*ret = reg;
+	const char *frame_buf = drgn_object_buffer(frame_obj);
+	size_t frame_size = drgn_object_size(frame_obj);
+
+	struct drgn_register_state *regs =
+		drgn_register_state_create(rbx, false);
+	if (!regs)
+		return &drgn_enomem;
+
+#define COPY_REGISTER(id, member_name) do {					\
+	struct drgn_type_member *member;					\
+	uint64_t bit_offset;							\
+	err = drgn_type_find_member(frame_obj->type, member_name, &member,	\
+				    &bit_offset);				\
+	if (err)								\
+		goto err;							\
+	if (bit_offset / 8 + DRGN_REGISTER_SIZE(id) > frame_size) {		\
+		err = drgn_error_create(DRGN_ERROR_OUT_OF_BOUNDS,		\
+					"out of bounds of value");		\
+		goto err;							\
+	}									\
+	drgn_register_state_set_from_buffer(regs, id,				\
+					    frame_buf + bit_offset / 8);	\
+} while (0)
+
+	COPY_REGISTER(rip, "ret_addr");
+	COPY_REGISTER(r15, "r15");
+	COPY_REGISTER(r14, "r14");
+	COPY_REGISTER(r13, "r13");
+	COPY_REGISTER(r12, "r12");
+	COPY_REGISTER(rbp, "bp");
+	COPY_REGISTER(rbx, "bx");
+
+#undef COPY_REGISTER
+
+	drgn_register_state_set_from_integer(prog, regs,
+					     rsp, address + frame_size);
+	drgn_register_state_set_pc_from_register(prog, regs, rip);
+
+	*ret = regs;
 	return NULL;
-}
 
-static struct drgn_error *
-set_initial_registers_inactive_task_frame(Dwfl_Thread *thread,
-					  const struct drgn_object *frame_obj)
-{
-	struct drgn_error *err;
-	struct drgn_object reg_obj;
-	Dwarf_Word dwarf_regs[5];
-
-	drgn_object_init(&reg_obj, drgn_object_program(frame_obj));
-
-	err = read_register(&reg_obj, frame_obj, "bx", &dwarf_regs[0]);
-	if (err)
-		goto out;
-	/* rbx is register 3. */
-	if (!dwfl_thread_state_registers(thread, 3, 1, dwarf_regs)) {
-		err = drgn_error_libdwfl();
-		goto out;
-	}
-
-	err = read_register(&reg_obj, frame_obj, "bp", &dwarf_regs[0]);
-	if (err)
-		goto out;
-	dwarf_regs[1] = frame_obj->address + drgn_object_size(frame_obj);
-	/* rbp is register 6, rsp is register 7. */
-	if (!dwfl_thread_state_registers(thread, 6, 2, dwarf_regs)) {
-		err = drgn_error_libdwfl();
-		goto out;
-	}
-
-	err = read_register(&reg_obj, frame_obj, "r12", &dwarf_regs[0]);
-	if (err)
-		goto out;
-	err = read_register(&reg_obj, frame_obj, "r13", &dwarf_regs[1]);
-	if (err)
-		goto out;
-	err = read_register(&reg_obj, frame_obj, "r14", &dwarf_regs[2]);
-	if (err)
-		goto out;
-	err = read_register(&reg_obj, frame_obj, "r15", &dwarf_regs[3]);
-	if (err)
-		goto out;
-	err = read_register(&reg_obj, frame_obj, "ret_addr", &dwarf_regs[4]);
-	if (err)
-		goto out;
-	/* r12-r15 are registers 12-15; register 16 is the return address. */
-	if (!dwfl_thread_state_registers(thread, 12, 5, dwarf_regs)) {
-		err = drgn_error_libdwfl();
-		goto out;
-	}
-
-	err = NULL;
-out:
-	drgn_object_deinit(&reg_obj);
+err:
+	drgn_register_state_destroy(regs);
 	return err;
 }
 
 static struct drgn_error *
-set_initial_registers_frame_pointer(Dwfl_Thread *thread,
-				    const struct drgn_object *bp_obj)
-{
-	struct drgn_error *err;
-
-	struct drgn_object reg_obj;
-	drgn_object_init(&reg_obj, drgn_object_program(bp_obj));
-
-	Dwarf_Word dwarf_regs[2];
-
-	err = drgn_object_subscript(&reg_obj, bp_obj, 0);
-	if (err)
-		goto out;
-	uint64_t reg;
-	err = drgn_object_read_unsigned(&reg_obj, &reg);
-	if (err)
-		goto out;
-	dwarf_regs[0] = reg;
-
-	err = drgn_object_read_unsigned(bp_obj, &reg);
-	if (err)
-		goto out;
-	dwarf_regs[1] = reg + 16;
-
-	/* rbp is register 6, rsp is register 7. */
-	if (!dwfl_thread_state_registers(thread, 6, 2, dwarf_regs)) {
-		err = drgn_error_libdwfl();
-		goto out;
-	}
-
-	err = drgn_object_subscript(&reg_obj, bp_obj, 1);
-	if (err)
-		goto out;
-	err = drgn_object_read_unsigned(&reg_obj, &reg);
-	if (err)
-		goto out;
-	dwarf_regs[0] = reg;
-	/* The return address is register 16. */
-	if (!dwfl_thread_state_registers(thread, 16, 1, dwarf_regs)) {
-		err = drgn_error_libdwfl();
-		goto out;
-	}
-
-	err = NULL;
-out:
-	drgn_object_deinit(&reg_obj);
-	return err;
-}
-
-static struct drgn_error *
-linux_kernel_set_initial_registers_x86_64(Dwfl_Thread *thread,
-					  const struct drgn_object *task_obj)
+linux_kernel_get_initial_registers_x86_64(const struct drgn_object *task_obj,
+					  struct drgn_register_state **ret)
 {
 	struct drgn_error *err;
 	struct drgn_program *prog = drgn_object_program(task_obj);
-	struct drgn_object sp_obj;
 
+	struct drgn_object sp_obj;
 	drgn_object_init(&sp_obj, prog);
 
 	err = drgn_object_member_dereference(&sp_obj, task_obj, "thread");
@@ -341,11 +243,10 @@ linux_kernel_set_initial_registers_x86_64(Dwfl_Thread *thread,
 		err = drgn_object_dereference(&sp_obj, &sp_obj);
 		if (err)
 			goto out;
-		err = set_initial_registers_inactive_task_frame(thread,
-								&sp_obj);
+		err = get_initial_registers_inactive_task_frame(&sp_obj, ret);
 	} else if (err->code == DRGN_ERROR_LOOKUP) {
 		drgn_error_destroy(err);
-		err = drgn_program_find_type(prog, "unsigned long **", NULL,
+		err = drgn_program_find_type(prog, "void **", NULL,
 					     &frame_type);
 		if (err)
 			goto out;
@@ -355,7 +256,16 @@ linux_kernel_set_initial_registers_x86_64(Dwfl_Thread *thread,
 		err = drgn_object_dereference(&sp_obj, &sp_obj);
 		if (err)
 			goto out;
-		err = set_initial_registers_frame_pointer(thread, &sp_obj);
+		uint64_t frame_pointer;
+		err = drgn_object_read_unsigned(&sp_obj, &frame_pointer);
+		if (err)
+			return err;
+		err = get_registers_from_frame_pointer(prog, frame_pointer,
+						       ret);
+		if (err == &drgn_stop) {
+			err = drgn_error_create(DRGN_ERROR_OTHER,
+						"invalid frame pointer");
+		}
 	}
 out:
 	drgn_object_deinit(&sp_obj);
@@ -583,13 +493,34 @@ linux_kernel_pgtable_iterator_next_x86_64(struct pgtable_iterator *it,
 }
 
 const struct drgn_architecture_info arch_info_x86_64 = {
-	ARCHITECTURE_INFO,
+	.name = "x86-64",
+	.arch = DRGN_ARCH_X86_64,
 	.default_flags = (DRGN_PLATFORM_IS_64_BIT |
 			  DRGN_PLATFORM_IS_LITTLE_ENDIAN),
-	.pt_regs_set_initial_registers = pt_regs_set_initial_registers_x86_64,
-	.prstatus_set_initial_registers = prstatus_set_initial_registers_x86_64,
-	.linux_kernel_set_initial_registers =
-		linux_kernel_set_initial_registers_x86_64,
+	DRGN_ARCHITECTURE_REGISTERS,
+	.default_dwarf_cfi_row = DRGN_CFI_ROW(
+		/*
+		 * The System V psABI defines the CFA as the value of rsp in the
+		 * calling frame.
+		 */
+		[DRGN_REGISTER_NUMBER(rsp)] = { DRGN_CFI_RULE_CFA_PLUS_OFFSET },
+		/*
+		 * Other callee-saved registers default to DW_CFA_same_value.
+		 * This isn't explicitly documented in the psABI, but it seems
+		 * to be the consensus.
+		 */
+		DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(rbx)),
+		DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(rbp)),
+		DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(r12)),
+		DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(r13)),
+		DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(r14)),
+		DRGN_CFI_SAME_VALUE_INIT(DRGN_REGISTER_NUMBER(r15)),
+	),
+	.fallback_unwind = fallback_unwind_x86_64,
+	.pt_regs_get_initial_registers = pt_regs_get_initial_registers_x86_64,
+	.prstatus_get_initial_registers = prstatus_get_initial_registers_x86_64,
+	.linux_kernel_get_initial_registers =
+		linux_kernel_get_initial_registers_x86_64,
 	.linux_kernel_get_page_offset = linux_kernel_get_page_offset_x86_64,
 	.linux_kernel_get_vmemmap = linux_kernel_get_vmemmap_x86_64,
 	.linux_kernel_live_direct_mapping_fallback =
