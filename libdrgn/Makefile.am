@@ -263,10 +263,15 @@ EXTRA_DIST = $(ARCH_DEFS_PYS) \
 	     build-aux/gen_elf_sections.py \
 	     build-aux/gen_strswitch.py
 
-EXTRA_PROGRAMS = examples/load_debug_info
+EXTRA_PROGRAMS = examples/load_debug_info \
+		 tools/dratini
 
 examples_load_debug_info_SOURCES = examples/load_debug_info.c
 examples_load_debug_info_LDADD = $(libdrgn_libs)
+
+tools_dratini_SOURCES = ../tools/dratini.c
+tools_dratini_CPPFLAGS = $(AM_CPPFLAGS)
+tools_dratini_LDADD = $(libdrgn_libs)
 
 # Only test internals here. Anything exposed via Python should be tested in
 # Python unit tests instead.
