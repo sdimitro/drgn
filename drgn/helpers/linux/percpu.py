@@ -1,5 +1,5 @@
-# Copyright 2018-2019 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Per-CPU
@@ -10,34 +10,57 @@ per-CPU allocations from :linux:`include/linux/percpu.h` and per-CPU counters
 from :linux:`include/linux/percpu_counter.h`.
 """
 
-from drgn import Object
+from _drgn import _linux_helper_per_cpu_ptr as per_cpu_ptr
+from drgn import IntegerLike, Object
 from drgn.helpers.linux.cpumask import for_each_online_cpu
 
-
 __all__ = (
+    "per_cpu",
     "per_cpu_ptr",
     "percpu_counter_sum",
+    "percpu_counter_sum_positive",
 )
 
 
-def per_cpu_ptr(ptr, cpu):
+def per_cpu(var: Object, cpu: IntegerLike) -> Object:
     """
-    .. c:function:: type *per_cpu_ptr(type __percpu *ptr, int cpu)
+    Return the per-CPU variable for a given CPU.
 
-    Return the per-CPU pointer for a given CPU.
+    >>> print(repr(prog["runqueues"]))
+    Object(prog, 'struct rq', address=0x278c0)
+    >>> per_cpu(prog["runqueues"], 6).curr.comm
+    (char [16])"python3"
+
+    :param var: Per-CPU variable, i.e., ``type __percpu`` (not a pointer; use
+        :func:`per_cpu_ptr()` for that).
+    :param cpu: CPU number.
+    :return: ``type`` object.
     """
-    offset = ptr.prog_["__per_cpu_offset"][cpu].value_()
-    return Object(ptr.prog_, ptr.type_, value=ptr.value_() + offset)
+    return per_cpu_ptr(var.address_of_(), cpu)[0]
 
 
-def percpu_counter_sum(fbc):
+def percpu_counter_sum(fbc: Object) -> int:
     """
-    .. c:function:: s64 percpu_counter_sum(struct percpu_counter *fbc)
-
     Return the sum of a per-CPU counter.
+
+    :param fbc: ``struct percpu_counter *``
     """
     ret = fbc.count.value_()
-    ptr = fbc.counters
-    for cpu in for_each_online_cpu(fbc.prog_):
-        ret += per_cpu_ptr(ptr, cpu)[0].value_()
+    try:
+        ptr = fbc.counters
+    except AttributeError:
+        # On !SMP kernels, there's nothing to sum.
+        pass
+    else:
+        for cpu in for_each_online_cpu(fbc.prog_):
+            ret += per_cpu_ptr(ptr, cpu)[0].value_()
     return ret
+
+
+def percpu_counter_sum_positive(fbc: Object) -> int:
+    """
+    Return the sum of a per-CPU counter, or 0 if it is negative.
+
+    :param fbc: ``struct percpu_counter *``
+    """
+    return max(percpu_counter_sum(fbc), 0)

@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Kconfig
@@ -12,27 +13,13 @@ import gzip
 import types
 from typing import Mapping
 
+from drgn import Program
+from drgn.helpers.common.prog import takes_program_or_default
+
 __all__ = ("get_kconfig",)
 
 
-def get_kconfig(prog) -> Mapping[str, str]:
-    """
-    Get the kernel build configuration as a mapping from the option name to the
-    value.
-
-    >>> get_kconfig(prog)['CONFIG_SMP']
-    'y'
-    >>> get_kconfig(prog)['CONFIG_HZ']
-    '300'
-
-    This is only supported if the kernel was compiled with ``CONFIG_IKCONFIG``.
-    Note that most Linux distributions do not enable this option.
-    """
-    try:
-        return prog.cache["kconfig_map"]
-    except KeyError:
-        pass
-
+def _get_raw_kconfig(prog: Program) -> bytes:
     try:
         start = prog.symbol("kernel_config_data").address
         size = prog.symbol("kernel_config_data_end").address - start
@@ -45,15 +32,36 @@ def get_kconfig(prog) -> Mapping[str, str]:
         except KeyError:
             raise LookupError(
                 "kernel configuration data not found; kernel must be compiled with CONFIG_IKCONFIG"
-            )
+            ) from None
         # The data is delimited by the magic strings "IKCFG_ST" and "IKCFG_ED"
         # plus a NUL byte.
-        start = kernel_config_data.address_ + 8
+        start = kernel_config_data.address_ + 8  # type: ignore[operator]
         size = len(kernel_config_data) - 17
 
-    data = prog.read(start, size)
+    return gzip.decompress(prog.read(start, size))
+
+
+@takes_program_or_default
+def get_kconfig(prog: Program) -> Mapping[str, str]:
+    """
+    Get the kernel build configuration as a mapping from the option name to the
+    value.
+
+    >>> get_kconfig()['CONFIG_SMP']
+    'y'
+    >>> get_kconfig()['CONFIG_HZ']
+    '300'
+
+    This is only supported if the kernel was compiled with ``CONFIG_IKCONFIG``.
+    Note that most Linux distributions do not enable this option.
+    """
+    try:
+        return prog.cache["kconfig_map"]
+    except KeyError:
+        pass
+
     kconfig = {}
-    for line in gzip.decompress(data).decode().splitlines():
+    for line in _get_raw_kconfig(prog).decode().splitlines():
         if not line or line.startswith("#"):
             continue
         name, _, value = line.partition("=")

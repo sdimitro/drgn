@@ -1,18 +1,10 @@
-// Copyright 2018-2019 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
-#include "internal.h"
+#include "drgn_internal.h"
 #include "lexer.h"
 
-DEFINE_VECTOR_FUNCTIONS(drgn_token_vector)
-
-void drgn_lexer_init(struct drgn_lexer *lexer, drgn_lexer_func func,
-		     const char *str)
-{
-	lexer->func = func;
-	lexer->p = str;
-	drgn_token_vector_init(&lexer->stack);
-}
+DEFINE_VECTOR_FUNCTIONS(drgn_token_vector);
 
 void drgn_lexer_deinit(struct drgn_lexer *lexer)
 {
@@ -22,11 +14,11 @@ void drgn_lexer_deinit(struct drgn_lexer *lexer)
 struct drgn_error *drgn_lexer_pop(struct drgn_lexer *lexer,
 				  struct drgn_token *token)
 {
-	if (lexer->stack.size) {
+	if (drgn_token_vector_empty(&lexer->stack)) {
+		return lexer->func(lexer, token);
+	} else {
 		*token = *drgn_token_vector_pop(&lexer->stack);
 		return NULL;
-	} else {
-		return lexer->func(lexer, token);
 	}
 }
 

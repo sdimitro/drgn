@@ -1,13 +1,19 @@
-import struct
-from typing import Optional, Sequence
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
-from tests.elf import ET, PT, SHT
+import os
+import struct
+from typing import List, NamedTuple, Optional, Sequence, Tuple, Union
+import zlib
+
+from _drgn_util.elf import ET, PT, SHF, SHN, SHT, STB, STT, STV
 
 
 class ElfSection:
     def __init__(
         self,
-        data: bytes,
+        *,
+        data: bytes = b"",
         name: Optional[str] = None,
         sh_type: Optional[SHT] = None,
         p_type: Optional[PT] = None,
@@ -15,53 +21,207 @@ class ElfSection:
         paddr: int = 0,
         memsz: Optional[int] = None,
         p_align: int = 0,
+        sh_link: int = 0,
+        sh_info: int = 0,
+        sh_entsize: int = 0,
+        sh_flags: SHF = SHF(0),
     ):
         self.data = data
         self.name = name
         self.sh_type = sh_type
+        self.sh_flags = sh_flags
         self.p_type = p_type
         self.vaddr = vaddr
         self.paddr = paddr
         self.memsz = memsz
         self.p_align = p_align
+        self.sh_link = sh_link
+        self.sh_info = sh_info
+        self.sh_entsize = sh_entsize
 
         assert (self.name is not None) or (self.p_type is not None)
         assert (self.name is None) == (self.sh_type is None)
-        if self.p_type is None:
-            assert self.memsz is None
-        elif self.memsz is None:
-            self.memsz = len(self.data)
+        assert self.p_type is None or not (sh_flags & SHF.COMPRESSED)
+
+
+class ElfSymbol(NamedTuple):
+    name: str
+    value: int
+    size: int
+    type: STT
+    binding: STB
+    shindex: Optional[int] = None
+    visibility: STV = STV.DEFAULT
+
+    def st_info(self) -> int:
+        return (self.binding << 4) + (self.type & 0xF)
+
+
+def _create_symtab(
+    sections: List[ElfSection],
+    symbols: Sequence[ElfSymbol],
+    *,
+    dynamic: bool = False,
+    little_endian: bool,
+    bits: int,
+):
+    symtab_name = ".dynsym" if dynamic else ".symtab"
+    strtab_name = ".dynstr" if dynamic else ".strtab"
+    assert not any(section.name in (symtab_name, strtab_name) for section in sections)
+
+    # An empty symbol name is a placeholder for the implicit 0-index entry in
+    # the symbol table. It's used to create a valid, but empty symbol table.
+    if symbols and symbols[0].name == "":
+        symbols = symbols[1:]
+
+    endian = "<" if little_endian else ">"
+    if bits == 64:
+        symbol_struct = struct.Struct(endian + "IBBHQQ")
+
+        def symbol_fields(sym: ElfSymbol):
+            return (
+                sym.st_info(),
+                sym.visibility,
+                SHN.UNDEF if sym.shindex is None else sym.shindex,
+                sym.value,
+                sym.size,
+            )
+
+    else:
+        symbol_struct = struct.Struct(endian + "IIIBBH")
+
+        def symbol_fields(sym: ElfSymbol):
+            return (
+                sym.value,
+                sym.size,
+                sym.st_info(),
+                sym.visibility,
+                SHN.UNDEF if sym.shindex is None else sym.shindex,
+            )
+
+    symtab_data = bytearray((len(symbols) + 1) * symbol_struct.size)
+    strtab_data = bytearray(1)
+    sh_info = 1
+    for i, sym in enumerate(symbols, 1):
+        symbol_struct.pack_into(
+            symtab_data, i * symbol_struct.size, len(strtab_data), *symbol_fields(sym)
+        )
+        strtab_data.extend(sym.name.encode())
+        strtab_data.append(0)
+        if sym.binding == STB.LOCAL:
+            assert sh_info == i, "local symbol after non-local symbol"
+            sh_info = i + 1
+
+    sections.append(
+        ElfSection(
+            name=symtab_name,
+            sh_type=SHT.DYNSYM if dynamic else SHT.SYMTAB,
+            data=symtab_data,
+            sh_link=sum((1 for section in sections if section.name is not None), 2),
+            sh_info=sh_info,
+            sh_entsize=symbol_struct.size,
+        )
+    )
+    sections.append(ElfSection(name=strtab_name, sh_type=SHT.STRTAB, data=strtab_data))
 
 
 def create_elf_file(
-    type: ET, sections: Sequence[ElfSection], little_endian: bool = True, bits: int = 64
+    type: ET,
+    sections: Sequence[ElfSection] = (),
+    symbols: Sequence[ElfSymbol] = (),
+    *,
+    dynamic_symbols: Sequence[ElfSymbol] = (),
+    build_id: Optional[bytes] = None,
+    gnu_debuglink: Optional[
+        Tuple[Union[str, bytes, "os.PathLike[str]", "os.PathLike[bytes]"], int]
+    ] = None,
+    gnu_debugaltlink: Optional[
+        Tuple[Union[str, bytes, "os.PathLike[str]", "os.PathLike[bytes]"], bytes]
+    ] = None,
+    little_endian: bool = True,
+    bits: int = 64,
 ):
     endian = "<" if little_endian else ">"
     if bits == 64:
         ehdr_struct = struct.Struct(endian + "16BHHIQQQIHHHHHH")
         shdr_struct = struct.Struct(endian + "IIQQQQIIQQ")
         phdr_struct = struct.Struct(endian + "IIQQQQQQ")
+        chdr_struct = struct.Struct(endian + "IIQQ")
         e_machine = 62 if little_endian else 43  # EM_X86_64 or EM_SPARCV9
     else:
         assert bits == 32
         ehdr_struct = struct.Struct(endian + "16BHHIIIIIHHHHHH")
         shdr_struct = struct.Struct(endian + "10I")
         phdr_struct = struct.Struct(endian + "8I")
+        chdr_struct = struct.Struct(endian + "III")
         e_machine = 3 if little_endian else 8  # EM_386 or EM_MIPS
+    nhdr_struct = struct.Struct(endian + "3I")
 
-    shstrtab = ElfSection(name=".shstrtab", sh_type=SHT.STRTAB, data=bytearray(1),)
-    tmp = [shstrtab]
-    tmp.extend(sections)
-    sections = tmp
-    shnum = 1  # One for the SHT_NULL section.
+    sections = list(sections)
+    if dynamic_symbols:
+        _create_symtab(
+            sections,
+            dynamic_symbols,
+            dynamic=True,
+            little_endian=little_endian,
+            bits=bits,
+        )
+    if symbols:
+        _create_symtab(sections, symbols, little_endian=little_endian, bits=bits)
+    if build_id is not None:
+        build_id_note = (
+            nhdr_struct.pack(
+                4,  # n_namesz,
+                len(build_id),  # n_namesz,
+                3,  # n_type = NT_GNU_BUILD_ID
+            )
+            + b"GNU\0"
+            + build_id
+            + bytes(-len(build_id) % 4)
+        )
+        sections.append(
+            ElfSection(name=".note.gnu.build-id", sh_type=SHT.NOTE, data=build_id_note)
+        )
+
+    if gnu_debuglink is not None:
+        gnu_debuglink_path, gnu_debuglink_crc = gnu_debuglink
+        gnu_debuglink_path = os.fsencode(gnu_debuglink_path)
+        sections.append(
+            ElfSection(
+                name=".gnu_debuglink",
+                sh_type=SHT.PROGBITS,
+                data=gnu_debuglink_path
+                + bytes(4 - len(gnu_debuglink_path) % 4)
+                + gnu_debuglink_crc.to_bytes(4, "little"),
+            )
+        )
+
+    if gnu_debugaltlink is not None:
+        gnu_debugaltlink_path, gnu_debugaltlink_build_id = gnu_debugaltlink
+        sections.append(
+            ElfSection(
+                name=".gnu_debugaltlink",
+                sh_type=SHT.PROGBITS,
+                data=os.fsencode(gnu_debugaltlink_path)
+                + b"\0"
+                + gnu_debugaltlink_build_id,
+            )
+        )
+
+    shnum = 0
     phnum = 0
+    shstrtab = bytearray(1)
     for section in sections:
         if section.name is not None:
-            shstrtab.data.extend(section.name.encode())
-            shstrtab.data.append(0)
+            shstrtab.extend(section.name.encode())
+            shstrtab.append(0)
             shnum += 1
         if section.p_type is not None:
             phnum += 1
+    if shnum > 0:
+        shnum += 2  # One for the SHT_NULL section, one for .shstrtab.
+        shstrtab.extend(b".shstrtab\0")
+        sections.append(ElfSection(name=".shstrtab", sh_type=SHT.STRTAB, data=shstrtab))
 
     shdr_offset = ehdr_struct.size
     phdr_offset = shdr_offset + shdr_struct.size * shnum
@@ -90,19 +250,28 @@ def create_elf_file(
         e_machine,
         1,  # e_version = EV_CURRENT
         0,  # e_entry
-        phdr_offset,  # e_phoff
-        shdr_offset,  # e_shoff
+        phdr_offset if phnum else 0,  # e_phoff
+        shdr_offset if shnum else 0,  # e_shoff
         0,  # e_flags
         ehdr_struct.size,  # e_ehsize
         phdr_struct.size,  # e_phentsize
         phnum,  # e_phnum
-        shdr_struct.size,  # e_shentsize,
-        shnum,  # e_shnum,
-        1,  # e_shstrndx
+        shdr_struct.size,  # e_shentsize
+        shnum,  # e_shnum
+        shnum - 1 if shnum else 0,  # e_shstrndx
     )
 
     shdr_offset += shdr_struct.size
     for section in sections:
+        ch_addralign = 1 if section.p_type is None else bits // 8
+        memsz = len(section.data) if section.memsz is None else section.memsz
+        if section.sh_flags & SHF.COMPRESSED:
+            sh_addralign = bits // 8
+            compressed_data = zlib.compress(section.data)
+            sh_size = chdr_struct.size + len(compressed_data)
+        else:
+            sh_addralign = ch_addralign
+            sh_size = memsz
         if section.p_align:
             padding = section.vaddr % section.p_align - len(buf) % section.p_align
             buf.extend(bytes(padding))
@@ -110,16 +279,16 @@ def create_elf_file(
             shdr_struct.pack_into(
                 buf,
                 shdr_offset,
-                shstrtab.data.index(section.name.encode()),  # sh_name
+                shstrtab.index(section.name.encode()),  # sh_name
                 section.sh_type,  # sh_type
-                0,  # sh_flags
+                section.sh_flags,  # sh_flags
                 section.vaddr,  # sh_addr
                 len(buf),  # sh_offset
-                len(section.data),  # sh_size
-                0,  # sh_link
-                0,  # sh_info
-                1 if section.p_type is None else bits // 8,  # sh_addralign
-                0,  # sh_entsize
+                sh_size,  # sh_size
+                section.sh_link,  # sh_link
+                section.sh_info,  # sh_info
+                sh_addralign,  # sh_addralign
+                section.sh_entsize,  # sh_entsize
             )
             shdr_offset += shdr_struct.size
         if section.p_type is not None:
@@ -134,7 +303,7 @@ def create_elf_file(
                     section.vaddr,  # p_vaddr
                     section.paddr,  # p_paddr
                     len(section.data),  # p_filesz
-                    section.memsz,  # p_memsz
+                    memsz,  # p_memsz
                     section.p_align,  # p_align
                 )
             else:
@@ -146,11 +315,32 @@ def create_elf_file(
                     section.vaddr,  # p_vaddr
                     section.paddr,  # p_paddr
                     len(section.data),  # p_filesz
-                    section.memsz,  # p_memsz
+                    memsz,  # p_memsz
                     flags,  # p_flags
                     section.p_align,  # p_align
                 )
             phdr_offset += phdr_struct.size
-        buf.extend(section.data)
+        if section.sh_flags & SHF.COMPRESSED:
+            ELFCOMPRESS_ZLIB = 1
+            if bits == 64:
+                buf.extend(
+                    chdr_struct.pack(
+                        ELFCOMPRESS_ZLIB,  # ch_type
+                        0,  # ch_reserved
+                        memsz,  # ch_size
+                        ch_addralign,  # ch_addralign
+                    )
+                )
+            else:
+                buf.extend(
+                    chdr_struct.pack(
+                        ELFCOMPRESS_ZLIB,  # ch_type
+                        memsz,  # ch_size
+                        ch_addralign,  # ch_addralign
+                    )
+                )
+            buf.extend(compressed_data)
+        else:
+            buf.extend(section.data)
 
     return buf

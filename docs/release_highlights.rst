@@ -1,0 +1,20 @@
+Release Highlights
+==================
+
+These are highlights of each release of drgn focusing on a few exciting items
+from the full `release notes <https://github.com/osandov/drgn/releases>`_.
+
+.. toctree::
+
+   release_highlights/0.1.0.rst
+   release_highlights/0.0.33.rst
+   release_highlights/0.0.32.rst
+   release_highlights/0.0.31.rst
+   release_highlights/0.0.30.rst
+   release_highlights/0.0.28.rst
+   release_highlights/0.0.27.rst
+   release_highlights/0.0.26.rst
+   release_highlights/0.0.25.rst
+   release_highlights/0.0.24.rst
+   release_highlights/0.0.23.rst
+   release_highlights/0.0.22.rst

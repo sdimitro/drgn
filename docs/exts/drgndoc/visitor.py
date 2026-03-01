@@ -1,8 +1,7 @@
-# Copyright 2020 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import ast
-import sys
 from typing import Any, Optional
 
 

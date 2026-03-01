@@ -1,0 +1,68 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
+
+static struct drgn_error *
+linux_kernel_object_find(const char *name, size_t name_len,
+			 const char *filename,
+			 enum drgn_find_object_flags flags, void *arg,
+			 struct drgn_object *ret)
+{
+	struct drgn_program *prog = arg;
+	if (!filename) {
+		@memswitch (name, name_len)@
+		@case "PAGE_SHIFT"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_page_shift(prog, ret);
+			break;
+		@case "PAGE_SIZE"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_page_size(prog, ret);
+			break;
+		@case "PAGE_MASK"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_page_mask(prog, ret);
+			break;
+		@case "THREAD_SIZE"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_thread_size(prog, ret);
+			break;
+		@case "UTS_RELEASE"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_uts_release(prog, ret);
+			break;
+		@case "VMCOREINFO"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_vmcoreinfo(prog, ret);
+			break;
+		@case "jiffies"@
+			if (flags & DRGN_FIND_OBJECT_VARIABLE)
+				return linux_kernel_get_jiffies(prog, ret);
+			break;
+		@case "vmemmap"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_vmemmap(prog, ret);
+			break;
+		@case "NR_SECTION_ROOTS"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_nr_section_roots(prog, ret);
+			break;
+		@case "SECTIONS_PER_ROOT"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_sections_per_root(prog, ret);
+			break;
+		@case "SECTION_SIZE_BITS"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_section_size_bits(prog, ret);
+			break;
+		@case "MAX_PHYSMEM_BITS"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_max_physmem_bits(prog, ret);
+			break;
+		@case "ARCH_PFN_OFFSET"@
+			if (flags & DRGN_FIND_OBJECT_CONSTANT)
+				return linux_kernel_get_arch_pfn_offset(prog, ret);
+			break;
+		@endswitch@
+	}
+	return &drgn_not_found;
+}

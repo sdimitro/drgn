@@ -1,5 +1,6 @@
-# Copyright 2019 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2026, Oracle and/or its affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 CPU Scheduler
@@ -9,21 +10,358 @@ The ``drgn.helpers.linux.sched`` module provides helpers for working with the
 Linux CPU scheduler.
 """
 
-from _drgn import _linux_helper_task_state_to_char
+from typing import Iterator, Tuple
+
+from _drgn import (
+    _linux_helper_cpu_curr,
+    _linux_helper_idle_task,
+    _linux_helper_task_cpu as task_cpu,
+    _linux_helper_task_on_cpu as task_on_cpu,
+    _linux_helper_task_thread_info as task_thread_info,
+)
+from drgn import IntegerLike, Object, Program, container_of
+from drgn.helpers.common.prog import takes_program_or_default
+from drgn.helpers.linux.cgroup import cgroup_name
+from drgn.helpers.linux.list import list_for_each_entry
+from drgn.helpers.linux.percpu import per_cpu
+from drgn.helpers.linux.rbtree import rbtree_inorder_for_each_entry
+
+__all__ = (
+    "cfs_rq_for_each_entity",
+    "cpu_curr",
+    "cpu_rq",
+    "get_task_state",
+    "idle_task",
+    "loadavg",
+    "rq_for_each_fair_task",
+    "rq_for_each_rt_task",
+    "sched_entity_is_task",
+    "sched_entity_to_task",
+    "task_cpu",
+    "task_group_name",
+    "task_on_cpu",
+    "task_rq",
+    "task_since_last_arrival_ns",
+    "task_state_to_char",
+    "task_thread_info",
+    "thread_group_leader",
+)
+
+_TASK_NOLOAD = 0x400
 
 
-__all__ = ("task_state_to_char",)
-
-
-def task_state_to_char(task):
+@takes_program_or_default
+def cpu_curr(prog: Program, cpu: IntegerLike) -> Object:
     """
-    .. c:function char task_state_to_char(struct task_struct *task)
+    Return the task running on the given CPU.
 
+    >>> cpu_curr(7).comm
+    (char [16])"python3"
+
+    :param cpu: CPU number.
+    :return: ``struct task_struct *``
+    """
+    return _linux_helper_cpu_curr(prog, cpu)
+
+
+@takes_program_or_default
+def idle_task(prog: Program, cpu: IntegerLike) -> Object:
+    """
+    Return the idle thread (PID 0, a.k.a swapper) for the given CPU.
+
+    >>> idle_task(1).comm
+    (char [16])"swapper/1"
+
+    :param cpu: CPU number.
+    :return: ``struct task_struct *``
+    """
+    return _linux_helper_idle_task(prog, cpu)
+
+
+def task_state_to_char(task: Object) -> str:
+    """
     Get the state of the task as a character (e.g., ``'R'`` for running). See
     `ps(1)
     <http://man7.org/linux/man-pages/man1/ps.1.html#PROCESS_STATE_CODES>`_ for
     a description of the process state codes.
 
-    :rtype: str
+    :param task: ``struct task_struct *``
     """
-    return _linux_helper_task_state_to_char(task)
+    prog = task.prog_
+    task_state_chars: str
+    TASK_REPORT: int
+    try:
+        task_state_chars, TASK_REPORT, task_state_name = prog.cache[
+            "task_state_to_char"
+        ]
+    except KeyError:
+        task_state_array = prog["task_state_array"]
+        # Walk through task_state_array backwards looking for the largest state
+        # that we know is in TASK_REPORT, then populate the task state mapping.
+        chars = None
+        for i in range(len(task_state_array) - 1, -1, -1):
+            c: int = task_state_array[i][0].value_()
+            if chars is None and c in b"RSDTtXZP":
+                chars = bytearray(i + 1)
+                TASK_REPORT = (1 << i) - 1
+            if chars is not None:
+                chars[i] = c
+        if chars is None:
+            raise Exception("could not parse task_state_array")
+        task_state_chars = chars.decode("ascii")
+
+        # Since Linux kernel commit 2f064a59a11f ("sched: Change
+        # task_struct::state") (in v5.14), the task state is named "__state".
+        # Before that, it is named "state".
+        try:
+            task_state = task.__state
+            task_state_name = "__state"
+        except AttributeError:
+            task_state = task.state
+            task_state_name = "state"
+
+        prog.cache["task_state_to_char"] = (
+            task_state_chars,
+            TASK_REPORT,
+            task_state_name,
+        )
+    else:
+        task_state = task.member_(task_state_name)
+    task_state = task_state.value_()
+    exit_state = task.exit_state.value_()
+    state = (task_state | exit_state) & TASK_REPORT
+    char = task_state_chars[state.bit_length()]
+    # States beyond TASK_REPORT are special. As of Linux v5.14, TASK_IDLE is
+    # the only one; it is defined as TASK_UNINTERRUPTIBLE | TASK_NOLOAD.
+    if char == "D" and (task_state & ~state) == _TASK_NOLOAD:
+        return "I"
+    else:
+        return char
+
+
+_TASK_STATE_CHAR_TO_STATE = {
+    "R": "R (running)",
+    "S": "S (sleeping)",
+    "D": "D (disk sleep)",
+    "T": "T (stopped)",
+    "t": "t (tracing stop)",
+    "X": "X (dead)",
+    "Z": "Z (zombie)",
+    "P": "P (parked)",
+    "I": "I (idle)",
+}
+
+
+def get_task_state(task: Object) -> str:
+    """
+    Get the state of the task as a character plus a parenthesized name (e.g.,
+    ``'R (running)'``).
+
+    See also :func:`task_state_to_char()`.
+
+    :param task: ``struct task_struct *``
+    """
+    char = task_state_to_char(task)
+    return _TASK_STATE_CHAR_TO_STATE.get(char, char)
+
+
+@takes_program_or_default
+def loadavg(prog: Program) -> Tuple[float, float, float]:
+    """
+    Return system load averaged over 1, 5 and 15 minutes as
+    tuple of three float values.
+
+    >>> loadavg()
+    (2.34, 0.442, 1.33)
+    """
+
+    avenrun = prog["avenrun"]
+    vals = [avenrun[i].value_() / (1 << 11) for i in range(3)]
+    return (vals[0], vals[1], vals[2])
+
+
+@takes_program_or_default
+def cpu_rq(prog: Program, cpu: IntegerLike) -> Object:
+    """
+    Get the runqueue for a given cpu.
+
+    :param cpu: CPU number.
+    :returns: ``struct rq *``
+    """
+    return per_cpu(prog["runqueues"], cpu).address_of_()
+
+
+def task_rq(task: Object) -> Object:
+    """
+    Get the runqueue for a given task.
+
+    :param task: ``struct task_struct *``
+    :returns: ``struct rq *``
+    """
+    return cpu_rq(task.prog_, task_cpu(task))
+
+
+def rq_for_each_fair_task(rq: Object) -> Iterator[Object]:
+    """
+    Iterate over tasks on a runqueue in the fair scheduling class (EEVDF or
+    CFS).
+
+    :param rq: ``struct rq *``
+    :return: Iterator of ``struct task_struct *`` objects
+    """
+    try:
+        cfs_tasks = rq.cfs_tasks
+    except AttributeError:
+        # Before Linux kernel commit cac5cefbade9 ("sched/smp: Make SMP
+        # unconditional") (in v6.17), cfs_tasks does not exist on !SMP. Fall
+        # back to walking the tasks_timeline hierarchy.
+        return (
+            sched_entity_to_task(se)
+            for se, _, _, is_task in cfs_rq_for_each_entity(rq.cfs.address_of_())
+            if is_task
+        )
+    return list_for_each_entry(
+        "struct task_struct", cfs_tasks.address_of_(), "se.group_node"
+    )
+
+
+def rq_for_each_rt_task(rq: Object) -> Iterator[Object]:
+    """
+    Iterate over tasks on a runqueue in the realtime scheduling class.
+
+    :param rq: ``struct rq *``
+    :return: Iterator of ``struct task_struct *`` objects
+    """
+    for queue in rq.rt.active.queue:
+        yield from list_for_each_entry(
+            "struct task_struct", queue.address_of_(), "rt.run_list"
+        )
+
+
+def sched_entity_is_task(se: Object) -> bool:
+    """
+    Return whether a scheduler entity is a task.
+
+    :param se: ``struct sched_entity *``
+    """
+    try:
+        return not se.my_q
+    except AttributeError:
+        return True
+
+
+def sched_entity_to_task(se: Object) -> Object:
+    """
+    Get the task represented by a scheduler entity.
+
+    Note that this does not check whether the entity is actually a task; see
+    :func:`sched_entity_is_task()`.
+
+    :param se: ``struct sched_entity *``
+    :return: ``struct task_struct *``
+    """
+    return container_of(se, "struct task_struct", "se")
+
+
+def task_group_name(tg: Object) -> bytes:
+    """
+    Get the name of a task group.
+
+    :param tg: ``struct task_group *``
+    :return: Cgroup name, or empty byte string if not a cgroup.
+    """
+    cgrp = tg.css.cgroup.read_()
+    if not cgrp:
+        return b""
+    return cgroup_name(cgrp)
+
+
+def cfs_rq_for_each_entity(cfs_rq: Object) -> Iterator[Tuple[Object, int, bool, bool]]:
+    """
+    Iterate over all entities on a fair scheduler runqueue (recursively).
+
+    Task groups are visited before their children (i.e., this does a pre-order
+    traversal).
+
+    :param cfs_rq: ``struct cfs_rq *``
+    :return: Iterator of (``struct sched_entity *``, ``depth``, ``is_curr``,
+        ``is_task``) tuples.
+
+        ``depth`` is the depth of the entity relative to the runqueue (e.g.,
+        direct children have depth 0, entities in descendant task groups have
+        depth > 0).
+
+        ``is_curr`` is whether the entity is the current entity on its
+        runqueue.
+
+        If ``is_task`` is ``True``, then the entity is a task, which can be
+        obtained with :func:`sched_entity_to_task()`. Otherwise, it is a task
+        group.
+    """
+
+    def entities(cfs_rq: Object) -> Iterator[Tuple[Object, bool]]:
+        curr = cfs_rq.curr.read_()
+        if curr:
+            yield curr, True
+
+        # Since Linux kernel commit bfb068892d30 ("sched/fair: replace
+        # cfs_rq->rb_leftmost") (in v4.14), tasks_timeline is a struct
+        # rb_root_cached. Before that, it was a struct rb_root.
+        rb_root = cfs_rq.tasks_timeline
+        try:
+            rb_root = rb_root.rb_root
+        except AttributeError:
+            pass
+
+        for se in rbtree_inorder_for_each_entry(
+            "struct sched_entity", rb_root.address_of_(), "run_node"
+        ):
+            yield se, False
+
+    stack = [(entities(cfs_rq), 0)]
+    while stack:
+        it, depth = stack[-1]
+        try:
+            se, is_curr = next(it)
+        except StopIteration:
+            stack.pop()
+        else:
+            try:
+                my_q = se.my_q.read_()
+            except AttributeError:
+                my_q = None
+
+            yield se, depth, is_curr, not my_q
+
+            if my_q:
+                stack.append((entities(my_q), depth + 1))
+
+
+def task_since_last_arrival_ns(task: Object) -> int:
+    """
+    Get the difference between the runqueue timestamp when a task last started
+    running and the current runqueue timestamp.
+
+    This is approximately the time that the task has been in its current status
+    (running, queued, or blocked). However, if a CPU is either idle or running
+    the same task for a long time, then the timestamps will not be accurate.
+
+    This is only supported if the kernel was compiled with
+    ``CONFIG_SCHEDSTATS`` or ``CONFIG_TASK_DELAY_ACCT``.
+
+    :param task: ``struct task_struct *``
+    :returns: Duration in nanoseconds.
+    """
+    arrival_time = task.sched_info.last_arrival.value_()
+    rq_clock = task_rq(task).clock.value_()
+
+    return rq_clock - arrival_time
+
+
+def thread_group_leader(task: Object) -> bool:
+    """
+    Return whether a task is a thread group leader.
+
+    :param task: ``struct task_struct *``
+    """
+    return task.exit_signal >= 0

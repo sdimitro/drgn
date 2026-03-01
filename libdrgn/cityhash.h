@@ -1,5 +1,5 @@
-// Copyright 2018-2019 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #ifndef DRGN_CITYHASH_H
 #define DRGN_CITYHASH_H
@@ -86,7 +86,7 @@ static uint32_t cityhash32_len_5to12(const uint8_t *s, size_t len) {
 	return cityhash_fmix(cityhash_mur(c, cityhash_mur(b, cityhash_mur(a, d))));
 }
 
-__attribute__((unused))
+__attribute__((__unused__))
 static uint32_t cityhash32(const void *data, size_t len) {
 	const uint8_t *s = data;
 
@@ -120,11 +120,11 @@ static uint32_t cityhash32(const void *data, size_t len) {
 	f = f * 5 + cityhash_c3;
 	size_t iters = (len - 1) / 20;
 	do {
-		uint32_t a0 = cityhash_rotate32(cityhash_fetch32(s) * cityhash_c1, 17) * cityhash_c2;
-		uint32_t a1 = cityhash_fetch32(s + 4);
-		uint32_t a2 = cityhash_rotate32(cityhash_fetch32(s + 8) * cityhash_c1, 17) * cityhash_c2;
-		uint32_t a3 = cityhash_rotate32(cityhash_fetch32(s + 12) * cityhash_c1, 17) * cityhash_c2;
-		uint32_t a4 = cityhash_fetch32(s + 16);
+		a0 = cityhash_rotate32(cityhash_fetch32(s) * cityhash_c1, 17) * cityhash_c2;
+		a1 = cityhash_fetch32(s + 4);
+		a2 = cityhash_rotate32(cityhash_fetch32(s + 8) * cityhash_c1, 17) * cityhash_c2;
+		a3 = cityhash_rotate32(cityhash_fetch32(s + 12) * cityhash_c1, 17) * cityhash_c2;
+		a4 = cityhash_fetch32(s + 16);
 		h ^= a0;
 		h = cityhash_rotate32(h, 18);
 		h = h * 5 + cityhash_c3;
@@ -279,7 +279,7 @@ static uint64_t cityhash_len_33to64(const uint8_t *s, size_t len)
 	return b + x;
 }
 
-__attribute__((unused))
+__attribute__((__unused__))
 static uint64_t cityhash64(const void *data, size_t len)
 {
 	const uint8_t *s = data;

@@ -1,5 +1,5 @@
-# Copyright 2018-2019 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 drgn entry point
@@ -11,6 +11,6 @@ $ python3 -m drgn --help
 
 
 if __name__ == "__main__":
-    from drgn.internal.cli import main
+    from drgn.cli import _main
 
-    main()
+    _main()

@@ -1,5 +1,5 @@
-# Copyright 2018-2019 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Process IDS
@@ -9,50 +9,57 @@ The ``drgn.helpers.linux.pid`` module provides helpers for looking up process
 IDs and processes.
 """
 
-from drgn import NULL, Program, cast, container_of
-from drgn.helpers.linux.idr import idr_find, idr_for_each
-from drgn.helpers.linux.list import hlist_for_each_entry
+from typing import Iterator, Optional
+
 from _drgn import (
     _linux_helper_find_pid,
     _linux_helper_find_task,
-    _linux_helper_pid_task,
+    _linux_helper_pid_task as pid_task,
 )
+from drgn import IntegerLike, Object, Program, cast, container_of
+from drgn.helpers.common.prog import takes_object_or_program_or_default
+from drgn.helpers.linux.cpumask import for_each_online_cpu
+from drgn.helpers.linux.idr import idr_for_each
+from drgn.helpers.linux.list import hlist_for_each_entry, list_for_each_entry
+from drgn.helpers.linux.sched import idle_task
 
 __all__ = (
     "find_pid",
     "find_task",
     "for_each_pid",
     "for_each_task",
+    "for_each_task_in_group",
     "pid_task",
 )
 
 
-def find_pid(prog_or_ns, nr):
+@takes_object_or_program_or_default
+def find_pid(prog: Program, ns: Optional[Object], pid: IntegerLike) -> Object:
     """
-    .. c:function:: struct pid *find_pid(struct pid_namespace *ns, int nr)
+    Return the ``struct pid *`` for the given PID number.
 
-    Return the ``struct pid *`` for the given PID number in the given
-    namespace. If given a :class:`Program` instead, the initial PID namespace
-    is used.
+    :param ns: ``struct pid_namespace *``. Defaults to the initial PID
+        namespace if given a :class:`~drgn.Program` or :ref:`omitted
+        <default-program>`.
+    :return: ``struct pid *``
     """
-    return _linux_helper_find_pid(prog_or_ns, nr)
+    if ns is None:
+        ns = prog["init_pid_ns"].address_of_()
+    return _linux_helper_find_pid(ns, pid)
 
 
-def for_each_pid(prog_or_ns):
+@takes_object_or_program_or_default
+def for_each_pid(prog: Program, ns: Optional[Object]) -> Iterator[Object]:
     """
-    .. c:function:: for_each_pid(struct pid_namespace *ns)
+    Iterate over all PIDs in a namespace.
 
-    Iterate over all of the PIDs in the given namespace. If given a
-    :class:`Program` instead, the initial PID namespace is used.
-
+    :param ns: ``struct pid_namespace *``. Defaults to the initial PID
+        namespace if given a :class:`~drgn.Program` or :ref:`omitted
+        <default-program>`.
     :return: Iterator of ``struct pid *`` objects.
     """
-    if isinstance(prog_or_ns, Program):
-        prog = prog_or_ns
-        ns = prog_or_ns["init_pid_ns"].address_of_()
-    else:
-        prog = prog_or_ns.prog_
-        ns = prog_or_ns
+    if ns is None:
+        ns = prog["init_pid_ns"].address_of_()
     if hasattr(ns, "idr"):
         for nr, entry in idr_for_each(ns.idr):
             yield cast("struct pid *", entry)
@@ -66,41 +73,63 @@ def for_each_pid(prog_or_ns):
                     yield container_of(upid, "struct pid", f"numbers[{int(ns.level)}]")
 
 
-def pid_task(pid, pid_type):
+@takes_object_or_program_or_default
+def find_task(prog: Program, ns: Optional[Object], pid: IntegerLike) -> Object:
     """
-    .. c:function:: struct task_struct *pid_task(struct pid *pid, enum pid_type pid_type)
+    Return the task with the given PID.
 
-    Return the ``struct task_struct *`` containing the given ``struct pid *``
-    of the given type.
+    :param ns: ``struct pid_namespace *``. Defaults to the initial PID
+        namespace if given a :class:`~drgn.Program` or :ref:`omitted
+        <default-program>`.
+    :return: ``struct task_struct *``
     """
-    return _linux_helper_pid_task(pid, pid_type)
+    if ns is None:
+        ns = prog["init_pid_ns"].address_of_()
+    return _linux_helper_find_task(ns, pid)
 
 
-def find_task(prog_or_ns, pid):
+@takes_object_or_program_or_default
+def for_each_task(
+    prog: Program, ns: Optional[Object], *, idle: bool = False
+) -> Iterator[Object]:
     """
-    .. c:function:: struct task_struct *find_task(struct pid_namespace *ns, int pid)
+    Iterate over all of the tasks visible in a namespace.
 
-    Return the task with the given PID in the given namespace. If given a
-    :class:`Program` instead, the initial PID namespace is used.
-    """
-    return _linux_helper_find_task(prog_or_ns, pid)
-
-
-def for_each_task(prog_or_ns):
-    """
-    .. c:function:: for_each_task(struct pid_namespace *ns)
-
-    Iterate over all of the tasks visible in the given namespace. If given a
-    :class:`Program` instead, the initial PID namespace is used.
-
+    :param ns: ``struct pid_namespace *``. Defaults to the initial PID
+        namespace if given a :class:`~drgn.Program` or :ref:`omitted
+        <default-program>`.
+    :param idle: Whether to include the idle threads (PID 0, a.k.a swapper) for
+        each CPU.
     :return: Iterator of ``struct task_struct *`` objects.
     """
-    if isinstance(prog_or_ns, Program):
-        prog = prog_or_ns
-    else:
-        prog = prog_or_ns.prog_
+    if idle:
+        for cpu in for_each_online_cpu(prog):
+            yield idle_task(prog, cpu)
+
     PIDTYPE_PID = prog["PIDTYPE_PID"].value_()
-    for pid in for_each_pid(prog_or_ns):
+    for pid in for_each_pid(prog if ns is None else ns):
         task = pid_task(pid, PIDTYPE_PID)
         if task:
             yield task
+
+
+def for_each_task_in_group(
+    task: Object, include_self: bool = False
+) -> Iterator[Object]:
+    """
+    Iterate over all tasks in the thread group
+
+    Or, in the more common userspace terms, iterate over all threads of a
+    process.
+
+    :param task: a task whose group to iterate over
+    :param include_self: should ``task`` itself be returned?
+    :returns: an iterable of every thread in the thread group
+    """
+    for other in list_for_each_entry(
+        "struct task_struct",
+        task.signal.thread_head.address_of_(),
+        "thread_node",
+    ):
+        if other != task or include_self:
+            yield other

@@ -1,40 +1,135 @@
-// Copyright 2018-2020 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #ifndef DRGNPY_H
 #define DRGNPY_H
 
 #define PY_SSIZE_T_CLEAN
 
-#include <stdalign.h>
+// IWYU pragma: begin_exports
 #include <Python.h>
 #include "structmember.h"
 
 #include "docstrings.h"
-#include "../drgn.h"
+#include "../cleanup.h"
+#include "../drgn_internal.h"
+// IWYU pragma: end_exports
+
+#include "../hash_table.h"
+#include "../pp.h"
 #include "../program.h"
+#include "../symbol.h"
+#include "../vector.h"
 
-/* These were added in Python 3.7. */
-#ifndef Py_UNREACHABLE
-#define Py_UNREACHABLE() abort()
-#endif
-#ifndef Py_RETURN_RICHCOMPARE
-#define Py_RETURN_RICHCOMPARE(val1, val2, op)                               \
-    do {                                                                    \
-        switch (op) {                                                       \
-        case Py_EQ: if ((val1) == (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;  \
-        case Py_NE: if ((val1) != (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;  \
-        case Py_LT: if ((val1) < (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;   \
-        case Py_GT: if ((val1) > (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;   \
-        case Py_LE: if ((val1) <= (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;  \
-        case Py_GE: if ((val1) >= (val2)) Py_RETURN_TRUE; Py_RETURN_FALSE;  \
-        default:                                                            \
-            Py_UNREACHABLE();                                               \
-        }                                                                   \
-    } while (0)
+#if PY_VERSION_HEX < 0x030900a1
+static inline PyObject *PyObject_CallNoArgs(PyObject *func)
+{
+	return PyObject_CallFunctionObjArgs(func, NULL);
+}
+static inline PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *arg)
+{
+	return PyObject_CallFunctionObjArgs(callable, arg, NULL);
+}
 #endif
 
-#define DRGNPY_PUBLIC __attribute__((visibility("default")))
+#if PY_VERSION_HEX < 0x030a00a3
+static inline int PyModule_AddObjectRef(PyObject *mod, const char *name,
+					PyObject *value)
+{
+	Py_XINCREF(value);
+	int ret = PyModule_AddObject(mod, name, value);
+	if (ret)
+		Py_XDECREF(value);
+	return ret;
+}
+#endif
+
+#if PY_VERSION_HEX < 0x030d00a1
+static inline int PyModule_Add(PyObject *mod, const char *name, PyObject *value)
+{
+	int ret = PyModule_AddObject(mod, name, value);
+	if (ret)
+		Py_XDECREF(value);
+	return ret;
+}
+
+#define PyThreadState_GetUnchecked _PyThreadState_UncheckedGet
+#endif
+
+#if PY_VERSION_HEX < 0x030e00a5
+#define Py_HashPointer _Py_HashPointer
+#endif
+
+#define DRGNPY_PUBLIC __attribute__((__visibility__("default")))
+
+// Added in Python 3.14. We provide a fallback for older versions.
+int PyLong_IsNegative(PyObject *obj);
+
+#if PY_VERSION_HEX < 0x030e00a1
+static inline PyObject *PyLong_FromInt64(int64_t value)
+{
+	return PyLong_FromLongLong(value);
+}
+static inline PyObject *PyLong_FromUInt32(uint32_t value)
+{
+	return PyLong_FromUnsignedLong(value);
+}
+static inline PyObject *PyLong_FromUInt64(uint64_t value)
+{
+	return PyLong_FromUnsignedLongLong(value);
+}
+
+int PyLong_AsInt64(PyObject *obj, int64_t *value);
+int PyLong_AsUInt32(PyObject *obj, uint32_t *value);
+int PyLong_AsUInt64(PyObject *obj, uint64_t *value);
+#endif
+
+// These variants don't exist as of Python 3.14.
+static inline PyObject *PyLong_FromUInt8(uint8_t value)
+{
+	return PyLong_FromUnsignedLong(value);
+}
+static inline PyObject *PyLong_FromUInt16(uint16_t value)
+{
+	return PyLong_FromUnsignedLong(value);
+}
+int PyLong_AsUInt16(PyObject *obj, uint16_t *value);
+
+#define Py_RETURN_BOOL(cond) do {	\
+	if (cond)			\
+		Py_RETURN_TRUE;		\
+	else				\
+		Py_RETURN_FALSE;	\
+} while (0)
+
+/**
+ * Return from a PyGetSetDef setter with an error if attempting to delete the
+ * attribute.
+ */
+#define SETTER_NO_DELETE(name, value) do {				\
+	if (!(value)) {							\
+		PyErr_Format(PyExc_AttributeError,			\
+			     "can't delete '%s' attribute", (name));	\
+		return -1;						\
+	}								\
+} while (0)
+
+static inline void pydecrefp(void *p)
+{
+	Py_XDECREF(*(PyObject **)p);
+}
+
+/** Scope guard that wraps PyGILState_Ensure() and PyGILState_Release(). */
+#define PyGILState_guard()						\
+	__attribute__((__cleanup__(PyGILState_Releasep), __unused__))	\
+	PyGILState_STATE PP_UNIQUE(gstate) = PyGILState_Ensure()
+static inline void PyGILState_Releasep(PyGILState_STATE *gstatep)
+{
+	PyGILState_Release(*gstatep);
+}
+
+/** Call @c Py_XDECREF() when the variable goes out of scope. */
+#define _cleanup_pydecref_ _cleanup_(pydecrefp)
 
 typedef struct {
 	PyObject_HEAD
@@ -42,29 +137,20 @@ typedef struct {
 } DrgnObject;
 
 typedef struct {
-	PyObject_VAR_HEAD
+	PyObject_HEAD
+	struct drgn_type *type;
 	enum drgn_qualifiers qualifiers;
 	/*
-	 * This serves two purposes: it caches attributes which were previously
-	 * converted from a struct drgn_type member, and it keeps a reference to
-	 * any objects which are referenced internally by _type. For example, in
-	 * order to avoid doing a strdup(), we can set the name of a type
-	 * directly to PyUnicode_AsUTF8(s). This is only valid as long as s is
-	 * alive, so we store it here.
+	 * Cache of attributes which were previously converted from a struct
+	 * drgn_type member or used to create the type.
 	 */
 	PyObject *attr_cache;
-	/*
-	 * A Type object can wrap a struct drgn_type created elsewhere, or it
-	 * can have an embedded struct drgn_type. In the latter case, type
-	 * points to _type.
-	 */
-	struct drgn_type *type;
-	union {
-		struct drgn_type _type[0];
-		/* An object which must be kept alive for type to be valid. */
-		PyObject *parent;
-	};
 } DrgnType;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_symbol_index index;
+} SymbolIndex;
 
 typedef struct {
 	PyObject_HEAD
@@ -79,8 +165,34 @@ typedef struct {
 
 typedef struct {
 	PyObject_HEAD
+	struct drgn_memory_search_iterator *it;
+} MemorySearchIterator;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_module *module;
+} Module;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_module_iterator *it;
+} ModuleIterator;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_module *module;
+} ModuleSectionAddresses;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_module_section_address_iterator *it;
+} ModuleSectionAddressesIterator;
+
+typedef struct {
+	PyObject_HEAD
 	DrgnObject *obj;
-	uint64_t length, index;
+	uint64_t index, end;
+	int step;
 } ObjectIterator;
 
 typedef struct {
@@ -88,28 +200,63 @@ typedef struct {
 	struct drgn_platform *platform;
 } Platform;
 
+DEFINE_HASH_SET_TYPE(pyobjectp_set, PyObject *);
+
 typedef struct {
 	PyObject_HEAD
 	struct drgn_program prog;
-	PyObject *objects;
 	PyObject *cache;
+	PyObject *config;
+	/*
+	 * Set of objects that we need to hold a reference to during the
+	 * lifetime of the Program.
+	 */
+	struct pyobjectp_set objects;
 } Program;
 
 typedef struct {
 	PyObject_HEAD
+	struct drgn_debug_info_options *options;
+	// If this is a Program's default debug info options, the Program.
+	// Otherwise, NULL.
 	Program *prog;
+} DebugInfoOptions;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_thread thread;
+} Thread;
+
+typedef struct {
+	PyObject_HEAD
+	Program *prog;
+	struct drgn_thread_iterator *iterator;
+} ThreadIterator;
+
+typedef struct {
+	PyObject_HEAD
+	const struct drgn_register *reg;
+} Register;
+
+typedef struct {
+	PyObject_HEAD
+	struct drgn_source_location_list *locs;
+} SourceLocationList;
+
+typedef struct {
+	PyObject_HEAD
 	struct drgn_stack_trace *trace;
 } StackTrace;
 
 typedef struct {
 	PyObject_HEAD
 	StackTrace *trace;
-	struct drgn_stack_frame frame;
+	size_t i;
 } StackFrame;
 
 typedef struct {
 	PyObject_HEAD
-	Program *prog;
+	PyObject *name_obj; /* object owning the reference to the symbol name */
 	struct drgn_symbol *sym;
 } Symbol;
 
@@ -119,84 +266,153 @@ typedef struct {
 	PyObject *value;
 } TypeEnumerator;
 
-/*
- * LazyType.obj is a tagged pointer to a PyObject. If the
- * DRGNPY_LAZY_TYPE_UNEVALUATED flag is unset, then LazyType.obj is the
- * evaluated Type. If it is set and LazyType.lazy_type is set, then LazyType.obj
- * is the parent Type and LazyType.lazy_type must be evaluated and wrapped. If
- * the flag is set and LazyType.lazy_type is not set, then LazyType.obj is a
- * Python callable that should return the Type.
- */
-enum {
-	DRGNPY_LAZY_TYPE_UNEVALUATED = 1,
-	DRGNPY_LAZY_TYPE_MASK = ~(uintptr_t)1,
-};
-static_assert(alignof(PyObject) >= 2, "PyObject is not aligned");
-
-#define LazyType_HEAD				\
-	PyObject_HEAD				\
-	uintptr_t obj;				\
-	struct drgn_lazy_type *lazy_type;
+typedef struct {
+	PyObject_HEAD
+	PyObject *obj;
+	/*
+	 * If DRGNPY_LAZY_OBJECT_EVALUATED, obj is the evaluated Object.
+	 * If DRGNPY_LAZY_OBJECT_CALLABLE, obj is a Python callable that should
+	 * return the Object.
+	 * Otherwise, this must be evaluated and wrapped, and obj is a reference
+	 * required to keep this alive.
+	 */
+	union drgn_lazy_object *lazy_obj;
+} LazyObject;
 
 typedef struct {
-	LazyType_HEAD
-} LazyType;
+	PyObject_HEAD
+	uint64_t kinds;
+} TypeKindSet;
 
 typedef struct {
-	LazyType_HEAD
+	PyObject_HEAD
+	uint64_t mask;
+} TypeKindSetIterator;
+
+typedef struct {
+	LazyObject lazy_obj;
 	PyObject *name;
 	PyObject *bit_offset;
-	PyObject *bit_field_size;
 } TypeMember;
 
 typedef struct {
-	LazyType_HEAD
+	LazyObject lazy_obj;
 	PyObject *name;
 } TypeParameter;
 
+typedef struct {
+	LazyObject lazy_obj;
+	PyObject *name;
+	PyObject *is_default;
+} TypeTemplateParameter;
+
+extern PyObject *AbsenceReason_class;
 extern PyObject *Architecture_class;
 extern PyObject *FindObjectFlags_class;
+extern PyObject *KmodSearchMethod_class;
+extern PyObject *ModuleFileStatus_class;
+extern PyObject *ModuleSectionAddresses_class;
 extern PyObject *PlatformFlags_class;
 extern PyObject *PrimitiveType_class;
 extern PyObject *ProgramFlags_class;
 extern PyObject *Qualifiers_class;
+extern PyObject *SupplementaryFileKind_class;
+extern PyObject *SymbolBinding_class;
+extern PyObject *SymbolKind_class;
 extern PyObject *TypeKind_class;
-extern PyStructSequence_Desc Register_desc;
+extern PyTypeObject DebugInfoOptions_type;
 extern PyTypeObject DrgnObject_type;
 extern PyTypeObject DrgnType_type;
+extern PyTypeObject ExtraModule_type;
 extern PyTypeObject FaultError_type;
 extern PyTypeObject Language_type;
+extern PyTypeObject MainModule_type;
+extern PyTypeObject MemorySearchIteratorWithBytes_type;
+extern PyTypeObject MemorySearchIteratorWithInt_type;
+extern PyTypeObject MemorySearchIteratorWithStr_type;
+extern PyTypeObject MemorySearchIterator_type;
+extern PyTypeObject ModuleIteratorWithNew_type;
+extern PyTypeObject ModuleIterator_type;
+extern PyTypeObject ModuleSectionAddressesIterator_type;
+extern PyTypeObject Module_type;
 extern PyTypeObject ObjectIterator_type;
+extern PyTypeObject ObjectNotFoundError_type;
 extern PyTypeObject Platform_type;
 extern PyTypeObject Program_type;
 extern PyTypeObject Register_type;
+extern PyTypeObject RelocatableModule_type;
+extern PyTypeObject SharedLibraryModule_type;
+extern PyTypeObject SourceLocationList_type;
+extern PyObject *SourceLocation_type;
 extern PyTypeObject StackFrame_type;
 extern PyTypeObject StackTrace_type;
+extern PyTypeObject SymbolIndex_type;
 extern PyTypeObject Symbol_type;
+extern PyTypeObject ThreadIterator_type;
+extern PyTypeObject Thread_type;
 extern PyTypeObject TypeEnumerator_type;
+extern PyTypeObject TypeKindSetIterator_type;
+extern PyTypeObject TypeKindSet_type;
 extern PyTypeObject TypeMember_type;
 extern PyTypeObject TypeParameter_type;
+extern PyTypeObject TypeTemplateParameter_type;
+extern PyTypeObject VdsoModule_type;
 extern PyObject *MissingDebugInfoError;
+extern PyObject *ObjectAbsentError;
 extern PyObject *OutOfBoundsError;
 
+PyGILState_STATE drgn_initialize_python(bool *success_ret);
+
+#define drgn_initialize_python_guard(success_ret)				\
+	__attribute__((__cleanup__(PyGILState_Releasep), __unused__))		\
+	PyGILState_STATE PP_UNIQUE(gstate) = drgn_initialize_python(success_ret)
+
 int add_module_constants(PyObject *m);
+int init_logging(void);
 
 bool set_drgn_in_python(void);
 void clear_drgn_in_python(void);
+
+static inline void drgn_in_python_cleanup(bool *clearp)
+{
+	if (*clearp)
+		clear_drgn_in_python();
+}
+
+#define drgn_in_python_guard()							\
+	__attribute__((__cleanup__(drgn_in_python_cleanup), __unused__))	\
+	bool PP_UNIQUE(clear) = set_drgn_in_python()
+
 struct drgn_error *drgn_error_from_python(void);
 void *set_drgn_error(struct drgn_error *err);
 void *set_error_type_name(const char *format,
 			  struct drgn_qualified_type qualified_type);
 
+#define call_tp_alloc(type) ((type *)type##_type.tp_alloc(&type##_type, 0))
+
+PyObject *MemorySearchIterator_wrap(PyTypeObject *type,
+				    struct drgn_memory_search_iterator *it);
+
+PyObject *Module_wrap(struct drgn_module *module);
+static inline Program *Module_prog(Module *module)
+{
+	struct drgn_program *prog = drgn_module_program(module->module);
+	return container_of(prog, Program, prog);
+}
+
+int add_WantedSupplementaryFile(PyObject *m);
+int init_module_section_addresses(void);
+
 PyObject *Language_wrap(const struct drgn_language *language);
 int language_converter(PyObject *o, void *p);
 int add_languages(void);
 
+PyObject *TypeKindSet_wrap(uint64_t mask);
+int init_type_kind_set(void);
+
 static inline DrgnObject *DrgnObject_alloc(Program *prog)
 {
-	DrgnObject *ret;
-
-	ret = (DrgnObject *)DrgnObject_type.tp_alloc(&DrgnObject_type, 0);
+	DrgnObject *ret = call_tp_alloc(DrgnObject);
 	if (ret) {
 		drgn_object_init(&ret->obj, &prog->prog);
 		Py_INCREF(prog);
@@ -205,58 +421,62 @@ static inline DrgnObject *DrgnObject_alloc(Program *prog)
 }
 static inline Program *DrgnObject_prog(DrgnObject *obj)
 {
-	return container_of(obj->obj.prog, Program, prog);
+	return container_of(drgn_object_program(&obj->obj), Program, prog);
 }
 PyObject *DrgnObject_NULL(PyObject *self, PyObject *args, PyObject *kwds);
 DrgnObject *cast(PyObject *self, PyObject *args, PyObject *kwds);
+DrgnObject *implicit_convert(PyObject *self, PyObject *args, PyObject *kwds);
 DrgnObject *reinterpret(PyObject *self, PyObject *args, PyObject *kwds);
 DrgnObject *DrgnObject_container_of(PyObject *self, PyObject *args,
 				    PyObject *kwds);
 
 PyObject *Platform_wrap(const struct drgn_platform *platform);
 
+int Program_hold_object(Program *prog, PyObject *obj);
+bool Program_hold_reserve(Program *prog, size_t n);
 int Program_type_arg(Program *prog, PyObject *type_obj, bool can_be_none,
 		     struct drgn_qualified_type *ret);
 Program *program_from_core_dump(PyObject *self, PyObject *args, PyObject *kwds);
 Program *program_from_kernel(PyObject *self);
 Program *program_from_pid(PyObject *self, PyObject *args, PyObject *kwds);
 
-PyObject *Symbol_wrap(struct drgn_symbol *sym, Program *prog);
+int add_SourceLocation(PyObject *m);
+PyObject *SourceLocationList_wrap(struct drgn_source_location_list *locs);
 
-static inline PyObject *DrgnType_parent(DrgnType *type)
+PyObject *Symbol_wrap(struct drgn_symbol *sym, PyObject *name_obj);
+PyObject *Symbol_list_wrap(struct drgn_symbol **symbols, size_t count,
+			   PyObject *name_obj);
+
+PyObject *Thread_wrap(struct drgn_thread *drgn_thread);
+
+PyObject *StackTrace_wrap(struct drgn_stack_trace *trace);
+
+static inline Program *DrgnType_prog(DrgnType *type)
 {
-	if (type->type == type->_type)
-		return (PyObject *)type;
-	else
-		return type->parent;
+	return container_of(drgn_type_program(type->type), Program, prog);
 }
-PyObject *DrgnType_wrap(struct drgn_qualified_type qualified_type,
-			PyObject *parent);
-int qualifiers_converter(PyObject *arg, void *result);
-DrgnType *void_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *int_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *bool_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *float_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *complex_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *struct_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *union_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *class_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *enum_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *typedef_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *pointer_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *array_type(PyObject *self, PyObject *args, PyObject *kwds);
-DrgnType *function_type(PyObject *self, PyObject *args, PyObject *kwds);
+PyObject *DrgnType_wrap(struct drgn_qualified_type qualified_type);
+DrgnType *Program_void_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_int_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_bool_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_float_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_struct_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_union_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_class_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_enum_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_typedef_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_pointer_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_array_type(Program *self, PyObject *args, PyObject *kwds);
+DrgnType *Program_function_type(Program *self, PyObject *args, PyObject *kwds);
 
 int append_string(PyObject *parts, const char *s);
+int append_u64_hex(PyObject *parts, uint64_t value);
 int append_format(PyObject *parts, const char *format, ...);
-PyObject *byteorder_string(bool little_endian);
-
-struct byteorder_arg {
-	bool allow_none;
-	bool is_none;
-	enum drgn_byte_order value;
-};
-int byteorder_converter(PyObject *o, void *p);
+int append_attr_repr(PyObject *parts, PyObject *obj, const char *attr_name);
+int append_attr_str(PyObject *parts, PyObject *obj, const char *attr_name);
+PyObject *join_strings(PyObject *parts);
+// Implementation of _repr_pretty_() for IPython/Jupyter that just calls str().
+PyObject *repr_pretty_from_str(PyObject *self, PyObject *args, PyObject *kwds);
 
 struct index_arg {
 	bool allow_none;
@@ -269,16 +489,39 @@ struct index_arg {
 };
 int index_converter(PyObject *o, void *p);
 
-/* Helpers for path arguments based on posixmodule.c in CPython. */
+int u64_converter(PyObject *o, void *p);
+
 struct path_arg {
+	bool allow_fd;
 	bool allow_none;
+	int fd;
 	char *path;
 	Py_ssize_t length;
 	PyObject *object;
-	PyObject *cleanup;
+	PyObject *bytes;
 };
 int path_converter(PyObject *o, void *p);
 void path_cleanup(struct path_arg *path);
+
+#define PATH_ARG(name, ...)				\
+	__attribute__((__cleanup__(path_cleanup)))	\
+	struct path_arg name = { __VA_ARGS__ }
+
+DEFINE_VECTOR_TYPE(path_arg_vector, struct path_arg);
+
+struct path_sequence_arg {
+	bool allow_none;
+	bool null_terminate;
+	struct path_arg_vector args;
+	const char **paths;
+};
+int path_sequence_converter(PyObject *o, void *p);
+void path_sequence_cleanup(struct path_sequence_arg *paths);
+size_t path_sequence_size(struct path_sequence_arg *paths);
+
+#define PATH_SEQUENCE_ARG(name, ...)						\
+	__attribute__((__cleanup__(path_sequence_cleanup)))			\
+	struct path_sequence_arg name = { .args = VECTOR_INIT, __VA_ARGS__ }
 
 struct enum_arg {
 	PyObject *type;
@@ -287,22 +530,35 @@ struct enum_arg {
 };
 int enum_converter(PyObject *o, void *p);
 
+PyObject *drgnpy_linux_helper_direct_mapping_offset(PyObject *self,
+						    PyObject *arg);
 PyObject *drgnpy_linux_helper_read_vm(PyObject *self, PyObject *args,
 				      PyObject *kwds);
-DrgnObject *drgnpy_linux_helper_radix_tree_lookup(PyObject *self,
-						  PyObject *args,
-						  PyObject *kwds);
+PyObject *drgnpy_linux_helper_follow_phys(PyObject *self, PyObject *args,
+					  PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_per_cpu_ptr(PyObject *self, PyObject *args,
+					    PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_cpu_curr(PyObject *self, PyObject *args);
+DrgnObject *drgnpy_linux_helper_idle_task(PyObject *self, PyObject *args);
+DrgnObject *drgnpy_linux_helper_task_thread_info(PyObject *self, PyObject *args,
+						 PyObject *kwds);
+PyObject *drgnpy_linux_helper_task_cpu(PyObject *self, PyObject *args,
+				       PyObject *kwds);
+PyObject *drgnpy_linux_helper_task_on_cpu(PyObject *self, PyObject *args,
+					  PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_xa_load(PyObject *self, PyObject *args,
+					PyObject *kwds);
 DrgnObject *drgnpy_linux_helper_idr_find(PyObject *self, PyObject *args,
 					 PyObject *kwds);
-DrgnObject *drgnpy_linux_helper_find_pid(PyObject *self, PyObject *args,
-					 PyObject *kwds);
+DrgnObject *drgnpy_linux_helper_find_pid(PyObject *self, PyObject *args);
 DrgnObject *drgnpy_linux_helper_pid_task(PyObject *self, PyObject *args,
 					 PyObject *kwds);
-DrgnObject *drgnpy_linux_helper_find_task(PyObject *self, PyObject *args,
-					  PyObject *kwds);
-PyObject *drgnpy_linux_helper_task_state_to_char(PyObject *self, PyObject *args,
+DrgnObject *drgnpy_linux_helper_find_task(PyObject *self, PyObject *args);
+PyObject *drgnpy_linux_helper_kaslr_offset(PyObject *self, PyObject *arg);
+PyObject *drgnpy_linux_helper_pgtable_l5_enabled(PyObject *self, PyObject *arg);
+PyObject *drgnpy_linux_helper_load_proc_kallsyms(PyObject *self, PyObject *args,
 						 PyObject *kwds);
-PyObject *drgnpy_linux_helper_pgtable_l5_enabled(PyObject *self, PyObject *args,
-						 PyObject *kwds);
+PyObject *drgnpy_linux_helper_load_builtin_kallsyms(PyObject *self, PyObject *args,
+						    PyObject *kwds);
 
 #endif /* DRGNPY_H */

@@ -1,5 +1,5 @@
-# Copyright 2018-2019 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Linux Kernel
@@ -32,13 +32,10 @@ Translates to the following code in Python:
 
 import importlib
 import pkgutil
+from typing import List
 
-
-__all__ = []
-for _module_info in pkgutil.iter_modules(
-    __path__,  # type: ignore[name-defined]  # python/mypy#1422
-    prefix=__name__ + ".",
-):
+__all__: List[str] = []
+for _module_info in pkgutil.iter_modules(__path__, prefix=__name__ + "."):
     _submodule = importlib.import_module(_module_info.name)
     _submodule_all = getattr(_submodule, "__all__", ())
     __all__.extend(_submodule_all)

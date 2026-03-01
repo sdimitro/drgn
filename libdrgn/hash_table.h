@@ -1,5 +1,5 @@
-// Copyright 2018-2020 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -13,17 +13,25 @@
 #define DRGN_HASH_TABLE_H
 
 #ifdef __SSE2__
-#include <emmintrin.h>
+#include <emmintrin.h> // IWYU pragma: keep
 #endif
 #ifdef __SSE4_2__
 #include <nmmintrin.h>
 #endif
+#ifdef __BMI2__
+#include <immintrin.h>
+#endif
+#include <stdalign.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
 
+#include "bitops.h"
 #include "cityhash.h"
+#include "generics.h"
+#include "minmax.h"
+#include "nstring.h" // IWYU pragma: export
 #include "util.h"
 
 /**
@@ -39,8 +47,8 @@
  * using SIMD instructions to allow for a high load factor.
  *
  * These hash tables are generic, strongly typed (i.e., keys and values have
- * static types rather than <tt>void *</tt>), and don't have any function pointer
- * overhead. See @ref HashMaps and @ref HashSets.
+ * static types rather than <tt>void *</tt>), and don't have any function
+ * pointer overhead.
  *
  * On non-x86 platforms, this falls back to a slower implementation that doesn't
  * use SIMD.
@@ -56,7 +64,7 @@
  * key_type entry_to_key(const entry_type *entry);
  * struct hash_pair hash_func(const key_type *key);
  * bool eq_func(const key_type *a, const key_type *b);
- * DEFINE_HASH_TABLE(hash_table, entry_type, entry_to_key, hash_func, eq_func)
+ * DEFINE_HASH_TABLE(hash_table, entry_type, entry_to_key, hash_func, eq_func);
  * @endcode
  *
  * @sa BinarySearchTrees
@@ -65,10 +73,7 @@
  */
 
 /**
- * Hash function output.
- *
- * F14 resolves collisions by double hashing. This type comprises the two
- * hashes.
+ * Double hash.
  *
  * @sa HashTableHelpers
  */
@@ -76,11 +81,14 @@ struct hash_pair {
 	/**
 	 * First hash.
 	 *
-	 * This is used for selecting the chunk.
+	 * F14 uses this to select the chunk.
 	 */
 	size_t first;
 	/**
 	 * Second hash.
+	 *
+	 * F14 uses this as the tag within the chunk and as the probe stride
+	 * when a chunk overflows.
 	 *
 	 * Only the 8 least-significant bits of this are used; the rest are zero
 	 * (the folly implementation insists that storing this as @c size_t
@@ -88,9 +96,6 @@ struct hash_pair {
 	 * from @ref hash_pair::first; see @ref
 	 * hash_pair_from_avalanching_hash() and @ref
 	 * hash_pair_from_non_avalanching_hash().
-	 *
-	 * This is used as a tag within the chunk, and for the probe stride when
-	 * a chunk overflows.
 	 */
 	size_t second;
 };
@@ -111,11 +116,11 @@ struct hash_table;
  *
  * Several functions return an iterator or take one as an argument. This
  * iterator has a reference to an entry, which can be @c NULL to indicate that
- * there is no such entry. It may also contain private bookkeeping which should
- * not be used.
+ * there is no such entry. It also contains private bookkeeping which should not
+ * be used.
  *
- * An iterator remains valid as long as the entry is not deleted and the table
- * is not rehashed.
+ * An iterator remains valid until the table is rehashed or the entry or one
+ * before it is deleted.
  */
 struct hash_table_iterator {
 	/** Pointer to the entry in the hash table. */
@@ -135,6 +140,8 @@ struct hash_pair hash_table_hash(const key_type *key);
  *
  * The new hash table is empty. It must be deinitialized with @ref
  * hash_table_deinit().
+ *
+ * @sa HASH_TABLE_INIT
  */
 void hash_table_init(struct hash_table *table);
 
@@ -164,6 +171,13 @@ bool hash_table_empty(struct hash_table *table);
 size_t hash_table_size(struct hash_table *table);
 
 /**
+ * Maximum possible number of entries in a @ref hash_table.
+ *
+ * Attempts to increase the size or capacity beyond this will fail.
+ */
+const size_t hash_table_max_size;
+
+/**
  * Delete all entries in a @ref hash_table.
  *
  * This does not necessarily free memory used by the hash table.
@@ -173,8 +187,8 @@ void hash_table_clear(struct hash_table *table);
 /**
  * Reserve entries in a @ref hash_table.
  *
- * This allocates space up front to ensure that the table will not be rehashed
- * until the table contains the given number of entries.
+ * This allocates space up front and rehashes the table to ensure that it will
+ * not be rehashed until it contains the given number of entries.
  *
  * @return @c true on success, @c false on failure.
  */
@@ -278,6 +292,14 @@ hash_table_delete_iterator_hashed(struct hash_table *table,
 				  struct hash_pair hp);
 
 /**
+ * Delete an entry in a @ref hash_table.
+ *
+ * @return An iterator pointing to the next entry in the table. See @ref
+ * hash_table_next().
+ */
+bool hash_table_delete_entry(struct hash_table *table, const entry_type *entry);
+
+/**
  * Get an iterator pointing to the first entry in a @ref hash_table.
  *
  * The first entry is arbitrary.
@@ -298,9 +320,146 @@ struct hash_table_iterator hash_table_first(struct hash_table *table);
 struct hash_table_iterator hash_table_next(struct hash_table_iterator it);
 #endif
 
+enum { hash_table_chunk_alignment = max_iconst(alignof(max_align_t), 16) };
+
 static inline size_t hash_table_probe_delta(struct hash_pair hp)
 {
 	return 2 * hp.second + 1;
+}
+
+static const uint8_t hosted_overflow_count_inc = 0x10;
+static const uint8_t hosted_overflow_count_dec = -0x10;
+
+#if SIZE_MAX == 0xffffffffffffffff
+_Static_assert(sizeof(size_t) == sizeof(uint64_t),
+	       "size_t/SIZE_MAX doesn't make sense");
+
+struct hash_table_size_and_chunk_shift {
+	uint64_t packed;
+};
+
+static inline void
+hash_table_size_and_chunk_shift_init(struct hash_table_size_and_chunk_shift *scs)
+{
+	scs->packed = 0;
+}
+
+enum { hash_table_size_shift = 8 };
+static const size_t hash_table_max_size = SIZE_MAX >> hash_table_size_shift;
+
+static inline size_t
+hash_table_size(struct hash_table_size_and_chunk_shift *scs)
+{
+	return scs->packed >> hash_table_size_shift;
+}
+
+static inline uint8_t
+hash_table_chunk_shift(struct hash_table_size_and_chunk_shift *scs)
+{
+	return scs->packed;
+}
+
+static inline void
+hash_table_set_size(struct hash_table_size_and_chunk_shift *scs, size_t size)
+{
+	scs->packed = (size << hash_table_size_shift)
+		      | hash_table_chunk_shift(scs);
+}
+
+static inline void
+hash_table_increment_size(struct hash_table_size_and_chunk_shift *scs)
+{
+	scs->packed += UINT64_C(1) << hash_table_size_shift;
+}
+
+static inline void
+hash_table_decrement_size(struct hash_table_size_and_chunk_shift *scs)
+{
+	scs->packed -= UINT64_C(1) << hash_table_size_shift;
+}
+
+static inline void
+hash_table_set_chunk_count(struct hash_table_size_and_chunk_shift *scs,
+			   size_t chunk_count)
+{
+	scs->packed = (hash_table_size(scs) << hash_table_size_shift)
+		      | ilog2(chunk_count);
+}
+#elif SIZE_MAX == 0xffffffff
+_Static_assert(sizeof(size_t) == sizeof(uint32_t),
+	       "size_t/SIZE_MAX doesn't make sense");
+
+struct hash_table_size_and_chunk_shift {
+	size_t size;
+	uint32_t chunk_shift;
+};
+
+static inline void
+hash_table_size_and_chunk_shift_init(struct hash_table_size_and_chunk_shift *scs)
+{
+	scs->size = 0;
+	scs->chunk_shift = 0;
+}
+
+static const size_t hash_table_max_size = SIZE_MAX;
+
+static inline size_t
+hash_table_size(struct hash_table_size_and_chunk_shift *scs)
+{
+	return scs->size;
+}
+
+static inline uint8_t
+hash_table_chunk_shift(struct hash_table_size_and_chunk_shift *scs)
+{
+	return scs->chunk_shift;
+}
+
+static inline void
+hash_table_set_size(struct hash_table_size_and_chunk_shift *scs, size_t size)
+{
+	scs->size = size;
+}
+
+static inline void
+hash_table_increment_size(struct hash_table_size_and_chunk_shift *scs)
+{
+	scs->size++;
+}
+
+static inline void
+hash_table_decrement_size(struct hash_table_size_and_chunk_shift *scs)
+{
+	scs->size--;
+}
+
+static inline void
+hash_table_set_chunk_count(struct hash_table_size_and_chunk_shift *scs,
+			   size_t chunk_count)
+{
+	scs->chunk_shift = ilog2(chunk_count);
+}
+#else
+#error "unsupported SIZE_MAX"
+#endif
+
+static inline size_t
+hash_table_chunk_count(struct hash_table_size_and_chunk_shift *scs)
+{
+	return (size_t)1 << hash_table_chunk_shift(scs);
+}
+
+static inline size_t
+hash_table_modulo_by_chunk_count(struct hash_table_size_and_chunk_shift *scs,
+				 size_t index)
+{
+	// The folly implementation resorts to an instrinsic because BZHI wasn't
+	// generated reliably by the compiler.
+#ifdef __BMI2__
+	return _bzhi_u64(index, hash_table_chunk_shift(scs));
+#else
+	return index & (((size_t)1 << hash_table_chunk_shift(scs)) - 1);
+#endif
 }
 
 /*
@@ -336,7 +495,6 @@ static inline unsigned int table##_chunk_match(struct table##_chunk *chunk,	\
 					       size_t needle)			\
 {										\
 	unsigned int mask, i;							\
-										\
 	for (mask = 0, i = 0; i < table##_chunk_capacity; i++) {		\
 		if (chunk->tags[i] == needle)					\
 			mask |= 1U << i;					\
@@ -348,7 +506,6 @@ static inline unsigned int table##_chunk_match(struct table##_chunk *chunk,	\
 static inline unsigned int table##_chunk_occupied(struct table##_chunk *chunk)	\
 {										\
 	unsigned int mask, i;							\
-										\
 	for (mask = 0, i = 0; i < table##_chunk_capacity; i++) {		\
 		if (chunk->tags[i])						\
 			mask |= 1U << i;					\
@@ -367,74 +524,72 @@ static inline unsigned int table##_chunk_occupied(struct table##_chunk *chunk)	\
  *
  * @sa DEFINE_HASH_TABLE()
  */
-#define DEFINE_HASH_TABLE_TYPE(table, entry_type, entry_to_key)			\
+#define DEFINE_HASH_TABLE_TYPE(table, entry_type)				\
 typedef typeof(entry_type) table##_entry_type;					\
-typedef typeof(entry_to_key((table##_entry_type *)0)) table##_key_type;		\
-										\
-static inline table##_key_type							\
-table##_entry_to_key(const table##_entry_type *entry)				\
-{										\
-	return entry_to_key(entry);						\
-}										\
 										\
 enum {										\
 	/*									\
-	 * The number of entries per chunk. 14 is the most space efficient, but	\
-	 * if an entry is 4 bytes, 12 entries makes a chunk exactly one cache	\
-	 * line.								\
-	 */									\
-	table##_chunk_capacity = sizeof(table##_entry_type) == 4 ? 12 : 14,	\
-	/* The maximum load factor in terms of entries per chunk. */		\
-	table##_chunk_desired_capacity = table##_chunk_capacity - 2,		\
-	/*									\
-	 * If an entry is 16 bytes, add an extra 16 bytes of padding to make a	\
-	 * chunk exactly four cache lines.					\
-	 */									\
-	table##_chunk_allocated_capacity =					\
-		(table##_chunk_capacity +					\
-		 (sizeof(table##_entry_type) == 16 ? 1 : 0)),			\
-	table##_chunk_full_mask = (1 << table##_chunk_capacity) - 1,		\
-};										\
-										\
-struct table##_chunk {								\
-	uint8_t tags[14];							\
-	/*									\
-	 * If this is the first chunk, the capacity of the table if it is also	\
-	 * the only chunk, and one otherwise. Zero if this is not the first	\
-	 * chunk.								\
-	 */									\
-	uint8_t chunk0_capacity : 4;						\
-	/*									\
-	 * The number of entries in this chunk that overflowed their desired	\
-	 * chunk.								\
+	 * Whether this table uses the vector storage policy.			\
 	 *									\
-	 * Note that this bit field and chunk0_capacity are combined into a	\
-	 * single uint8_t member named "control" in the folly implementation.	\
+	 * The vector policy provides the best performance and memory		\
+	 * efficiency for medium and large entries.				\
 	 */									\
-	uint8_t hosted_overflow_count : 4;					\
-	/*									\
-	 * The number of entries that would have been in this chunk if it were	\
-	 * not full. This value saturates if it hits 255, after which it will	\
-	 * not be updated.							\
-	 */									\
-	uint8_t outbound_overflow_count;					\
-	table##_entry_type entries[table##_chunk_allocated_capacity];		\
-} __attribute__((aligned(16)));							\
-										\
-struct table##_iterator {							\
-	table##_entry_type *entry;						\
-	size_t index;								\
+	table##_vector_policy = sizeof(table##_entry_type) >= 24,		\
 };										\
+										\
+/*										\
+ * The vector storage policy stores 32-bit indices, so it only needs 32-bit	\
+ * sizes.									\
+ */										\
+typedef_if(table##_size_type, table##_vector_policy, uint32_t, size_t);		\
 										\
 struct table {									\
 	struct table##_chunk *chunks;						\
-	/* Number of chunks minus one. */					\
-	size_t chunk_mask;							\
-	/* Number of used values. */						\
-	size_t size;								\
-	/* Cached first iterator. */						\
-	uintptr_t first_packed;							\
+	struct hash_table_size_and_chunk_shift size_and_chunk_shift;		\
+	union {									\
+		/* Allocated together with chunks. */				\
+		table##_entry_type *vector;					\
+		uintptr_t first_packed;						\
+	};									\
 };										\
+struct DEFINE_HASH_TABLE_needs_semicolon
+
+/*
+ * Common search function implementation returning an item iterator. This is
+ * shared by key lookups and index lookups.
+ */
+#define HASH_TABLE_SEARCH_IMPL(table, func, key_type, item_to_key, eq_func)	\
+static struct table##_iterator table##_##func(struct table *table,		\
+					      const key_type *key,		\
+					      struct hash_pair hp)		\
+{										\
+	const size_t delta = hash_table_probe_delta(hp);			\
+	size_t index = hp.first;						\
+	for (size_t tries = 0; tries >> table##_chunk_shift(table) == 0;	\
+	     tries++) {								\
+		struct table##_chunk *chunk =					\
+			&table->chunks[table##_modulo_by_chunk_count(table, index)];	\
+		if (sizeof(*chunk) > 64)					\
+			__builtin_prefetch(&chunk->items[8]);			\
+		unsigned int mask = table##_chunk_match(chunk, hp.second), i;	\
+		for_each_bit(i, mask) {						\
+			table##_item_type *item = &chunk->items[i];		\
+			key_type item_key = item_to_key(table, item);		\
+			if (likely(eq_func(key, &item_key))) {			\
+				return (struct table##_iterator){		\
+					.item = item,				\
+					.index = i,				\
+				};						\
+			}							\
+		}								\
+		if (likely(chunk->outbound_overflow_count == 0))		\
+			break;							\
+		index += delta;							\
+	}									\
+	return (struct table##_iterator){};					\
+}
+
+#define HASH_TABLE_SEARCH_BY_INDEX_ITEM_TO_KEY(table, item) (*(uint32_t *)item)
 
 /**
  * Define the functions for a hash table.
@@ -444,13 +599,123 @@ struct table {									\
  *
  * Unless the type and function definitions must be in separate places, use @ref
  * DEFINE_HASH_TABLE() instead.
- *
- * @sa DEFINE_HASH_TABLE()
  */
-#define DEFINE_HASH_TABLE_FUNCTIONS(table, hash_func, eq_func)			\
+#define DEFINE_HASH_TABLE_FUNCTIONS(table, entry_to_key, hash_func, eq_func)	\
+typedef typeof(entry_to_key((table##_entry_type *)0)) table##_key_type;		\
+										\
+static inline table##_key_type							\
+table##_entry_to_key(const table##_entry_type *entry)				\
+{										\
+	return entry_to_key(entry);						\
+}										\
+										\
+/*										\
+ * Item stored in a chunk.							\
+ *										\
+ * When using the basic policy, the entry is stored directly in the item. When	\
+ * using the vector policy, the item is an index to an out-of-band vector of	\
+ * entries.									\
+ */										\
+typedef_if(table##_item_type, table##_vector_policy, uint32_t,			\
+	   table##_entry_type);							\
+										\
+static inline uint32_t *table##_vector_item(table##_item_type *item)		\
+{										\
+	return (uint32_t *)item;						\
+}										\
+										\
+enum {										\
+	/*									\
+	 * The number of items per chunk. 14 is the most space efficient, but	\
+	 * if an item is 4 bytes, 12 items makes a chunk exactly one cache	\
+	 * line.								\
+	 */									\
+	table##_chunk_capacity = sizeof(table##_item_type) == 4 ? 12 : 14,	\
+	/* The maximum load factor in terms of items per chunk. */		\
+	table##_chunk_desired_capacity = table##_chunk_capacity - 2,		\
+	/*									\
+	 * If an item is 16 bytes, add an extra 16 bytes of padding to make a	\
+	 * chunk exactly four cache lines.					\
+	 */									\
+	table##_chunk_allocated_capacity =					\
+		(table##_chunk_capacity +					\
+		 (sizeof(table##_item_type) == 16 ? 1 : 0)),			\
+	/*									\
+	 * If the chunk capacity is 12, we can use tags 12 and 13 for 16 bits.	\
+	 * Otherwise, we only get 4 from control.				\
+	 */									\
+	table##_capacity_scale_bits = table##_chunk_capacity == 12 ? 16 : 4,	\
+	table##_capacity_scale_shift = table##_capacity_scale_bits - 4,		\
+	table##_chunk_full_mask = (1 << table##_chunk_capacity) - 1,		\
+};										\
+										\
+struct table##_chunk {								\
+	uint8_t tags[14];							\
+	/*									\
+	 * The lower 4 bits are capacity_scale: for the first chunk, this is	\
+	 * the scaling factor between the chunk count and the capacity; for	\
+	 * other chunks, this is zero.						\
+	 *									\
+	 * The upper 4 bits are hosted_overflow_count: the number of entries in	\
+	 * this chunk that overflowed their desired chunk.			\
+	 */									\
+	uint8_t control;							\
+	/*									\
+	 * The number of entries that would have been in this chunk if it were	\
+	 * not full. This value saturates if it hits 255, after which it will	\
+	 * not be updated.							\
+	 */									\
+	uint8_t outbound_overflow_count;					\
+	table##_item_type items[table##_chunk_allocated_capacity];		\
+} __attribute__((__aligned__(hash_table_chunk_alignment)));			\
+										\
+/*										\
+ * This may be a "public iterator" (used by the public interface to refer to an	\
+ * entry) or an "item iterator" (used by certain internal functions to refer to	\
+ * an item regardless of the storage policy).					\
+ */										\
+struct table##_iterator {							\
+	union {									\
+		/* Entry if public iterator. */					\
+		table##_entry_type *entry;					\
+		/*								\
+		 * Item if item iterator. Interchangable with entry when using	\
+		 * the basic storage policy.					\
+		 */								\
+		table##_item_type *item;					\
+	};									\
+	union {									\
+		/*								\
+		 * Lowest entry if public iterator and using the vector storage	\
+		 * policy (i.e., table->vector).				\
+		 */								\
+		table##_entry_type *lowest;					\
+		/*								\
+		 * Index of item in its containing chunk if item iterator or	\
+		 * using the basic storage policy.				\
+		 */								\
+		size_t index;							\
+	};									\
+};										\
+										\
 static inline struct hash_pair table##_hash(const table##_key_type *key)	\
 {										\
 	return hash_func(key);							\
+}										\
+										\
+static inline table##_entry_type *						\
+table##_item_to_entry(struct table *table, table##_item_type *item)		\
+{										\
+	if (table##_vector_policy)						\
+		return &table->vector[*table##_vector_item(item)];		\
+	else									\
+		return (table##_entry_type *)item;				\
+}										\
+										\
+static inline table##_key_type							\
+table##_item_to_key(struct table *table, table##_item_type *item)		\
+{										\
+	return table##_entry_to_key(table##_item_to_entry(table, item));	\
 }										\
 										\
 /*										\
@@ -481,13 +746,10 @@ static inline size_t table##_unpack_index(uintptr_t packed)			\
 										\
 static inline struct table##_iterator table##_unpack_iterator(uintptr_t packed)	\
 {										\
-	struct table##_chunk *chunk;						\
-	size_t index;								\
-										\
-	chunk = table##_unpack_chunk(packed);					\
-	index = table##_unpack_index(packed);					\
-	return (struct table##_iterator){					\
-		.entry = chunk ? &chunk->entries[index] : NULL,			\
+	struct table##_chunk *chunk = table##_unpack_chunk(packed);		\
+	size_t index = table##_unpack_index(packed);				\
+	return (struct table##_iterator) {					\
+		.item = chunk ? &chunk->items[index] : NULL,			\
 		.index = index,							\
 	};									\
 }										\
@@ -495,8 +757,7 @@ static inline struct table##_iterator table##_unpack_iterator(uintptr_t packed)	
 static inline struct table##_chunk *						\
 table##_iterator_chunk(struct table##_iterator it)				\
 {										\
-	return container_of(it.entry - it.index, struct table##_chunk,		\
-			    entries[0]);					\
+	return container_of(it.item - it.index, struct table##_chunk, items[0]);\
 }										\
 										\
 HASH_TABLE_CHUNK_MATCH(table)							\
@@ -505,19 +766,56 @@ HASH_TABLE_CHUNK_OCCUPIED(table)						\
 static inline unsigned int							\
 table##_chunk_first_empty(struct table##_chunk *chunk)				\
 {										\
-	unsigned int mask;							\
-										\
-	mask = table##_chunk_occupied(chunk) ^ table##_chunk_full_mask;		\
+	unsigned int mask =							\
+		table##_chunk_occupied(chunk) ^ table##_chunk_full_mask;	\
 	return mask ? ctz(mask) : (unsigned int)-1;				\
 }										\
 										\
 static inline unsigned int							\
 table##_chunk_last_occupied(struct table##_chunk *chunk)			\
 {										\
-	unsigned int mask;							\
-										\
-	mask = table##_chunk_occupied(chunk);					\
+	unsigned int mask = table##_chunk_occupied(chunk);			\
 	return mask ? fls(mask) - 1 : (unsigned int)-1;				\
+}										\
+										\
+static inline size_t								\
+table##_chunk_hosted_overflow_count(struct table##_chunk *chunk)		\
+{										\
+	return chunk->control >> 4;						\
+}										\
+										\
+static inline void								\
+table##_chunk_adjust_hosted_overflow_count(struct table##_chunk *chunk,		\
+					   size_t op)				\
+{										\
+	chunk->control += op;							\
+}										\
+										\
+static inline size_t table##_chunk_capacity_scale(struct table##_chunk *chunk)	\
+{										\
+	if (table##_capacity_scale_bits == 4) {					\
+		return chunk->control & 0xf;					\
+	} else {								\
+		uint16_t val;							\
+		memcpy(&val, &chunk->tags[12], 2);				\
+		return val;							\
+	}									\
+}										\
+										\
+static inline bool table##_chunk_eof(struct table##_chunk *chunk)		\
+{										\
+	return table##_chunk_capacity_scale(chunk) != 0;			\
+}										\
+										\
+static inline void table##_chunk_mark_eof(struct table##_chunk *chunk,		\
+					  size_t capacity_scale)		\
+{										\
+	if (table##_capacity_scale_bits == 4) {					\
+		chunk->control = capacity_scale;				\
+	} else {								\
+		uint16_t val = capacity_scale;					\
+		memcpy(&chunk->tags[12], &val, 2);				\
+	}									\
 }										\
 										\
 static inline void								\
@@ -534,130 +832,227 @@ table##_chunk_dec_outbound_overflow_count(struct table##_chunk *chunk)		\
 		chunk->outbound_overflow_count--;				\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static void table##_init(struct table *table)					\
 {										\
 	table->chunks = hash_table_empty_chunk;					\
-	table->chunk_mask = 0;							\
-	table->size = 0;							\
-	table->first_packed = 0;						\
+	hash_table_size_and_chunk_shift_init(&table->size_and_chunk_shift);	\
+	if (table##_vector_policy)						\
+		table->vector = NULL;						\
+	else									\
+		table->first_packed = 0;					\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static void table##_deinit(struct table *table)					\
 {										\
 	if (table->chunks != hash_table_empty_chunk)				\
 		free(table->chunks);						\
 }										\
 										\
-__attribute__((unused))								\
-static inline bool table##_empty(struct table *table)				\
-{										\
-	return table->size == 0;						\
-}										\
-										\
-__attribute__((unused))								\
 static inline size_t table##_size(struct table *table)				\
 {										\
-	return table->size;							\
+	return hash_table_size(&table->size_and_chunk_shift);			\
 }										\
 										\
-static table##_entry_type *table##_allocate_tag(struct table *table,		\
-						uint8_t *fullness,		\
-						struct hash_pair hp)		\
+static inline uint8_t table##_chunk_shift(struct table *table)			\
 {										\
-    struct table##_chunk *chunk;						\
-    size_t index = hp.first;							\
-    size_t delta = hash_table_probe_delta(hp);					\
-    uint8_t hosted_inc = 0;							\
-    size_t entry_index;								\
+	return hash_table_chunk_shift(&table->size_and_chunk_shift);		\
+}										\
 										\
+static inline size_t table##_chunk_count(struct table *table)			\
+{										\
+	return hash_table_chunk_count(&table->size_and_chunk_shift);		\
+}										\
+										\
+static inline size_t table##_modulo_by_chunk_count(struct table *table,		\
+						   size_t i)			\
+{										\
+	return hash_table_modulo_by_chunk_count(&table->size_and_chunk_shift,	\
+						i);				\
+}										\
+										\
+static inline void table##_set_size(struct table *table, size_t size)		\
+{										\
+	hash_table_set_size(&table->size_and_chunk_shift, size);		\
+}										\
+										\
+static inline void table##_increment_size(struct table *table)			\
+{										\
+	hash_table_increment_size(&table->size_and_chunk_shift);		\
+}										\
+										\
+static inline void table##_decrement_size(struct table *table)			\
+{										\
+	hash_table_decrement_size(&table->size_and_chunk_shift);		\
+}										\
+										\
+static inline void table##_set_chunk_count(struct table *table,			\
+					   size_t chunk_count)			\
+{										\
+	hash_table_set_chunk_count(&table->size_and_chunk_shift, chunk_count);	\
+}										\
+										\
+__attribute__((__unused__))							\
+static inline bool table##_empty(struct table *table)				\
+{										\
+	return table##_size(table) == 0;					\
+}										\
+										\
+static const size_t table##_max_size =						\
+	min_iconst(min_iconst(PTRDIFF_MAX / sizeof(table##_entry_type),		\
+			      table##_vector_policy ? UINT32_MAX : SIZE_MAX),	\
+		   (table##_size_type)-1);					\
+										\
+static table##_item_type *table##_allocate_tag(struct table *table,		\
+					       uint8_t *fullness,		\
+					       struct hash_pair hp)		\
+{										\
+    const size_t delta = hash_table_probe_delta(hp);				\
+    size_t index = hp.first;							\
+    struct table##_chunk *chunk;						\
+    uint8_t hosted_op = 0;							\
     for (;;) {									\
-	    index &= table->chunk_mask;						\
+	    index = table##_modulo_by_chunk_count(table, index);		\
 	    chunk = &table->chunks[index];					\
 	    if (likely(fullness[index] < table##_chunk_capacity))		\
 		    break;							\
 	    table##_chunk_inc_outbound_overflow_count(chunk);			\
-	    hosted_inc = 1;							\
+	    hosted_op = hosted_overflow_count_inc;				\
 	    index += delta;							\
     }										\
-    entry_index = fullness[index]++;						\
-    chunk->tags[entry_index] = hp.second;					\
-    chunk->hosted_overflow_count += hosted_inc;					\
-    return &chunk->entries[entry_index];					\
+    size_t item_index = fullness[index]++;					\
+    chunk->tags[item_index] = hp.second;					\
+    table##_chunk_adjust_hosted_overflow_count(chunk, hosted_op);		\
+    return &chunk->items[item_index];						\
 }										\
 										\
-static void table##_set_first_packed_after_rehash(struct table *table,		\
-						  uint8_t *fullness)		\
+static size_t table##_compute_capacity(size_t chunk_count, size_t scale)	\
 {										\
-	size_t i;								\
-										\
-	i = table->chunk_mask;							\
-	while (fullness[i] == 0)						\
-		i--;								\
-	table->first_packed = table##_pack_iterator(&table->chunks[i],		\
-						    fullness[i] - 1);		\
+	return (((chunk_count - 1) >> table##_capacity_scale_shift) + 1) * scale;\
 }										\
 										\
-static inline size_t table##_alloc_size(size_t chunk_count, size_t max_size)	\
+static bool									\
+table##_compute_chunk_count_and_scale(size_t capacity,				\
+				      bool continuous_single_chunk_capacity,	\
+				      bool continuous_multi_chunk_capacity,	\
+				      size_t *chunk_count_ret,			\
+				      size_t *scale_ret)			\
+{										\
+	if (capacity <= table##_chunk_capacity) {				\
+		if (!continuous_single_chunk_capacity) {			\
+			if (capacity <= 2)					\
+				capacity = 2;					\
+			else if (capacity <= 6)					\
+				capacity = 6;					\
+			else							\
+				capacity = table##_chunk_capacity;		\
+		}								\
+		*chunk_count_ret = 1;						\
+		*scale_ret = capacity;						\
+	} else {								\
+		size_t min_chunks =						\
+			(capacity - 1) / table##_chunk_desired_capacity + 1;	\
+		size_t chunk_pow = fls(min_chunks - 1);				\
+		if (chunk_pow == 8 * sizeof(size_t))				\
+			return false;						\
+		size_t chunk_count = (size_t)1 << chunk_pow;			\
+		size_t ss = (chunk_pow >= table##_capacity_scale_shift ?	\
+			     chunk_pow - table##_capacity_scale_shift : 0);	\
+		size_t scale =							\
+			continuous_multi_chunk_capacity ?			\
+			((capacity - 1) >> ss) + 1 :				\
+			table##_chunk_desired_capacity << (chunk_pow - ss);	\
+		if (table##_compute_capacity(chunk_count, scale)		\
+		    > table##_max_size)						\
+			return false;						\
+		*chunk_count_ret = chunk_count;					\
+		*scale_ret = scale;						\
+	}									\
+	return true;								\
+}										\
+										\
+static inline size_t table##_chunk_alloc_size(size_t chunk_count,		\
+					      size_t capacity_scale)		\
 {										\
 	/*									\
 	 * Small hash tables are common, so for capacities of less than a full	\
-	 * chunk we only allocate the required entries.				\
+	 * chunk, we only allocate the required items.				\
 	 */									\
 	if (chunk_count == 1) {							\
-		return (offsetof(struct table##_chunk, entries) +		\
-			max_size * sizeof(table##_entry_type));			\
+		return (offsetof(struct table##_chunk, items) +			\
+			table##_compute_capacity(1, capacity_scale) *		\
+			sizeof(table##_item_type));				\
 	} else {								\
 		return chunk_count * sizeof(struct table##_chunk);		\
 	}									\
 }										\
 										\
-static bool table##_rehash(struct table *table, size_t new_chunk_count,		\
-			   size_t new_max_size)					\
+static bool table##_rehash(struct table *table, size_t orig_chunk_count,	\
+			   size_t orig_capacity_scale, size_t new_chunk_count,	\
+			   size_t new_capacity_scale)				\
 {										\
+	size_t chunk_alloc_size = table##_chunk_alloc_size(new_chunk_count,	\
+							   new_capacity_scale);	\
+	size_t alloc_size, entries_offset;					\
+	if (table##_vector_policy) {						\
+		entries_offset = chunk_alloc_size;				\
+		if (alignof(table##_entry_type) > alignof(table##_item_type)) {	\
+			entries_offset = -(-entries_offset &			\
+					   ~(alignof(table##_entry_type) - 1));	\
+		}								\
+		size_t new_capacity =						\
+			table##_compute_capacity(new_chunk_count,		\
+						 new_capacity_scale);		\
+		alloc_size = (entries_offset +					\
+			      new_capacity * sizeof(table##_entry_type));	\
+	} else {								\
+		alloc_size = chunk_alloc_size;					\
+	}									\
+										\
+	void *new_chunks;							\
+	if (posix_memalign(&new_chunks, hash_table_chunk_alignment, alloc_size))\
+		return false;							\
+										\
 	struct table##_chunk *orig_chunks = table->chunks;			\
-	size_t orig_chunk_mask = table->chunk_mask;				\
-	size_t orig_chunk_count = orig_chunk_mask + 1;				\
-	size_t alloc_size = table##_alloc_size(new_chunk_count, new_max_size);	\
+	table->chunks = new_chunks;						\
+	table##_entry_type *orig_entries;					\
+	if (table##_vector_policy) {						\
+		orig_entries = table->vector;					\
+		table->vector = (void *)((char *)new_chunks + entries_offset);	\
+		if (table##_size(table) > 0) {					\
+			memcpy(table->vector, orig_entries,			\
+			       table##_size(table) *				\
+			       sizeof(table##_entry_type));			\
+		}								\
+	}									\
 										\
-	/*									\
-	 * aligned_alloc() requires that the allocation size is aligned to the	\
-	 * allocation alignment.						\
-	 */									\
-	table->chunks = aligned_alloc(16, (alloc_size + 0xf) & ~(size_t)0xf);	\
-	if (!table->chunks)							\
-		goto err;							\
-	memset(table->chunks, 0, alloc_size);					\
-	table->chunks[0].chunk0_capacity =					\
-		new_chunk_count == 1 ? new_max_size : 1;			\
-	table->chunk_mask = new_chunk_count - 1;				\
+	memset(table->chunks, 0, chunk_alloc_size);				\
+	table##_chunk_mark_eof(table->chunks, new_capacity_scale);		\
+	table##_set_chunk_count(table, new_chunk_count);			\
 										\
-	if (table->size == 0) {							\
+	if (table##_size(table) == 0) {						\
 		/* Nothing to do. */						\
 	} else if (orig_chunk_count == 1 && new_chunk_count == 1) {		\
-		struct table##_chunk *src, *dst;				\
+		struct table##_chunk *src = orig_chunks;			\
+		struct table##_chunk *dst = table->chunks;			\
 		size_t src_i = 0, dst_i = 0;					\
-										\
-		src = &orig_chunks[0];						\
-		dst = &table->chunks[0];					\
-		while (dst_i < table->size) {					\
+		while (dst_i < table##_size(table)) {				\
 			if (likely(src->tags[src_i])) {				\
 				dst->tags[dst_i] = src->tags[src_i];		\
-				memcpy(&dst->entries[dst_i],			\
-				       &src->entries[src_i],			\
-				       sizeof(dst->entries[dst_i]));		\
+				memcpy(&dst->items[dst_i], &src->items[src_i],	\
+				       sizeof(dst->items[dst_i]));		\
 				dst_i++;					\
 			}							\
 			src_i++;						\
 		}								\
-		table->first_packed = table##_pack_iterator(dst, dst_i - 1);	\
+		if (!table##_vector_policy) {					\
+			table->first_packed =					\
+				table##_pack_iterator(dst, dst_i - 1);		\
+		}								\
 	} else {								\
-		struct table##_chunk *src;					\
 		uint8_t stack_fullness[256];					\
 		uint8_t *fullness;						\
-		size_t remaining;						\
-										\
 		if (new_chunk_count <= sizeof(stack_fullness)) {		\
 			memset(stack_fullness, 0, sizeof(stack_fullness));	\
 			fullness = stack_fullness;				\
@@ -667,32 +1062,44 @@ static bool table##_rehash(struct table *table, size_t new_chunk_count,		\
 				goto err;					\
 		}								\
 										\
-		src = &orig_chunks[orig_chunk_count - 1];			\
-		remaining = table->size;					\
+		struct table##_chunk *src = &orig_chunks[orig_chunk_count - 1];	\
+		size_t remaining = table##_size(table);				\
 		while (remaining) {						\
-			unsigned int mask, i;					\
-										\
-			mask = table##_chunk_occupied(src);			\
+			unsigned int mask = table##_chunk_occupied(src), i;	\
+			if (table##_vector_policy) {				\
+				unsigned int pmask = mask;			\
+				for_each_bit(i, pmask) {			\
+					table##_item_type *item =		\
+						&src->items[i];			\
+					table##_entry_type *entry =		\
+						table##_item_to_entry(table,	\
+								      item);	\
+					__builtin_prefetch(entry);		\
+				}						\
+			}							\
 			for_each_bit(i, mask) {					\
-				table##_entry_type *src_entry;			\
-				table##_entry_type *dst_entry;			\
-				table##_key_type key;				\
-				struct hash_pair hp;				\
-										\
 				remaining--;					\
-				src_entry = &src->entries[i];			\
-				key = table##_entry_to_key(src_entry);		\
-				hp = table##_hash(&key);			\
-				dst_entry = table##_allocate_tag(table,		\
-								 fullness,	\
-								 hp);		\
-				memcpy(dst_entry, src_entry,			\
-				       sizeof(*dst_entry));			\
+										\
+				table##_item_type *src_item = &src->items[i];	\
+				table##_key_type key =				\
+					table##_item_to_key(table, src_item);	\
+				struct hash_pair hp = table##_hash(&key);	\
+				table##_item_type *dst_item =			\
+					table##_allocate_tag(table, fullness,	\
+							     hp);		\
+				memcpy(dst_item, src_item, sizeof(*dst_item));	\
 			}							\
 			src--;							\
 		}								\
 										\
-		table##_set_first_packed_after_rehash(table, fullness);		\
+		if (!table##_vector_policy) {					\
+			size_t i = table##_chunk_count(table) - 1;		\
+			while (fullness[i] == 0)				\
+				i--;						\
+			table->first_packed =					\
+				table##_pack_iterator(&table->chunks[i],	\
+						      fullness[i] - 1);		\
+		}								\
 										\
 		if (fullness != stack_fullness)					\
 			free(fullness);						\
@@ -705,123 +1112,111 @@ static bool table##_rehash(struct table *table, size_t new_chunk_count,		\
 err:										\
 	free(table->chunks);							\
 	table->chunks = orig_chunks;						\
-	table->chunk_mask = orig_chunk_mask;					\
+	table##_set_chunk_count(table, orig_chunk_count);			\
+	if (table##_vector_policy)						\
+		table->vector = orig_entries;					\
 	return false;								\
 }										\
 										\
-static bool table##_do_reserve(struct table *table, size_t capacity,		\
-			       size_t orig_max_size)				\
+static void table##_do_clear(struct table *table, bool reset)			\
 {										\
-	static const size_t initial_capacity = 2;				\
-	static const size_t half_chunk_capacity =				\
-		(table##_chunk_desired_capacity / 2) & ~(size_t)1;		\
-	size_t new_chunk_count, new_max_size;					\
-										\
-	if (capacity <= half_chunk_capacity) {					\
-		new_chunk_count = 1;						\
-		new_max_size = (capacity < initial_capacity ?			\
-				initial_capacity : half_chunk_capacity);	\
-	} else {								\
-		new_chunk_count = ((capacity - 1) /				\
-				   table##_chunk_desired_capacity + 1);		\
-		new_chunk_count = next_power_of_two(new_chunk_count);		\
-		new_max_size = (new_chunk_count *				\
-				table##_chunk_desired_capacity);		\
-										\
-		if (new_chunk_count >						\
-		    SIZE_MAX / table##_chunk_desired_capacity)			\
-			return false;						\
-	}									\
-										\
-	if (new_max_size != orig_max_size)					\
-		return table##_rehash(table, new_chunk_count, new_max_size);	\
-	else									\
-		return true;							\
-}										\
-										\
-static size_t table##_max_size(struct table *table)				\
-{										\
-	if (table->chunk_mask == 0) {						\
-		return table->chunks[0].chunk0_capacity;			\
-	} else {								\
-		return ((table->chunk_mask + 1) *				\
-			table##_chunk_desired_capacity);			\
-	}									\
-}										\
-										\
-__attribute__((unused))								\
-static bool table##_reserve(struct table *table, size_t capacity)		\
-{										\
-	if (table->size > capacity)						\
-		capacity = table->size;						\
-	return table##_do_reserve(table, capacity, table##_max_size(table));	\
-}										\
-										\
-__attribute__((unused))								\
-static void table##_clear(struct table *table)					\
-{										\
-	size_t chunk_count;							\
-										\
 	if (table->chunks == hash_table_empty_chunk)				\
 		return;								\
 										\
-	/* For large tables, free the chunks. For small tables, zero them. */	\
-	chunk_count = table->chunk_mask + 1;					\
-	if (chunk_count >= 16) {						\
+	size_t chunk_count = table##_chunk_count(table);			\
+	/* Always reset large tables. */					\
+	if (chunk_count >= 16)							\
+		reset = true;							\
+	if (!table##_empty(table)) {						\
+		if (!reset) {							\
+			size_t capacity_scale =					\
+				table##_chunk_capacity_scale(table->chunks);	\
+			memset(table->chunks, 0,				\
+			       table##_chunk_alloc_size(chunk_count,		\
+							capacity_scale));	\
+			table##_chunk_mark_eof(table->chunks, capacity_scale);	\
+		}								\
+		if (!table##_vector_policy)					\
+			table->first_packed = 0;				\
+		table##_set_size(table, 0);					\
+	}									\
+	if (reset) {								\
 		free(table->chunks);						\
 		table->chunks = hash_table_empty_chunk;				\
-		table->chunk_mask = 0;						\
-	} else if (table->size) {						\
-		uint8_t chunk0_capacity;					\
-		size_t alloc_size;						\
-										\
-		chunk0_capacity = table->chunks[0].chunk0_capacity;		\
-		alloc_size = table##_alloc_size(chunk_count,			\
-						table##_max_size(table));	\
-		memset(table->chunks, 0, alloc_size);				\
-		table->chunks[0].chunk0_capacity = chunk0_capacity;		\
+		table##_set_chunk_count(table, 1);				\
+		if (table##_vector_policy)					\
+			table->vector = NULL;					\
 	}									\
-	table->size = 0;							\
-	table->first_packed = 0;						\
 }										\
+										\
+__attribute__((__unused__))							\
+static bool table##_reserve(struct table *table, size_t capacity)		\
+{										\
+	capacity = max(capacity, table##_size(table));				\
+	if (!capacity) {							\
+		table##_do_clear(table, true);					\
+		return true;							\
+	}									\
+										\
+	size_t orig_chunk_count = table##_chunk_count(table);			\
+	size_t orig_capacity_scale = table##_chunk_capacity_scale(table->chunks);\
+	size_t orig_capacity = table##_compute_capacity(orig_chunk_count,	\
+							orig_capacity_scale);	\
+										\
+	/*									\
+	 * To avoid pathological behavior, ignore decreases that aren't at	\
+	 * least a 1/8 decrease, and double for increases that aren't at least	\
+	 * a 1/8 increase.							\
+	 */									\
+	if (capacity <= orig_capacity &&					\
+	    capacity >= orig_capacity - orig_capacity / 8)			\
+		return true;							\
+	bool attempt_exact = !(capacity > orig_capacity &&			\
+			       capacity < orig_capacity + orig_capacity / 8);	\
+										\
+	size_t new_chunk_count;							\
+	size_t new_capacity_scale;						\
+	if (!table##_compute_chunk_count_and_scale(capacity, attempt_exact,	\
+						   table##_vector_policy &&	\
+						   attempt_exact,		\
+						   &new_chunk_count,		\
+						   &new_capacity_scale))	\
+		return false;							\
+	size_t new_capacity = table##_compute_capacity(new_chunk_count,		\
+						       new_capacity_scale);	\
+	if (new_capacity == orig_capacity)					\
+		return true;							\
+	return table##_rehash(table, orig_chunk_count, orig_capacity_scale,	\
+			      new_chunk_count, new_capacity_scale);		\
+}										\
+										\
+__attribute__((__unused__))							\
+static void table##_clear(struct table *table)					\
+{										\
+	table##_do_clear(table, false);						\
+}										\
+										\
+										\
+HASH_TABLE_SEARCH_IMPL(table, search_by_key, table##_key_type,			\
+		       table##_item_to_key, eq_func)				\
+HASH_TABLE_SEARCH_IMPL(table, search_by_index, uint32_t,			\
+		       HASH_TABLE_SEARCH_BY_INDEX_ITEM_TO_KEY, scalar_key_eq)	\
+										\
 										\
 static struct table##_iterator							\
 table##_search_hashed(struct table *table, const table##_key_type *key,		\
 		      struct hash_pair hp)					\
 {										\
-	size_t index = hp.first;						\
-	size_t delta = hash_table_probe_delta(hp);				\
-	size_t tries;								\
-										\
-	for (tries = 0; tries <= table->chunk_mask; tries++) {			\
-		struct table##_chunk *chunk;					\
-		unsigned int mask, i;						\
-										\
-		chunk = &table->chunks[index & table->chunk_mask];		\
-		if (sizeof(*chunk) > 64)					\
-			__builtin_prefetch(&chunk->entries[8]);			\
-		mask = table##_chunk_match(chunk, hp.second);			\
-		for_each_bit(i, mask) {						\
-			table##_entry_type *entry;				\
-			table##_key_type entry_key;				\
-										\
-			entry = &chunk->entries[i];				\
-			entry_key = table##_entry_to_key(entry);		\
-			if (likely(eq_func(key, &entry_key))) {			\
-				return (struct table##_iterator){		\
-					.entry = entry,				\
-					.index = i,				\
-				};						\
-			}							\
-		}								\
-		if (likely(chunk->outbound_overflow_count == 0))		\
-			break;							\
-		index += delta;							\
+	struct table##_iterator it = table##_search_by_key(table, key, hp);	\
+	/* Convert the item iterator to a public iterator. */			\
+	if (table##_vector_policy && it.item) {					\
+		it.entry = table##_item_to_entry(table, it.item);		\
+		it.lowest = table->vector;					\
 	}									\
-	return (struct table##_iterator){};					\
+	return it;								\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static struct table##_iterator							\
 table##_search(struct table *table, const table##_key_type *key)		\
 {										\
@@ -830,14 +1225,26 @@ table##_search(struct table *table, const table##_key_type *key)		\
 										\
 static bool table##_reserve_for_insert(struct table *table)			\
 {										\
-	size_t capacity, max_size;						\
-										\
-	capacity = table->size + 1;						\
-	max_size = table##_max_size(table);					\
-	if (capacity - 1 >= max_size)						\
-		return table##_do_reserve(table, capacity, max_size);		\
-	else									\
+	size_t orig_chunk_count = table##_chunk_count(table);			\
+	size_t orig_capacity_scale = table##_chunk_capacity_scale(table->chunks);\
+	size_t orig_capacity = table##_compute_capacity(orig_chunk_count,	\
+							orig_capacity_scale);	\
+	size_t capacity = table##_size(table) + 1;				\
+	if (capacity <= orig_capacity)						\
 		return true;							\
+	/* Grow by at least orig_capacity * 2^0.5. */				\
+	size_t min_growth = (orig_capacity +					\
+			     (orig_capacity >> 2) +				\
+			     (orig_capacity >> 3) +				\
+			     (orig_capacity >> 5));				\
+	capacity = max(capacity, min_growth);					\
+	size_t new_chunk_count, new_capacity_scale;				\
+	if (!table##_compute_chunk_count_and_scale(capacity, false, false,	\
+						   &new_chunk_count,		\
+						   &new_capacity_scale))	\
+		return false;							\
+	return table##_rehash(table, orig_chunk_count, orig_capacity_scale,	\
+			      new_chunk_count, new_capacity_scale);		\
 }										\
 										\
 static void									\
@@ -845,12 +1252,12 @@ table##_adjust_size_and_first_after_insert(struct table *table,			\
 					   struct table##_chunk *chunk,		\
 					   size_t index)			\
 {										\
-	uintptr_t first_packed;							\
-										\
-	first_packed = table##_pack_iterator(chunk, index);			\
-	if (first_packed > table->first_packed)					\
-		table->first_packed = first_packed;				\
-	table->size++;								\
+	if (!table##_vector_policy) {						\
+		uintptr_t first_packed = table##_pack_iterator(chunk, index);	\
+		if (first_packed > table->first_packed)				\
+			table->first_packed = first_packed;			\
+	}									\
+	table##_increment_size(table);						\
 }										\
 										\
 static int table##_insert_searched(struct table *table,				\
@@ -858,32 +1265,43 @@ static int table##_insert_searched(struct table *table,				\
 				   struct hash_pair hp,				\
 				   struct table##_iterator *it_ret)		\
 {										\
-	size_t index = hp.first;						\
-	struct table##_chunk *chunk;						\
-	unsigned int first_empty;						\
-										\
 	if (!table##_reserve_for_insert(table))					\
 		return -1;							\
 										\
-	chunk = &table->chunks[index & table->chunk_mask];			\
-	first_empty = table##_chunk_first_empty(chunk);				\
+	size_t index = hp.first;						\
+	struct table##_chunk *chunk =						\
+		&table->chunks[table##_modulo_by_chunk_count(table, index)];	\
+	unsigned int first_empty = table##_chunk_first_empty(chunk);		\
 	if (first_empty == (unsigned int)-1) {					\
 		size_t delta = hash_table_probe_delta(hp);			\
-										\
 		do {								\
 			table##_chunk_inc_outbound_overflow_count(chunk);	\
 			index += delta;						\
-			chunk = &table->chunks[index & table->chunk_mask];	\
+			chunk = &table->chunks[table##_modulo_by_chunk_count(table, index)];\
 			first_empty = table##_chunk_first_empty(chunk);		\
 		} while (first_empty == (unsigned int)-1);			\
-		chunk->hosted_overflow_count++;					\
+		table##_chunk_adjust_hosted_overflow_count(chunk,		\
+							   hosted_overflow_count_inc);\
 	}									\
 	chunk->tags[first_empty] = hp.second;					\
-	memcpy(&chunk->entries[first_empty], entry, sizeof(*entry));		\
+	if (table##_vector_policy) {						\
+		*table##_vector_item(&chunk->items[first_empty]) =		\
+			table##_size(table);					\
+		memcpy(&table->vector[table##_size(table)], entry,		\
+		       sizeof(*entry));						\
+	} else {								\
+		memcpy(&chunk->items[first_empty], entry, sizeof(*entry));	\
+	}									\
 	table##_adjust_size_and_first_after_insert(table, chunk, first_empty);	\
 	if (it_ret) {								\
-		it_ret->entry = &chunk->entries[first_empty];			\
-		it_ret->index = first_empty;					\
+		if (table##_vector_policy) {					\
+			it_ret->entry =						\
+				&table->vector[table##_size(table) - 1];	\
+			it_ret->lowest = table->vector;				\
+		} else {							\
+			it_ret->item = &chunk->items[first_empty];		\
+			it_ret->index = first_empty;				\
+		}								\
 	}									\
 	return 1;								\
 }										\
@@ -895,7 +1313,6 @@ static int table##_insert_hashed(struct table *table,				\
 {										\
 	table##_key_type key = table##_entry_to_key(entry);			\
 	struct table##_iterator it = table##_search_hashed(table, &key, hp);	\
-										\
 	if (it.entry) {								\
 		if (it_ret)							\
 			*it_ret = it;						\
@@ -905,13 +1322,12 @@ static int table##_insert_hashed(struct table *table,				\
 	}									\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static int table##_insert(struct table *table,					\
 			  const table##_entry_type *entry,			\
 			  struct table##_iterator *it_ret)			\
 {										\
 	table##_key_type key = table##_entry_to_key(entry);			\
-										\
 	return table##_insert_hashed(table, entry, table##_hash(&key), it_ret);	\
 }										\
 										\
@@ -919,15 +1335,13 @@ static int table##_insert(struct table *table,					\
 static void table##_advance_first_packed(struct table *table)			\
 {										\
 	uintptr_t packed = table->first_packed;					\
-	struct table##_chunk *chunk;						\
-	size_t index;								\
-										\
-	chunk = table##_unpack_chunk(packed);					\
-	index = table##_unpack_index(packed);					\
+	struct table##_chunk *chunk = table##_unpack_chunk(packed);		\
+	size_t index = table##_unpack_index(packed);				\
 	while (index > 0) {							\
 		index--;							\
 		if (chunk->tags[index]) {					\
-			table->first_packed = table##_pack_iterator(chunk, index);\
+			table->first_packed =					\
+				table##_pack_iterator(chunk, index);		\
 			return;							\
 		}								\
 	}									\
@@ -937,12 +1351,11 @@ static void table##_advance_first_packed(struct table *table)			\
 	 * don't need to check if we hit the end.				\
 	 */									\
 	for (;;) {								\
-		unsigned int last;						\
-										\
 		chunk--;							\
-		last = table##_chunk_last_occupied(chunk);			\
+		unsigned int last = table##_chunk_last_occupied(chunk);		\
 		if (last != (unsigned int)-1) {					\
-			table->first_packed = table##_pack_iterator(chunk, last);\
+			table->first_packed =					\
+				table##_pack_iterator(chunk, last);		\
 			return;							\
 		}								\
 	}									\
@@ -953,12 +1366,10 @@ table##_adjust_size_and_first_before_delete(struct table *table,		\
 					    struct table##_chunk *chunk,	\
 					    size_t index)			\
 {										\
-	uintptr_t packed;							\
-										\
-	table->size--;								\
-	packed = table##_pack_iterator(chunk, index);				\
-	if (packed == table->first_packed) {					\
-		if (table->size == 0)						\
+	table##_decrement_size(table);						\
+	if (!table##_vector_policy &&						\
+	    table##_pack_iterator(chunk, index) == table->first_packed) {	\
+		if (table##_empty(table))					\
 			table->first_packed = 0;				\
 		else								\
 			table##_advance_first_packed(table);			\
@@ -970,14 +1381,11 @@ table##_adjust_size_and_first_before_delete(struct table *table,		\
  * in the likely_dead case, and so that the counter can be optimized away in	\
  * the not likely_dead case.							\
  */										\
-__attribute__((always_inline))							\
+__attribute__((__always_inline__))						\
 static inline struct table##_iterator						\
 table##_next_impl(struct table##_iterator it, bool likely_dead)			\
 {										\
-	struct table##_chunk *chunk;						\
-	size_t i;								\
-										\
-	chunk = table##_iterator_chunk(it);					\
+	struct table##_chunk *chunk = table##_iterator_chunk(it);		\
 	while (it.index > 0) {							\
 		it.index--;							\
 		it.entry--;							\
@@ -991,50 +1399,70 @@ table##_next_impl(struct table##_iterator it, bool likely_dead)			\
 	 * table##_delete_iterator() is often ignored), but the compiler needs	\
 	 * some help proving that the following loop terminates.		\
 	 */									\
-	for (i = 1; !likely_dead || i != 0; i++) {				\
-		unsigned int last;						\
-										\
-		if (unlikely(chunk->chunk0_capacity != 0))			\
+	for (size_t i = 1; !likely_dead || i != 0; i++) {			\
+		if (unlikely(table##_chunk_eof(chunk)))				\
 			break;							\
 										\
 		chunk--;							\
-		last = table##_chunk_last_occupied(chunk);			\
+		unsigned int last = table##_chunk_last_occupied(chunk);		\
 		if (!likely_dead)						\
 			__builtin_prefetch(chunk - 1);				\
 		if (likely(last != (unsigned int)-1)) {				\
 			it.index = last;					\
-			it.entry = &chunk->entries[last];			\
+			it.item = &chunk->items[last];				\
 			return it;						\
 		}								\
 	}									\
 	return (struct table##_iterator){};					\
 }										\
 										\
-static void table##_do_delete(struct table *table, struct table##_iterator it,	\
-			      struct hash_pair hp)				\
+static void table##_delete_impl(struct table *table,				\
+				struct table##_iterator item_it,		\
+				struct hash_pair hp)				\
 {										\
-	struct table##_chunk *it_chunk, *chunk;					\
+	struct table##_chunk *it_chunk = table##_iterator_chunk(item_it);	\
+	it_chunk->tags[item_it.index] = 0;					\
 										\
-	it_chunk = table##_iterator_chunk(it);					\
-	it_chunk->tags[it.index] = 0;						\
+	table##_adjust_size_and_first_before_delete(table, it_chunk,		\
+						    item_it.index);		\
 										\
-	table##_adjust_size_and_first_before_delete(table, it_chunk, it.index);	\
-										\
-	if (it_chunk->hosted_overflow_count) {					\
+	if (table##_chunk_hosted_overflow_count(it_chunk)) {			\
+		const size_t delta = hash_table_probe_delta(hp);		\
 		size_t index = hp.first;					\
-		size_t delta = hash_table_probe_delta(hp);			\
-		uint8_t hosted_dec = 0;						\
-										\
+		uint8_t hosted_op = 0;						\
 		for (;;) {							\
-			chunk = &table->chunks[index & table->chunk_mask];	\
+			struct table##_chunk *chunk =				\
+				&table->chunks[table##_modulo_by_chunk_count(table, index)];\
 			if (chunk == it_chunk) {				\
-				chunk->hosted_overflow_count -= hosted_dec;	\
+				table##_chunk_adjust_hosted_overflow_count(chunk,\
+									   hosted_op);\
 				break;						\
 			}							\
 			table##_chunk_dec_outbound_overflow_count(chunk);	\
-			hosted_dec = -1;					\
+			hosted_op = hosted_overflow_count_dec;			\
 			index += delta;						\
 		}								\
+	}									\
+}										\
+										\
+static void table##_vector_delete_impl(struct table *table,			\
+				       struct table##_iterator item_it,		\
+				       struct hash_pair hp)			\
+{										\
+	/* Delete the index from the table. */					\
+	uint32_t index = *table##_vector_item(item_it.item);			\
+	table##_delete_impl(table, item_it, hp);				\
+										\
+	/* Replace it with the last entry and update its index in the table. */	\
+	uint32_t tail_index = table##_size(table);				\
+	if (tail_index != index) {						\
+		table##_entry_type *tail =					\
+			&table->vector[tail_index];				\
+		table##_key_type tail_key = table##_entry_to_key(tail);		\
+		item_it = table##_search_by_index(table, &tail_index,		\
+						  table##_hash(&tail_key));	\
+		*table##_vector_item(item_it.item) = index;			\
+		memcpy(&table->vector[index], tail, sizeof(*tail));		\
 	}									\
 }										\
 										\
@@ -1042,63 +1470,105 @@ static void table##_do_delete(struct table *table, struct table##_iterator it,	\
  * We want this inlined so that the call to table##_next_impl() can be		\
  * optimized away.								\
  */										\
-__attribute__((always_inline))							\
+__attribute__((__always_inline__))						\
 static inline struct table##_iterator						\
 table##_delete_iterator_hashed(struct table *table, struct table##_iterator it,	\
 			       struct hash_pair hp)				\
 {										\
-	table##_do_delete(table, it, hp);					\
-	return table##_next_impl(it, true);					\
+	if (table##_vector_policy) {						\
+		uint32_t index = it.entry - it.lowest;				\
+		struct table##_iterator item_it =				\
+			table##_search_by_index(table, &index, hp);		\
+		table##_vector_delete_impl(table, item_it, hp);			\
+		if (index == 0) {						\
+			return (struct table##_iterator){};			\
+		} else {							\
+			it.entry--;						\
+			return it;						\
+		}								\
+	} else {								\
+		table##_delete_impl(table, it, hp);				\
+		return table##_next_impl(it, true);				\
+	}									\
 }										\
 										\
-__attribute__((always_inline))							\
+__attribute__((__always_inline__, __unused__))					\
 static inline struct table##_iterator						\
 table##_delete_iterator(struct table *table, struct table##_iterator it)	\
 {										\
 	struct hash_pair hp = {};						\
-										\
-	/* We only need the hash if the chunk hosts an overflowed entry. */	\
-	if (table##_iterator_chunk(it)->hosted_overflow_count) {		\
+	/*									\
+	 * The basic policy only needs the hash if the chunk hosts an		\
+	 * overflowed entry.							\
+	 */									\
+	if (table##_vector_policy ||						\
+	    table##_chunk_hosted_overflow_count(table##_iterator_chunk(it))) {	\
 		table##_key_type key = table##_entry_to_key(it.entry);		\
-										\
 		hp = table##_hash(&key);					\
 	}									\
-	table##_do_delete(table, it, hp);					\
-	return table##_next_impl(it, true);					\
+	return table##_delete_iterator_hashed(table, it, hp);			\
 }										\
 										\
 static bool table##_delete_hashed(struct table *table,				\
 				  const table##_key_type *key,			\
 				  struct hash_pair hp)				\
 {										\
-	struct table##_iterator it;						\
-										\
-	it = table##_search_hashed(table, key, hp);				\
-	if (it.entry) {								\
-		table##_do_delete(table, it, hp);				\
-		return true;							\
-	} else {								\
+	struct table##_iterator item_it = table##_search_by_key(table, key, hp);\
+	if (!item_it.item)							\
 		return false;							\
-	}									\
+	if (table##_vector_policy)						\
+		table##_vector_delete_impl(table, item_it, hp);			\
+	else									\
+		table##_delete_impl(table, item_it, hp);			\
+	return true;								\
 }										\
 										\
-__attribute__((unused))								\
 static bool table##_delete(struct table *table, const table##_key_type *key)	\
 {										\
 	return table##_delete_hashed(table, key, table##_hash(key));		\
 }										\
 										\
-__attribute__((unused))								\
-static struct table##_iterator table##_first(struct table *table)		\
+__attribute__((__unused__))							\
+static inline bool table##_delete_entry(struct table *table,			\
+					const table##_entry_type *entry)	\
 {										\
-	return table##_unpack_iterator(table->first_packed);			\
+	const table##_key_type key = table##_entry_to_key(entry);		\
+	return table##_delete(table, &key);					\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
+static struct table##_iterator table##_first(struct table *table)		\
+{										\
+	if (table##_vector_policy) {						\
+		table##_entry_type *entry;					\
+		if (table##_empty(table))					\
+			entry = NULL;						\
+		else								\
+			entry = &table->vector[table##_size(table) - 1];	\
+		return (struct table##_iterator){				\
+			.entry = entry,						\
+			.lowest = table->vector,				\
+		};								\
+	} else {								\
+		return table##_unpack_iterator(table->first_packed);		\
+	}									\
+}										\
+										\
+__attribute__((__unused__))							\
 static struct table##_iterator table##_next(struct table##_iterator it)		\
 {										\
-	return table##_next_impl(it, false);					\
-}
+	if (table##_vector_policy) {						\
+		if (it.entry == it.lowest) {					\
+			return (struct table##_iterator){};			\
+		} else {							\
+			it.entry--;						\
+			return it;						\
+		}								\
+	} else {								\
+		return table##_next_impl(it, false);				\
+	}									\
+}										\
+struct DEFINE_HASH_TABLE_needs_semicolon
 
 /**
  * Define a hash table interface.
@@ -1117,24 +1587,38 @@ static struct table##_iterator table##_next(struct table##_iterator it)		\
  * *</tt> and returns a @c bool.
  */
 #define DEFINE_HASH_TABLE(table, entry_type, entry_to_key, hash_func, eq_func)	\
-DEFINE_HASH_TABLE_TYPE(table, entry_type, entry_to_key)				\
-DEFINE_HASH_TABLE_FUNCTIONS(table, hash_func, eq_func)
-
-#define HASH_MAP_ENTRY_TO_KEY(entry) ((entry)->key)
+DEFINE_HASH_TABLE_TYPE(table, entry_type);					\
+DEFINE_HASH_TABLE_FUNCTIONS(table, entry_to_key, hash_func, eq_func)
 
 /**
  * Define a hash map type without defining its functions.
  *
- * The functions are defined with @ref DEFINE_HASH_TABLE_FUNCTIONS().
+ * The functions are defined with @ref DEFINE_HASH_MAP_FUNCTIONS().
  *
  * @sa DEFINE_HASH_MAP(), DEFINE_HASH_TABLE_TYPE()
  */
-#define DEFINE_HASH_MAP_TYPE(table, key_type, value_type)			\
-struct table##_entry {								\
-	typeof(key_type) key;							\
-	typeof(value_type) value;						\
-};										\
-DEFINE_HASH_TABLE_TYPE(table, struct table##_entry, HASH_MAP_ENTRY_TO_KEY)
+#define DEFINE_HASH_MAP_TYPE(table, key_type, value_type)	\
+struct table##_entry {						\
+	typeof(key_type) key;					\
+	typeof(value_type) value;				\
+};								\
+DEFINE_HASH_TABLE_TYPE(table, struct table##_entry)
+
+#define HASH_MAP_ENTRY_TO_KEY(entry) ((entry)->key)
+
+/**
+ * Define the functions for a hash map.
+ *
+ * The hash map type must have already been defined with @ref
+ * DEFINE_HASH_MAP_TYPE().
+ *
+ * Unless the type and function definitions must be in separate places, use @ref
+ * DEFINE_HASH_MAP() instead.
+ *
+ * @sa DEFINE_HASH_TABLE_FUNCTIONS
+ */
+#define DEFINE_HASH_MAP_FUNCTIONS(table, hash_func, eq_func)			\
+DEFINE_HASH_TABLE_FUNCTIONS(table, HASH_MAP_ENTRY_TO_KEY, hash_func, eq_func)
 
 /**
  * Define a hash map interface.
@@ -1157,20 +1641,33 @@ DEFINE_HASH_TABLE_TYPE(table, struct table##_entry, HASH_MAP_ENTRY_TO_KEY)
  * @param[in] eq_func See @ref DEFINE_HASH_TABLE().
  */
 #define DEFINE_HASH_MAP(table, key_type, value_type, hash_func, eq_func)	\
-DEFINE_HASH_MAP_TYPE(table, key_type, value_type)				\
-DEFINE_HASH_TABLE_FUNCTIONS(table, hash_func, eq_func)
-
-#define HASH_SET_ENTRY_TO_KEY(entry) (*(entry))
+DEFINE_HASH_MAP_TYPE(table, key_type, value_type);				\
+DEFINE_HASH_MAP_FUNCTIONS(table, hash_func, eq_func)
 
 /**
  * Define a hash set type without defining its functions.
  *
- * The functions are defined with @ref DEFINE_HASH_TABLE_FUNCTIONS().
+ * The functions are defined with @ref DEFINE_HASH_SET_FUNCTIONS().
  *
  * @sa DEFINE_HASH_SET(), DEFINE_HASH_TABLE_TYPE()
  */
-#define DEFINE_HASH_SET_TYPE(table, key_type)	\
-	DEFINE_HASH_TABLE_TYPE(table, key_type, HASH_SET_ENTRY_TO_KEY)
+#define DEFINE_HASH_SET_TYPE DEFINE_HASH_TABLE_TYPE
+
+#define HASH_SET_ENTRY_TO_KEY(entry) (*(entry))
+
+/**
+ * Define the functions for a hash set.
+ *
+ * The hash set type must have already been defined with @ref
+ * DEFINE_HASH_SET_TYPE().
+ *
+ * Unless the type and function definitions must be in separate places, use @ref
+ * DEFINE_HASH_SET() instead.
+ *
+ * @sa DEFINE_HASH_TABLE_FUNCTIONS
+ */
+#define DEFINE_HASH_SET_FUNCTIONS(table, hash_func, eq_func)			\
+DEFINE_HASH_TABLE_FUNCTIONS(table, HASH_SET_ENTRY_TO_KEY, hash_func, eq_func)
 
 /**
  * Define a hash set interface.
@@ -1185,24 +1682,52 @@ DEFINE_HASH_TABLE_FUNCTIONS(table, hash_func, eq_func)
  * @param[in] eq_func See @ref DEFINE_HASH_TABLE().
  */
 #define DEFINE_HASH_SET(table, key_type, hash_func, eq_func)	\
-DEFINE_HASH_SET_TYPE(table, key_type)				\
-DEFINE_HASH_TABLE_FUNCTIONS(table, hash_func, eq_func)
+DEFINE_HASH_SET_TYPE(table, key_type);				\
+DEFINE_HASH_SET_FUNCTIONS(table, hash_func, eq_func)
+
+/**
+ * Empty hash table initializer.
+ *
+ * This can be used to initialize a hash table when declaring it.
+ *
+ * @sa hash_table_init()
+ */
+#define HASH_TABLE_INIT { hash_table_empty_chunk }
+
+/**
+ * Define and initialize an empty @ref hash_table of type @p table_type named @p
+ * table that is automatically deinitialized when it goes out of scope.
+ */
+#define HASH_TABLE(table_type, table)				\
+	__attribute__((__cleanup__(table_type##_deinit)))	\
+	struct table_type table = HASH_TABLE_INIT
+
+/**
+ * Iterate over every entry in a @ref hash_table.
+ *
+ * @param[in] table_type Name of hash table type.
+ * @param[out] it Name of iterator variable.
+ * @param[in] table Hash table to iterate over.
+ */
+#define hash_table_for_each(table_type, it, table)				\
+	for (struct table_type##_iterator it = table_type##_first(table);	\
+	     it.entry; it = table_type##_next(it))
 
 /**
  * @defgroup HashTableHelpers Hash table helpers
  *
- * Hash functions and comparators for common key types.
+ * Hash functions and comparators for use with @ref HashTables.
  *
- * F14 requires that hash functions are avalanching, which means that each bit
- * of the hash value has a 50% chance of being the same for different inputs.
- * This is the case for cryptographic hash functions as well as certain
- * non-cryptographic hash functions like CityHash, MurmurHash, SipHash, xxHash,
- * etc.
+ * F14 resolves collisions by double hashing. Rather than using two independent
+ * hash functions, this provides two options for efficiently deriving a pair of
+ * hashes from a single input hash function depending on whether the hash
+ * function is _avalanching_. See @ref hash_pair_from_avalanching_hash() and
+ * @ref hash_pair_from_non_avalanching_hash().
  *
- * Simple hashes like DJBX33A, ad-hoc combinations like <tt>53 * x + y</tt>, and
- * the identity function are not avalanching.
- *
- * These hash functions are all avalanching.
+ * This provides:
+ * * Functions for double hashing common key types: `*_hash_pair()`.
+ * * Primitives for double hashing more complicated key types.
+ * * Equality functions for common key types: `*_eq()`.
  *
  * @{
  */
@@ -1210,8 +1735,16 @@ DEFINE_HASH_TABLE_FUNCTIONS(table, hash_func, eq_func)
 /**
  * Split an avalanching hash into a @ref hash_pair.
  *
- * We construct the second hash from the upper bits of the first hash, which we
- * would otherwise discard when masking to select the chunk.
+ * A hash function is avalanching if each bit of the hash value has a 50% chance
+ * of being the same for different inputs. This is true for cryptographic hash
+ * functions as well as certain non-cryptographic hash functions including
+ * CityHash, MurmurHash, SipHash, and xxHash. Simple hashes like DJBX33A, ad-hoc
+ * combinations like `53 * x + y`, and the identity function are not
+ * avalanching.
+ *
+ * We use the input hash value as the first hash and the upper bits of the input
+ * hash value as the second hash (which would otherwise be discarded when
+ * masking to select the bucket).
  */
 static inline struct hash_pair hash_pair_from_avalanching_hash(size_t hash)
 {
@@ -1221,43 +1754,43 @@ static inline struct hash_pair hash_pair_from_avalanching_hash(size_t hash)
 	};
 }
 
-/** Mix a non-avalanching hash and split it into a @ref hash_pair. */
+/**
+ * Mix a non-avalanching hash and split it into a @ref hash_pair.
+ *
+ * This is architecture-dependent.
+ */
 static inline struct hash_pair hash_pair_from_non_avalanching_hash(size_t hash)
 {
 #if SIZE_MAX == 0xffffffffffffffff
 #ifdef __SSE4_2__
-/* 64-bit with SSE4.2 uses CRC32 */
+	/* 64-bit with SSE4.2 uses CRC32 */
 	size_t c = _mm_crc32_u64(0, hash);
-
 	return (struct hash_pair){
 		.first = hash + c,
 		.second = (c >> 24) | 0x80,
 	};
 #else
-/* 64-bit without SSE4.2 uses a 128-bit multiplication-based mixer */
+	/* 64-bit without SSE4.2 uses a 128-bit multiplication-based mixer */
 	static const uint64_t multiplier = UINT64_C(0xc4ceb9fe1a85ec53);
-	uint64_t hi, lo;
-
-	hi = ((unsigned __int128)hash * multiplier) >> 64;
-	lo = hash * multiplier;
+	uint64_t hi = ((unsigned __int128)hash * multiplier) >> 64;
+	uint64_t lo = hash * multiplier;
 	hash = hi ^ lo;
 	hash *= multiplier;
 	return (struct hash_pair){
 		.first = hash >> 22,
-		.second = (hash >> 15) | 0x80,
+		.second = ((hash >> 15) & 0x7f) | 0x80,
 	};
 #endif
-#elif SIZE_MAX == 0xffffffff
-/* 32-bit with SSE4.2 uses CRC32 */
+#else
 #ifdef __SSE4_2__
+	/* 32-bit with SSE4.2 uses CRC32 */
 	size_t c = _mm_crc32_u32(0, hash);
-
 	return (struct hash_pair){
 		.first = hash + c,
 		.second = (uint8_t)(~(c >> 25)),
 	};
 #else
-/* 32-bit without SSE4.2 uses the 32-bit Murmur2 finalizer */
+	/* 32-bit without SSE4.2 uses the 32-bit Murmur2 finalizer */
 	hash ^= hash >> 13;
 	hash *= 0x5bd1e995;
 	hash ^= hash >> 15;
@@ -1266,20 +1799,16 @@ static inline struct hash_pair hash_pair_from_non_avalanching_hash(size_t hash)
 		.second = (uint8_t)(~(hash >> 25)),
 	};
 #endif
-#else
-#error "unknown SIZE_MAX"
 #endif
 }
 
 #ifdef DOXYGEN
 /**
- * Hash an integral key.
+ * Double hash an integral key.
  *
- * A common hash function for integers is the identity function, which clearly
- * does not avalanche at all. This avalanching hash function can be used for any
- * integer key type.
+ * This can be used for any integer key type.
  */
-struct hash_pair hash_pair_int_type(const T *key);
+struct hash_pair int_key_hash_pair(const T *key);
 #else
 #if SIZE_MAX == 0xffffffffffffffff
 static inline uint64_t hash_128_to_64(unsigned __int128 hash)
@@ -1287,12 +1816,13 @@ static inline uint64_t hash_128_to_64(unsigned __int128 hash)
 	return cityhash_128_to_64(hash, hash >> 64);
 }
 
-#define hash_pair_int_type(key) ({				\
-	__auto_type _key = *(key);				\
-								\
-	sizeof(_key) > sizeof(size_t) ?				\
-	hash_pair_from_avalanching_hash(hash_128_to_64(_key)) :	\
-	hash_pair_from_non_avalanching_hash(_key);		\
+#define int_key_hash_pair(key) ({					\
+	__auto_type _key = *(key);					\
+	_Static_assert(sizeof(_key) <= sizeof(unsigned __int128),	\
+		       "unsupported integer size");			\
+	sizeof(_key) > sizeof(size_t) ?					\
+	hash_pair_from_avalanching_hash(hash_128_to_64(_key)) :		\
+	hash_pair_from_non_avalanching_hash(_key);			\
 })
 #else
 /* Thomas Wang downscaling hash function. */
@@ -1307,9 +1837,10 @@ static inline uint32_t hash_64_to_32(uint64_t hash)
 	return hash;
 }
 
-#define hash_pair_int_type(key) ({				\
+#define int_key_hash_pair(key) ({				\
 	__auto_type _key = *(key);				\
-								\
+	_Static_assert(sizeof(_key) <= sizeof(uint64_t),	\
+		       "unsupported integer size");		\
 	sizeof(_key) > sizeof(size_t) ?				\
 	hash_pair_from_avalanching_hash(hash_64_to_32(_key)) :	\
 	hash_pair_from_non_avalanching_hash(_key);		\
@@ -1319,17 +1850,16 @@ static inline uint32_t hash_64_to_32(uint64_t hash)
 
 #ifdef DOXYGEN
 /**
- * Hash a pointer type.
+ * Double hash a pointer key.
  *
- * This avalanching hash function can be used when the key is a pointer value
- * (rather than the dereferenced value).
+ * This can be used when the key is a pointer value (rather than the
+ * dereferenced value).
  */
-struct hash_pair hash_pair_ptr_type(T * const *key);
+struct hash_pair ptr_key_hash_pair(T * const *key);
 #else
-#define hash_pair_ptr_type(key) ({		\
-	uintptr_t _ptr = (uintptr_t)*key;	\
-						\
-	hash_pair_int_type(&_ptr);		\
+#define ptr_key_hash_pair(key) ({		\
+	uintptr_t _ptr = (uintptr_t)*(key);	\
+	int_key_hash_pair(&_ptr);		\
 })
 #endif
 
@@ -1340,80 +1870,98 @@ struct hash_pair hash_pair_ptr_type(T * const *key);
  * This can be used as the key comparison function for any scalar key type
  * (e.g., integers, floating-point numbers, pointers).
  */
-bool hash_table_scalar_eq(const T *a, const T *b);
+bool scalar_key_eq(const T *a, const T *b);
 #else
-#define hash_table_scalar_eq(a, b) ((bool)(*(a) == *(b)))
+#define scalar_key_eq(a, b) ((bool)(*(a) == *(b)))
 #endif
 
 /**
- * Combine two hash values into one.
+ * Hash two integers.
  *
- * This is useful for compound types (e.g., a 3D point type or an array). The
- * input hash functions need not be avalanching; the output will be avalanching
- * regardless, so the following would be valid:
+ * This is an avalanching hash function. It can be used for any integer types.
+ * The two integers can have different types.
  *
- * <tt>hash_pair_from_avalanching_hash(hash_combine(hash_combine(p->x, p->y), p->z))</tt>
+ * This can be used to combine input hash functions in order to hash records
+ * with multiple fields (e.g., structures or arrays). For example:
+ *
+ * ```
+ * struct point3d {
+ *         int x, y, z;
+ * };
+ *
+ * static struct hash_pair point3d_key_hash_pair(const struct point3d *key)
+ * {
+ *         return hash_pair_from_avalanching_hash(hash_combine(hash_combine(key->x, key->y), key->z));
+ * }
+ * ```
+ *
+ * Note that the input hash functions need not be avalanching; the output will
+ * be avalanching regardless.
  */
-static inline size_t hash_combine(size_t a, size_t b)
-{
-#if SIZE_MAX == 0xffffffffffffffff
-	return cityhash_128_to_64(b, a);
+#ifdef DOXYGEN
+size_t hash_combine(T1 a, T2 b);
 #else
-	return hash_64_to_32(((uint64_t)a << 32) | b);
+#if SIZE_MAX == 0xffffffffffffffff
+#define hash_combine(a, b) ({							\
+	_Static_assert(sizeof(a) <= sizeof(unsigned __int128) &&		\
+		       sizeof(b) <= sizeof(unsigned __int128),			\
+		       "unsupported integer size");				\
+	size_t _a = sizeof(a) > sizeof(size_t) ? hash_128_to_64(a) : (a);	\
+	size_t _b = sizeof(b) > sizeof(size_t) ? hash_128_to_64(b) : (b);	\
+	cityhash_128_to_64(_b, _a);						\
+})
+#else
+#define hash_combine(a, b) ({							\
+	_Static_assert(sizeof(a) <= sizeof(uint64_t) &&				\
+		       sizeof(b) <= sizeof(uint64_t),				\
+		       "unsupported integer size");				\
+	size_t _a = sizeof(a) > sizeof(size_t) ? hash_64_to_32(a) : (a);	\
+	size_t _b = sizeof(b) > sizeof(size_t) ? hash_64_to_32(b) : (b);	\
+	hash_64_to_32(((uint64_t)_a << 32) | _b);				\
+})
 #endif
+#endif
+
+/**
+ * Hash a byte buffer.
+ *
+ * This is an avalanching hash function.
+ */
+static inline size_t hash_bytes(const void *data, size_t len)
+{
+	return cityhash_size_t(data, len);
+}
+
+/**
+ * Hash a null-terminated string.
+ *
+ * This is an avalanching hash function.
+ */
+static inline size_t hash_c_string(const char *s)
+{
+	return hash_bytes(s, strlen(s));
 }
 
 #ifdef DOXYGEN
-/** Hash a null-terminated string. */
-struct hash_pair c_string_hash(const char * const *key);
+/** Double hash a null-terminated string key. */
+struct hash_pair c_string_key_hash_pair(const char * const *key);
 #else
-#define c_string_hash(key) ({					\
-	const char *_key = *(key);				\
-	size_t _hash = cityhash_size_t(_key, strlen(_key));	\
-								\
-	hash_pair_from_avalanching_hash(_hash);			\
-})
+/* This is a macro so that it works with char * and const char * keys. */
+#define c_string_key_hash_pair(key)	\
+	hash_pair_from_avalanching_hash(hash_c_string(*(key)))
 #endif
 
 #ifdef DOXYGEN
 /** Compare two null-terminated string keys for equality. */
-bool c_string_eq(const char * const *a, const char * const *b);
+bool c_string_key_eq(const char * const *a, const char * const *b);
 #else
-#define c_string_eq(a, b) ({			\
-	const char *_a = *(a), *_b = *(b);	\
-						\
-	(bool)(strcmp(_a, _b) == 0);		\
-})
+#define c_string_key_eq(a, b) ((bool)(strcmp(*(a), *(b)) == 0))
 #endif
 
-/** A string with a given length. */
-struct string {
-	/**
-	 * The string, which is not necessarily null-terminated and may have
-	 * embedded null bytes.
-	 */
-	const char *str;
-	/** The length in bytes of the string. */
-	size_t len;
-};
-
-/** Hash a @ref string. */
-static inline struct hash_pair string_hash(const struct string *key)
+/** Double hash a @ref nstring. */
+static inline struct hash_pair nstring_hash_pair(const struct nstring *key)
 {
-	size_t hash = cityhash_size_t(key->str, key->len);
-
-	return hash_pair_from_avalanching_hash(hash);
-}
-
-/** Compare two @ref string keys for equality. */
-static inline bool string_eq(const struct string *a, const struct string *b)
-{
-	/*
-	 * len == 0 is a special case because memcmp(NULL, NULL, 0) is
-	 * technically undefined.
-	 */
-	return (a->len == b->len &&
-		(a->len == 0 || memcmp(a->str, b->str, a->len) == 0));
+	return hash_pair_from_avalanching_hash(hash_bytes(key->str, key->len));
 }
 
 /** @} */

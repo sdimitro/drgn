@@ -1,5 +1,5 @@
-// Copyright 2018-2019 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -13,7 +13,9 @@
 #define DRGN_STRING_BUILDER_H
 
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 /**
@@ -40,47 +42,83 @@ struct string_builder {
 	/**
 	 * Current string buffer.
 	 *
-	 * This may be reallocated when appending. It must be freed with @c
-	 * free() when it will no longer be used. It should be initialized to @c
-	 * NULL.
+	 * This may be reallocated when appending.
 	 */
 	char *str;
-	/**
-	 * Length of @c str.
-	 *
-	 * It should be initialized to zero.
-	 */
+	/** Length of @c str. */
 	size_t len;
-	/**
-	 * Allocated size of @c str.
-	 *
-	 * It should be initialized to zero.
-	 */
+	/** Allocated size of @c str. */
 	size_t capacity;
 };
 
+/** String builder initializer. */
+#define STRING_BUILDER_INIT { 0 }
+
+/** Free memory allocated by a @ref string_builder. */
+static inline void string_builder_deinit(struct string_builder *sb)
+{
+	free(sb->str);
+}
+
 /**
- * Null-terminate and return a string from a @ref string_builder.
+ * Define and initialize a @ref string_builder named @p sb that is automatically
+ * deinitialized when it goes out of scope.
+ */
+#define STRING_BUILDER(sb)					\
+	__attribute__((__cleanup__(string_builder_deinit)))	\
+	struct string_builder sb = STRING_BUILDER_INIT
+
+/**
+ * Steal the string buffer from a @ref string_builder.
  *
- * On success, the string builder must be reinitialized before being reused.
+ * The string builder can no longer be used except to be passed to @ref
+ * string_builder_deinit(), which will do nothing.
  *
- * @param[out] ret Returned string.
+ * @return String buffer. This must be freed with @c free().
+ */
+static inline char *string_builder_steal(struct string_builder *sb)
+{
+	char *str = sb->str;
+	sb->str = NULL;
+	return str;
+}
+
+/**
+ * Null-terminate a @ref string_builder.
+ *
+ * This appends a null character without incrementing @ref string_builder::len.
+ *
  * @return @c true on success, @c false on error (if we couldn't allocate
  * memory).
  */
-bool string_builder_finalize(struct string_builder *sb, char **ret);
+bool string_builder_null_terminate(struct string_builder *sb);
 
 /**
- * Resize the buffer of a @ref string_builder.
+ * Resize the buffer of a @ref string_builder to a given capacity.
  *
  * On success, the allocated size of the string buffer is at least @p capacity.
  *
  * @param[in] sb String builder.
- * @param[in] capacity New minimum size of the string buffer.
+ * @param[in] capacity New minimum allocated size of the string buffer.
  * @return @c true on success, @c false on error (if we couldn't allocate
  * memory).
  */
 bool string_builder_reserve(struct string_builder *sb, size_t capacity);
+
+/**
+ * Resize the buffer of a @ref string_builder to accomodate appending
+ * characters.
+ *
+ * On success, the allocated size of the string buffer is at least
+ * `sb->len + n`. This will also allocate extra space so that appends have
+ * amortized constant time complexity.
+ *
+ * @param[in] sb String builder.
+ * @param[in] n Minimum number of additional characters to reserve.
+ * @return @c true on success, @c false on error (if we couldn't allocate
+ * memory).
+ */
+bool string_builder_reserve_for_append(struct string_builder *sb, size_t n);
 
 /**
  * Append a character to a @ref string_builder.
@@ -128,7 +166,7 @@ static inline bool string_builder_append(struct string_builder *sb,
  * memory).
  */
 bool string_builder_appendf(struct string_builder *sb, const char *format, ...)
-	__attribute__((format(printf, 2, 3)));
+	__attribute__((__format__(__printf__, 2, 3)));
 
 /**
  * Append a string to a @ref string_builder from vprintf-style arguments.

@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Networking
@@ -8,38 +9,366 @@ The ``drgn.helpers.linux.net`` module provides helpers for working with the
 Linux kernel networking subsystem.
 """
 
-from drgn.helpers.linux.list_nulls import hlist_nulls_for_each_entry
-from drgn.helpers.linux.tcp import sk_tcpstate
+import ipaddress
+import operator
+from typing import Iterator, List, Optional, Union
 
+from drgn import NULL, IntegerLike, Object, Program, Type, cast, container_of, sizeof
+from drgn.helpers.common.prog import (
+    takes_object_or_program_or_default,
+    takes_program_or_default,
+)
+from drgn.helpers.linux.fs import fget
+from drgn.helpers.linux.list import hlist_for_each_entry, list_for_each_entry
+from drgn.helpers.linux.list_nulls import hlist_nulls_for_each_entry
 
 __all__ = (
+    "SOCK_INODE",
+    "SOCKET_I",
+    "for_each_net",
+    "for_each_netdev",
+    "get_net_ns_by_inode",
+    "get_net_ns_by_fd",
+    "netdev_for_each_tx_queue",
+    "netdev_get_by_index",
+    "netdev_get_by_name",
+    "netdev_name",
+    "netdev_priv",
     "sk_fullsock",
     "sk_nulls_for_each",
+    "skb_shinfo",
+    "is_pp_page",
+    "netdev_ipv4_addrs",
+    "netdev_ipv6_addrs",
 )
 
 
-def sk_fullsock(sk):
-    """
-    .. c:function:: bool sk_fullsock(struct sock *sk)
+_S_IFMT = 0o170000
+_S_IFSOCK = 0o140000
 
+
+def SOCKET_I(inode: Object) -> Object:
+    """
+    Get a socket from an inode referring to the socket.
+
+    :param inode: ``struct inode *``
+    :return: ``struct socket *``
+    :raises ValueError: If *inode* does not refer to a socket
+    """
+    if inode.i_mode & _S_IFMT != _S_IFSOCK:
+        raise ValueError("not a socket inode")
+
+    return container_of(inode, "struct socket_alloc", "vfs_inode").socket.address_of_()
+
+
+def SOCK_INODE(sock: Object) -> Object:
+    """
+    Get the inode of a socket.
+
+    :param sock: ``struct socket *``
+    :return: ``struct inode *``
+    """
+    return container_of(sock, "struct socket_alloc", "socket").vfs_inode.address_of_()
+
+
+@takes_program_or_default
+def for_each_net(prog: Program) -> Iterator[Object]:
+    """
+    Iterate over all network namespaces in the system.
+
+    :return: Iterator of ``struct net *`` objects.
+    """
+    return list_for_each_entry(
+        "struct net", prog["net_namespace_list"].address_of_(), "list"
+    )
+
+
+_CLONE_NEWNET = 0x40000000
+
+
+def get_net_ns_by_inode(inode: Object) -> Object:
+    """
+    Get a network namespace from a network namespace NSFS inode, e.g.
+    ``/proc/$PID/ns/net`` or ``/var/run/netns/$NAME``.
+
+    :param inode: ``struct inode *``
+    :return: ``struct net *``
+    :raises ValueError: if *inode* is not a network namespace inode
+    """
+    if inode.i_fop != inode.prog_["ns_file_operations"].address_of_():
+        raise ValueError("not a namespace inode")
+
+    ns = cast("struct ns_common *", inode.i_private)
+    # Linux kernel commit 4055526d3574 ("ns: move ns type into struct
+    # ns_common") (in v6.18) moved the type from struct proc_ns_operations to
+    # struct ns_common.
+    try:
+        ns_type = ns.ns_type
+    except AttributeError:
+        ns_type = ns.ops.type
+    if ns_type != _CLONE_NEWNET:
+        raise ValueError("not a network namespace inode")
+
+    return container_of(ns, "struct net", "ns")
+
+
+def get_net_ns_by_fd(task: Object, fd: IntegerLike) -> Object:
+    """
+    Get a network namespace from a task and a file descriptor referring to a
+    network namespace NSFS inode, e.g. ``/proc/$PID/ns/net`` or
+    ``/var/run/netns/$NAME``.
+
+    :param task: ``struct task_struct *``
+    :param fd: File descriptor.
+    :return: ``struct net *``
+    :raises ValueError: If *fd* does not refer to a network namespace inode
+    """
+    return get_net_ns_by_inode(fget(task, fd).f_inode)
+
+
+def netdev_for_each_tx_queue(dev: Object) -> Iterator[Object]:
+    """
+    Iterate over all TX queues for a network device.
+
+    :param dev: ``struct net_device *``
+    :return: Iterator of ``struct netdev_queue *`` objects.
+    """
+    for i in range(dev.num_tx_queues):
+        yield dev._tx + i
+
+
+@takes_object_or_program_or_default
+def for_each_netdev(prog: Program, net: Optional[Object]) -> Iterator[Object]:
+    """
+    Iterate over all network devices in a namespace.
+
+    :param net: ``struct net *``. Defaults to the initial network namespace if
+        given a :class:`~drgn.Program` or :ref:`omitted <default-program>`.
+    :return: Iterator of ``struct net_device *`` objects.
+    """
+    if net is None:
+        net = prog["init_net"]
+    return list_for_each_entry(
+        "struct net_device", net.dev_base_head.address_of_(), "dev_list"
+    )
+
+
+def netdev_name(dev: Object) -> bytes:
+    """
+    Get the name of a network device.
+
+    >>> netdev_name(dev)
+    b'lo'
+
+    :param dev: ``struct net_device *``
+    """
+    return dev.name.string_()
+
+
+_NETDEV_HASHBITS = 8
+_NETDEV_HASHENTRIES = 1 << _NETDEV_HASHBITS
+
+
+@takes_object_or_program_or_default
+def netdev_get_by_index(
+    prog: Program, net: Optional[Object], ifindex: IntegerLike
+) -> Object:
+    """
+    Get the network device with the given interface index number.
+
+    :param net: ``struct net *``. Defaults to the initial network namespace if
+        given a :class:`~drgn.Program` or :ref:`omitted <default-program>`.
+    :param ifindex: Network interface index number.
+    :return: ``struct net_device *`` (``NULL`` if not found)
+    """
+    if net is None:
+        net = prog["init_net"]
+    ifindex = operator.index(ifindex)
+
+    head = net.dev_index_head[ifindex & (_NETDEV_HASHENTRIES - 1)]
+    for netdev in hlist_for_each_entry("struct net_device", head, "index_hlist"):
+        if netdev.ifindex.value_() == ifindex:
+            return netdev
+
+    return NULL(prog, "struct net_device *")
+
+
+@takes_object_or_program_or_default
+def netdev_get_by_name(
+    prog: Program, net: Optional[Object], name: Union[str, bytes]
+) -> Object:
+    """
+    Get the network device with the given interface name.
+
+    :param net: ``struct net *``. Defaults to the initial network namespace if
+        given a :class:`~drgn.Program` or :ref:`omitted <default-program>`.
+    :param name: Network interface name.
+    :return: ``struct net_device *`` (``NULL`` if not found)
+    """
+    if net is None:
+        net = prog["init_net"]
+    if isinstance(name, str):
+        name = name.encode()
+
+    for dev in for_each_netdev(net):
+        if netdev_name(dev) == name:
+            return dev
+    return NULL(prog, "struct net_device *")
+
+
+def netdev_priv(dev: Object, type: Union[str, Type] = "void") -> Object:
+    """
+    Return the private data of a network device.
+
+    >>> dev = netdev_get_by_name("wlp0s20f3")
+    >>> netdev_priv(dev)
+    (void *)0xffff9419c9dec9c0
+    >>> netdev_priv(dev, "struct ieee80211_sub_if_data")
+    *(struct ieee80211_sub_if_data *)0xffff9419c9dec9c0 = {
+        ...
+    }
+
+    :param dev: ``struct net_device *``
+    :param type: Type of private data.
+    :return: ``type *``
+    """
+    prog = dev.prog_
+    try:
+        offset = prog.cache["net_device_aligned_size"]
+    except KeyError:
+        # 31 is NETDEV_ALIGN - 1
+        offset = (sizeof(prog.type("struct net_device")) + 31) & ~31
+        prog.cache["net_device_aligned_size"] = offset
+    return Object(prog, prog.pointer_type(prog.type(type)), dev.value_() + offset)
+
+
+def sk_fullsock(sk: Object) -> bool:
+    """
     Check whether a socket is a full socket, i.e., not a time-wait or request
     socket.
+
+    :param sk: ``struct sock *``
     """
     prog = sk.prog_
     state = sk.__sk_common.skc_state.value_()
     return state != prog["TCP_SYN_RECV"] and state != prog["TCP_TIME_WAIT"]
 
 
-def sk_nulls_for_each(head):
+def sk_nulls_for_each(head: Object) -> Iterator[Object]:
     """
-    .. c:function:: sk_nulls_for_each(struct hlist_nulls_head *head)
-
     Iterate over all the entries in a nulls hash list of sockets specified by
     ``struct hlist_nulls_head`` head.
 
-    :return: Iterator of ``struct sock`` objects.
+    :param head: ``struct hlist_nulls_head *``
+    :return: Iterator of ``struct sock *`` objects.
     """
-    for sk in hlist_nulls_for_each_entry(
-        "struct sock", head, "__sk_common.skc_nulls_node"
-    ):
-        yield sk
+    return hlist_nulls_for_each_entry("struct sock", head, "__sk_common.skc_nulls_node")
+
+
+def skb_shinfo(skb: Object) -> Object:
+    """
+    Get the shared info for a socket buffer.
+
+    :param skb: ``struct sk_buff *``
+    :return: ``struct skb_shared_info *``
+    """
+    prog = skb.prog_
+    try:
+        NET_SKBUFF_DATA_USES_OFFSET = prog.cache["NET_SKBUFF_DATA_USES_OFFSET"]
+    except KeyError:
+        NET_SKBUFF_DATA_USES_OFFSET = sizeof(prog.type("long")) > 4
+        prog.cache["NET_SKBUFF_DATA_USES_OFFSET"] = NET_SKBUFF_DATA_USES_OFFSET
+    if NET_SKBUFF_DATA_USES_OFFSET:
+        return cast("struct skb_shared_info *", skb.head + skb.end)
+    else:
+        return cast("struct skb_shared_info *", skb.end)
+
+
+def _poison_pointer_delta(prog: Program) -> int:
+    # The value of POISON_POINTER_DELTA depends on
+    # CONFIG_ILLEGAL_POINTER_VALUE, which varies by architecture and kernel
+    # version. To avoid hard-coding values, derive the value from
+    # TIMER_ENTRY_STATIC, which we can find in any statically-defined timer.
+    # This still requires hard-coding an offset, but that offset is the same on
+    # all architectures and kernel versions since Linux kernel commit
+    # b8a0255db958 ("include/linux/poison.h: use POISON_POINTER_DELTA for
+    # poison pointers") (in v4.5).
+    try:
+        return prog.cache["POISON_POINTER_DELTA"]
+    except KeyError:
+        pass
+    TIMER_ENTRY_STATIC = prog["poll_spurious_irq_timer"].entry.next.value_()
+    POISON_POINTER_DELTA = TIMER_ENTRY_STATIC - 0x300
+    prog.cache["POISON_POINTER_DELTA"] = POISON_POINTER_DELTA
+    return POISON_POINTER_DELTA
+
+
+def is_pp_page(page: Object) -> bool:
+    """
+    Check if given page is a page_pool page.
+
+    :param page: ``struct page *``
+    :raises NotImplementedError: If page_pool pages cannot be identified on
+        this kernel. This is the case from Linux 4.18 (when page_pool was
+        introduced) up to and including Linux 5.13.
+    """
+    PP_SIGNATURE = _poison_pointer_delta(page.prog_) + 0x40
+    PP_MAGIC_MASK = ~0x3
+
+    try:
+        return (page.pp_magic & PP_MAGIC_MASK) == PP_SIGNATURE
+    except AttributeError:
+        pass
+    # Before Linux kernel commit ff7d6b27f894 ("page_pool: refurbish version of
+    # page_pool code") (in v4.18), page_pool didn't exist.
+    try:
+        page.prog_.type("struct page_pool")
+    except LookupError:
+        return False
+    # Between that and Linux kernel commit c07aea3ef4d4 ("mm: add a signature
+    # in struct page") (in v5.14), there is no way to identify page_pool pages.
+    raise NotImplementedError("page_pool pages cannot be identified before Linux 5.14")
+
+
+def netdev_ipv4_addrs(dev: Object) -> List[ipaddress.IPv4Address]:
+    """
+    Get the list of IPV4 addresses associated with a network device.
+
+    :param dev: ``struct net_device *``
+    """
+    ips = []
+    prog = dev.prog_
+    ip_ptr = dev.ip_ptr.read_()
+    if ip_ptr:
+        ifa = ip_ptr.ifa_list.read_()
+        while ifa:
+            addr_bytes = prog.read(
+                ifa.ifa_address.address_,  # type: ignore[arg-type]  # address can't be None.
+                4,
+            )
+            ips.append(ipaddress.IPv4Address(addr_bytes))
+            ifa = ifa.ifa_next.read_()
+    return ips
+
+
+def netdev_ipv6_addrs(dev: Object) -> List[ipaddress.IPv6Address]:
+    """
+    Get the list of IPV6 addresses associated with a network device.
+
+    :param dev: ``struct net_device *``
+    """
+    ips = []
+    prog = dev.prog_
+    ip_ptr = dev.ip6_ptr.read_()
+    if ip_ptr:
+        for addr in list_for_each_entry(
+            "struct inet6_ifaddr",
+            dev.ip6_ptr.addr_list.address_of_(),
+            "if_list",
+        ):
+            addr_bytes = prog.read(
+                addr.addr.in6_u.u6_addr8.address_,  # type: ignore[arg-type]  # address can't be None.
+                16,
+            )
+            ips.append(ipaddress.IPv6Address(addr_bytes))
+    return ips

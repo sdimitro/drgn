@@ -1,5 +1,5 @@
-// Copyright 2018-2019 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -30,7 +30,6 @@
  * @{
  */
 
-struct drgn_error;
 struct drgn_lexer;
 struct drgn_token;
 
@@ -58,7 +57,7 @@ struct drgn_token {
 	size_t len;
 };
 
-DEFINE_VECTOR_TYPE(drgn_token_vector, struct drgn_token)
+DEFINE_VECTOR_TYPE(drgn_token_vector, struct drgn_token);
 
 /**
  * Lexer instance.
@@ -77,14 +76,13 @@ struct drgn_lexer {
 };
 
 /**
- * Initialize a @ref drgn_lexer from a lexer function and a string.
+ * @ref drgn_lexer initializer.
  *
- * @param[in] lexer Lexer to initialize.
- * @param[in] func Lexer function.
+ * @param[in] lexer_func Lexer function.
  * @param[in] str String to lex.
  */
-void drgn_lexer_init(struct drgn_lexer *lexer, drgn_lexer_func func,
-		     const char *str);
+#define DRGN_LEXER_INIT(lexer_func, str)				\
+	{ .func = (lexer_func), .p = (str), .stack = VECTOR_INIT }
 
 /**
  * Free memory allocated by a @ref drgn_lexer.
@@ -92,6 +90,17 @@ void drgn_lexer_init(struct drgn_lexer *lexer, drgn_lexer_func func,
  * @param[in] lexer Lexer to deinitialize.
  */
 void drgn_lexer_deinit(struct drgn_lexer *lexer);
+
+/**
+ * Define and initialize a @ref drgn_lexer named @p lexer that is automatically
+ * deinitialized when it goes out of scope.
+ *
+ * @param[in] lexer_func Lexer function.
+ * @param[in] str String to lex.
+ */
+#define DRGN_LEXER(lexer, lexer_func, str)				\
+	__attribute__((__cleanup__(drgn_lexer_deinit)))			\
+	struct drgn_lexer lexer = DRGN_LEXER_INIT(lexer_func, str)
 
 /**
  * Return the next token from a @ref drgn_lexer.

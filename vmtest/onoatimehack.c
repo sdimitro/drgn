@@ -1,5 +1,5 @@
-// Copyright 2020 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /*
  * QEMU's 9pfs server passes through O_NOATIME from the client. If the server
@@ -8,6 +8,9 @@
  * Overlayfs uses O_NOATIME, so overlayfs on top of 9pfs doesn't work. We work
  * around this with this LD_PRELOAD hack to remove O_NOATIME from open() and
  * fcntl() calls.
+ *
+ * As of QEMU 5.1.0, the 9pfs server falls back to removing O_NOATIME, so this
+ * isn't necessary on newer versions.
  */
 
 #include <dlfcn.h>

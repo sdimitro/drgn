@@ -1,10 +1,10 @@
-// Copyright 2018-2019 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include "drgnpy.h"
 #include "../error.h"
 
-int FaultError_init(PyObject *self, PyObject *args, PyObject *kwds)
+static int FaultError_init(PyObject *self, PyObject *args, PyObject *kwds)
 {
 	static char *keywords[] = {"message", "address", NULL};
 	PyObject *address, *message;
@@ -21,34 +21,26 @@ int FaultError_init(PyObject *self, PyObject *args, PyObject *kwds)
 
 static PyObject *FaultError_str(PyObject *self)
 {
-	PyObject *message, *address, *args, *fmt, *ret = NULL;
-
-	message = PyObject_GetAttrString(self, "message");
+	_cleanup_pydecref_ PyObject *message =
+		PyObject_GetAttrString(self, "message");
 	if (!message)
 		return NULL;
 
-	address = PyObject_GetAttrString(self, "address");
+	_cleanup_pydecref_ PyObject *address =
+		PyObject_GetAttrString(self, "address");
 	if (!address)
-		goto out_message;
+		return NULL;
 
-	args = Py_BuildValue("OO", message, address);
+	_cleanup_pydecref_ PyObject *args =
+		Py_BuildValue("OO", message, address);
 	if (!args)
-		goto out_address;
+		return NULL;
 
-	fmt = PyUnicode_FromString("%s: %#x");
+	_cleanup_pydecref_ PyObject *fmt = PyUnicode_FromString("%s: %#x");
 	if (!fmt)
-		goto out_args;
+		return NULL;
 
-	ret = PyUnicode_Format(fmt, args);
-
-	Py_DECREF(fmt);
-out_args:
-	Py_DECREF(args);
-out_address:
-	Py_DECREF(address);
-out_message:
-	Py_DECREF(message);
-	return ret;
+	return PyUnicode_Format(fmt, args);
 }
 
 PyTypeObject FaultError_type = {
@@ -61,95 +53,122 @@ PyTypeObject FaultError_type = {
 	.tp_init = (initproc)FaultError_init,
 };
 
+static int ObjectNotFoundError_init(PyObject *self, PyObject *args,
+				    PyObject *kwds)
+{
+	if (((PyTypeObject *)PyExc_BaseException)->tp_init(self, args, NULL) < 0)
+		return -1;
+
+	static char *keywords[] = {"name", NULL};
+	_cleanup_pydecref_ PyObject *empty_tuple = PyTuple_New(0);
+	if (!empty_tuple)
+		return -1;
+	PyObject *name;
+	if (!PyArg_ParseTupleAndKeywords(empty_tuple, kwds,
+					 "|$O:ObjectNotFoundError", keywords,
+					 &name))
+		return -1;
+
+	return PyObject_SetAttrString(self, "name", name);
+}
+
+PyTypeObject ObjectNotFoundError_type = {
+	PyVarObject_HEAD_INIT(NULL, 0)
+	.tp_name = "_drgn.ObjectNotFoundError",
+	.tp_basicsize = sizeof(PyBaseExceptionObject),
+	.tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+	.tp_doc = drgn_ObjectNotFoundError_DOC,
+	.tp_init = (initproc)ObjectNotFoundError_init,
+};
+
 static struct drgn_error drgn_error_python = {
 	.code = DRGN_ERROR_OTHER,
 	.message = "error in Python callback",
 };
 
-_Py_IDENTIFIER(drgn_in_python);
+static _Thread_local bool drgn_in_python = false;
 
 bool set_drgn_in_python(void)
 {
-	PyObject *dict, *key, *value;
-
-	dict = PyThreadState_GetDict();
-	if (!dict)
+	if (drgn_in_python)
 		return false;
-	key = _PyUnicode_FromId(&PyId_drgn_in_python);
-	if (!key) {
-		PyErr_Clear();
-		return false;
-	}
-	value = PyDict_GetItemWithError(dict, key);
-	if (value == Py_True)
-		return false;
-	if ((!value && PyErr_Occurred()) ||
-	    PyDict_SetItem(dict, key, Py_True) == -1) {
-		PyErr_Clear();
-		return false;
-	}
+	drgn_in_python = true;
 	return true;
 }
 
 void clear_drgn_in_python(void)
 {
-	PyObject *exc_type, *exc_value, *exc_traceback;
-	PyObject *dict;
+	drgn_in_python = false;
+}
 
-	PyErr_Fetch(&exc_type, &exc_value, &exc_traceback);
-	dict = PyThreadState_GetDict();
-	if (dict)
-		_PyDict_SetItemId(dict, &PyId_drgn_in_python, Py_False);
-	PyErr_Restore(exc_type, exc_value, exc_traceback);
+static struct drgn_error *drgn_fault_error_from_python(PyObject *exc_value)
+{
+	_cleanup_pydecref_ PyObject *py_message =
+		PyObject_GetAttrString(exc_value, "message");
+	const char *message = py_message ? PyUnicode_AsUTF8(py_message) : NULL;
+	if (!message)
+		return NULL;
+
+	_cleanup_pydecref_ PyObject *py_address =
+		PyObject_GetAttrString(exc_value, "address");
+	uint64_t address;
+	if (!py_address || PyLong_AsUInt64(py_address, &address))
+		return NULL;
+
+	return drgn_error_create_fault(message, address);
 }
 
 struct drgn_error *drgn_error_from_python(void)
 {
-	PyObject *exc_type, *exc_value, *exc_traceback, *exc_message;
-	PyObject *dict;
-	const char *type, *message;
-	struct drgn_error *err;
-
+	_cleanup_pydecref_ PyObject *exc_type, *exc_value, *exc_traceback;
 	PyErr_Fetch(&exc_type, &exc_value, &exc_traceback);
 	if (!exc_type)
 		return NULL;
 
-	dict = PyThreadState_GetDict();
-	if (dict && _PyDict_GetItemId(dict, &PyId_drgn_in_python) == Py_True) {
+	// Python FaultErrors should be translated back to drgn errors because
+	// they are frequently handled in libdrgn. They should be translated no
+	// matter how deeply nested we are, so we do this before checking
+	// drgn_in_python.
+	if ((PyTypeObject *)exc_type == &FaultError_type && exc_value) {
+		struct drgn_error *err = drgn_fault_error_from_python(exc_value);
+		if (err)
+			return err;
+		// A NULL return means that we encountered a Python error while
+		// trying to convert it. Clear the Python error and fall back to
+		// the standard code path.
+		PyErr_Clear();
+	}
+
+	if (drgn_in_python) {
 		PyErr_Restore(exc_type, exc_value, exc_traceback);
+		exc_type = exc_value = exc_traceback = NULL;
 		return &drgn_error_python;
 	}
 
-	type = ((PyTypeObject *)exc_type)->tp_name;
+	const char *type = ((PyTypeObject *)exc_type)->tp_name;
+	_cleanup_pydecref_ PyObject *exc_message = NULL;
+	const char *message;
 	if (exc_value) {
 		exc_message = PyObject_Str(exc_value);
 		message = exc_message ? PyUnicode_AsUTF8(exc_message) : NULL;
 		if (!message) {
-			err = drgn_error_format(DRGN_ERROR_OTHER,
-						"%s: <exception str() failed>", type);
-			goto out;
+			PyErr_Clear();
+			return drgn_error_format(DRGN_ERROR_OTHER,
+						 "%s: <exception str() failed>", type);
 		}
 	} else {
-		exc_message = NULL;
 		message = "";
 	}
 
 	if (message[0]) {
-		err = drgn_error_format(DRGN_ERROR_OTHER, "%s: %s", type,
-					message);
+		return drgn_error_format(DRGN_ERROR_OTHER, "%s: %s", type,
+					 message);
 	} else {
-		err = drgn_error_create(DRGN_ERROR_OTHER, type);
+		return drgn_error_create(DRGN_ERROR_OTHER, type);
 	}
-
-out:
-	Py_XDECREF(exc_message);
-	Py_XDECREF(exc_traceback);
-	Py_XDECREF(exc_value);
-	Py_DECREF(exc_type);
-	return err;
 }
 
-DRGNPY_PUBLIC void *set_drgn_error(struct drgn_error *err)
+void *set_drgn_error(struct drgn_error *err)
 {
 	if (err == &drgn_error_python)
 		return NULL;
@@ -181,10 +200,10 @@ DRGNPY_PUBLIC void *set_drgn_error(struct drgn_error *err)
 		PyErr_SetString(PyExc_LookupError, err->message);
 		break;
 	case DRGN_ERROR_FAULT: {
-		PyObject *exc;
-
-		exc = PyObject_CallFunction((PyObject *)&FaultError_type, "sK",
-					    err->message, err->address);
+		_cleanup_pydecref_ PyObject *exc =
+			PyObject_CallFunction((PyObject *)&FaultError_type,
+					      "sK", err->message,
+					      (unsigned long long)err->address);
 		if (exc)
 			PyErr_SetObject((PyObject *)&FaultError_type, exc);
 		break;
@@ -197,6 +216,12 @@ DRGNPY_PUBLIC void *set_drgn_error(struct drgn_error *err)
 		break;
 	case DRGN_ERROR_OUT_OF_BOUNDS:
 		PyErr_SetString(OutOfBoundsError, err->message);
+		break;
+	case DRGN_ERROR_OBJECT_ABSENT:
+		PyErr_SetString(ObjectAbsentError, err->message);
+		break;
+	case DRGN_ERROR_NOT_IMPLEMENTED:
+		PyErr_SetString(PyExc_NotImplementedError, err->message);
 		break;
 	default:
 		PyErr_SetString(PyExc_Exception, err->message);
@@ -212,4 +237,15 @@ void *set_error_type_name(const char *format,
 {
 	return set_drgn_error(drgn_qualified_type_error(format,
 							qualified_type));
+}
+
+struct drgn_error *
+drgn_blocking_check_signals(drgn_blocking_state *statep)
+{
+	if (!*statep)
+		return NULL;
+	PyEval_RestoreThread((PyThreadState *)*statep);
+	int r = PyErr_CheckSignals();
+	*statep = (drgn_blocking_state)PyEval_SaveThread();
+	return r ? &drgn_error_python : NULL;
 }

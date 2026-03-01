@@ -1,6 +1,10 @@
-recursive-include docs *.py *.rst
-recursive-include examples *.py
+recursive-include docs *.css *.ico *.png *.py *.rst
 recursive-include tests *.py
-recursive-include tools *.py
+recursive-include tests/resources *.zst
+include tests/linux_kernel/kmod/Makefile tests/linux_kernel/kmod/drgn_test.c
+recursive-include contrib *.py *.rst
+recursive-include tools *.py *.rst
 recursive-include vmtest *.c *.py *.rst
-include util.py vmtest/config
+recursive-include vmtest/patches *.patch
+recursive-include LICENSES *.txt
+include .flake8 CONTRIBUTING.rst COPYING pytest.ini util.py

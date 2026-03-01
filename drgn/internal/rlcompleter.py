@@ -1,14 +1,14 @@
-# Copyright 2018-2019 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """Improved readline completer"""
 
 import builtins
-import re
 import keyword
-import readline
+import re
 from typing import Any, Dict, List, Optional
 
+from drgn.internal.repl import readline
 
 _EXPR_RE = re.compile(
     r"""

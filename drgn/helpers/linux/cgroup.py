@@ -1,4 +1,5 @@
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Cgroup
@@ -9,12 +10,15 @@ cgroup interface in :linux:`include/linux/cgroup.h`. Only cgroup v2 is
 supported.
 """
 
+from typing import Callable, Iterator
 
-from drgn import NULL, cast, container_of
-from drgn.helpers.linux.kernfs import kernfs_name, kernfs_path
+from drgn import NULL, Object, Path, Program, cast, container_of
+from drgn.helpers.common.prog import takes_program_or_default
+from drgn.helpers.linux.kernfs import kernfs_name, kernfs_path, kernfs_walk
 from drgn.helpers.linux.list import list_for_each_entry
 
 __all__ = (
+    "cgroup_get_from_path",
     "cgroup_name",
     "cgroup_parent",
     "cgroup_path",
@@ -26,22 +30,31 @@ __all__ = (
 )
 
 
-def sock_cgroup_ptr(skcd):
+def sock_cgroup_ptr(skcd: Object) -> Object:
     """
-    .. c:function:: struct cgroup *sock_cgroup_ptr(struct sock_cgroup_data *skcd)
-
     Get the cgroup for a socket from the given ``struct sock_cgroup_data *``
     (usually from ``struct sock::sk_cgrp_data``).
+
+    :param skcd: ``struct sock_cgroup_data *``
+    :return: ``struct cgroup *``
     """
-    return cast("struct cgroup *", skcd.val)
+
+    # Since Linux kernel commit 8520e224f547 ("bpf, cgroups: Fix
+    # cgroup v2 fallback on v1/v2 mixed mode") (in v5.15), the sock_cgroup_data
+    # contains directly cgroup member (of struct cgroup * type).
+    try:
+        return skcd.cgroup
+    except AttributeError:
+        return cast("struct cgroup *", skcd.val)
 
 
-def cgroup_parent(cgrp):
+def cgroup_parent(cgrp: Object) -> Object:
     """
-    .. c:function:: struct cgroup *cgroup_parent(struct cgroup *cgrp)
-
     Return the parent cgroup of the given cgroup if it exists, ``NULL``
     otherwise.
+
+    :param cgrp: ``struct cgroup *``
+    :return: ``struct cgroup *``
     """
     parent_css = cgrp.self.parent
     if parent_css:
@@ -49,61 +62,74 @@ def cgroup_parent(cgrp):
     return NULL(cgrp.prog_, "struct cgroup *")
 
 
-def cgroup_name(cgrp):
+def cgroup_name(cgrp: Object) -> bytes:
     """
-    .. c:function:: char *cgroup_name(struct cgroup *cgrp)
-
     Get the name of the given cgroup.
 
-    :rtype: bytes
+    :param cgrp: ``struct cgroup *``
     """
     return kernfs_name(cgrp.kn)
 
 
-def cgroup_path(cgrp):
+def cgroup_path(cgrp: Object) -> bytes:
     """
-    .. c:function:: char *cgroup_path(struct cgroup *cgrp)
-
     Get the full path of the given cgroup.
 
-    :rtype: bytes
+    :param cgrp: ``struct cgroup *``
     """
     return kernfs_path(cgrp.kn)
 
 
-def css_next_child(pos, parent):
+@takes_program_or_default
+def cgroup_get_from_path(prog: Program, path: Path) -> Object:
     """
-    .. c:function:: struct cgroup_subsys_state *css_next_child(struct cgroup_subsys_state *pos, struct cgroup_subsys_state *parent)
+    Look up a cgroup from its default hierarchy path .
 
+    :param path: Path name.
+    """
+    obj = kernfs_walk(prog["cgrp_dfl_root"].cgrp.kn, path)
+    if obj:
+        obj = obj.priv
+    return cast("struct cgroup *", obj)
+
+
+def css_next_child(pos: Object, parent: Object) -> Object:
+    """
     Get the next child (or ``NULL`` if there is none) of the given parent
     starting from the given position (``NULL`` to initiate traversal).
+
+    :param pos: ``struct cgroup_subsys_state *``
+    :param parent: ``struct cgroup_subsys_state *``
+    :return: ``struct cgroup_subsys_state *``
     """
     if not pos:
-        next_ = container_of(
-            parent.children.next, "struct cgroup_subsys_state", "sibling"
-        )
+        next_ = parent.children.next.read_()
     elif not (pos.flags & pos.prog_["CSS_RELEASED"]):
-        next_ = container_of(pos.sibling.next, "struct cgroup_subsys_state", "sibling")
+        next_ = pos.sibling.next.read_()
     else:
-        serial_nr = pos.serial_nr.value_()  # Read once and cache.
-        for next_ in list_for_each_entry(
+        serial_nr = pos.serial_nr.read_()  # Read once and cache.
+        for css in list_for_each_entry(
             "struct cgroup_subsys_state", parent.children.address_of_(), "sibling"
         ):
-            if next_.serial_nr > serial_nr:
-                break
+            if css.serial_nr > serial_nr:
+                return css
+        return NULL(pos.prog_, "struct cgroup_subsys_state *")
 
-    if next_.sibling.address_of_() != parent.children.address_of_():
-        return next_
+    # If next_ doesn't point to the head, then it is the next sibling.
+    if next_ != parent.children.address_of_():
+        return container_of(next_, "struct cgroup_subsys_state", "sibling")
     return NULL(next_.prog_, "struct cgroup_subsys_state *")
 
 
-def css_next_descendant_pre(pos, root):
+def css_next_descendant_pre(pos: Object, root: Object) -> Object:
     """
-    .. c:function:: struct cgroup_subsys_state *css_next_descendant_pre(struct cgroup_subsys_state *pos, struct cgroup_subsys_state *root)
-
     Get the next pre-order descendant (or ``NULL`` if there is none) of the
     given css root starting from the given position (``NULL`` to initiate
     traversal).
+
+    :param pos: ``struct cgroup_subsys_state *``
+    :param root: ``struct cgroup_subsys_state *``
+    :return: ``struct cgroup_subsys_state *``
     """
     # If first iteration, visit root.
     if not pos:
@@ -125,33 +151,32 @@ def css_next_descendant_pre(pos, root):
     return NULL(root.prog_, "struct cgroup_subsys_state *")
 
 
-def _css_for_each_impl(next_fn, css):
+def _css_for_each_impl(
+    next_fn: Callable[[Object, Object], Object], css: Object
+) -> Iterator[Object]:
     pos = NULL(css.prog_, "struct cgroup_subsys_state *")
     while True:
         pos = next_fn(pos, css)
         if not pos:
             break
-        if pos.flags & pos.prog_["CSS_ONLINE"]:
-            yield pos
+        yield pos
 
 
-def css_for_each_child(css):
+def css_for_each_child(css: Object) -> Iterator[Object]:
     """
-    .. c:function:: css_for_each_child(struct cgroup_subsys_state *css)
+    Iterate through children (offline included) of the given css.
 
-    Iterate through children of the given css.
-
+    :param css: ``struct cgroup_subsys_state *``
     :return: Iterator of ``struct cgroup_subsys_state *`` objects.
     """
     return _css_for_each_impl(css_next_child, css)
 
 
-def css_for_each_descendant_pre(css):
+def css_for_each_descendant_pre(css: Object) -> Iterator[Object]:
     """
-    .. c:function:: css_for_each_descendant_pre(struct cgroup_subsys_state *css)
+    Iterate through the given css's descendants (offline included) in pre-order.
 
-    Iterate through the given css's descendants in pre-order.
-
+    :param css: ``struct cgroup_subsys_state *``
     :return: Iterator of ``struct cgroup_subsys_state *`` objects.
     """
     return _css_for_each_impl(css_next_descendant_pre, css)

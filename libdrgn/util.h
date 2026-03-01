@@ -1,12 +1,10 @@
-// Copyright 2018-2020 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
  *
  * Miscellanous utility functions.
- *
- * Several of these are taken from the Linux kernel source.
  */
 
 #ifndef DRGN_UTIL_H
@@ -14,10 +12,23 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#define _unused_ __attribute__((__unused__))
+
+#ifndef LIBDRGN_PUBLIC
+#define LIBDRGN_PUBLIC __attribute__((__visibility__("default")))
+#endif
+
+#if defined(__has_attribute) && __has_attribute(__fallthrough__)
+#define fallthrough __attribute__((__fallthrough__))
+#else
+#define fallthrough do {} while (0)
+#endif
 
 #ifdef NDEBUG
 #define UNREACHABLE() __builtin_unreachable()
@@ -25,135 +36,52 @@
 #define UNREACHABLE() assert(!"reachable")
 #endif
 
+#define HOST_LITTLE_ENDIAN (__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__)
+
+/**
+ * Switch statement with an enum controlling expression that must have a case
+ * for every enumeration value and a default case.
+ *
+ * m4/my_c_switch_enum.m4 checks whether this works and defines a stub version
+ * if not. Keep this definition in sync with the check.
+ */
+#ifndef SWITCH_ENUM
+#define SWITCH_ENUM(expr)					\
+	_Pragma("GCC diagnostic push")				\
+	_Pragma("GCC diagnostic error \"-Wswitch-enum\"")	\
+	_Pragma("GCC diagnostic error \"-Wswitch-default\"")	\
+	switch (expr)						\
+	_Pragma("GCC diagnostic pop")
+#endif
+
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 
-#if defined(__GNUC__) && !defined(__clang__) && !defined(__INTEL_COMPILER)
-#define __compiletime_error(message) __attribute__((__error__(message)))
-#else
-#define __compiletime_error(message)
-#endif
-#ifdef __OPTIMIZE__
-# define __compiletime_assert(condition, msg, prefix, suffix)		\
-	do {								\
-		extern void prefix ## suffix(void) __compiletime_error(msg); \
-		if (!(condition))					\
-			prefix ## suffix();				\
-	} while (0)
-#else
-# define __compiletime_assert(condition, msg, prefix, suffix) do { } while (0)
-#endif
-#define _compiletime_assert(condition, msg, prefix, suffix) \
-	__compiletime_assert(condition, msg, prefix, suffix)
-#define compiletime_assert(condition, msg) \
-	_compiletime_assert(condition, msg, __compiletime_assert_, __LINE__)
+/** Return whether two types or expressions have compatible types. */
+#define types_compatible(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
 
-#define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int:(-!!(e)); }))
-#define BUILD_BUG_ON_MSG(cond, msg) compiletime_assert(!(cond), msg)
-
-#define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
-
-#define ___PASTE(a,b) a##b
-#define __PASTE(a,b) ___PASTE(a,b)
-
-#define __UNIQUE_ID(prefix) __PASTE(__PASTE(__UNIQUE_ID_, prefix), __COUNTER__)
-
-#define __typecheck(x, y) \
-		(!!(sizeof((typeof(x) *)1 == (typeof(y) *)1)))
-
-#define __is_constexpr(x) \
-	(sizeof(int) == sizeof(*(8 ? ((void *)((long)(x) * 0l)) : (int *)8)))
-
-#define __no_side_effects(x, y) \
-	(__is_constexpr(x) && __is_constexpr(y))
-
-#define __safe_cmp(x, y) \
-	(__typecheck(x, y) && __no_side_effects(x, y))
-
-#define __cmp(x, y, op)	((x) op (y) ? (x) : (y))
-
-#define __cmp_once(x, y, unique_x, unique_y, op) ({	\
-		typeof(x) unique_x = (x);		\
-		typeof(y) unique_y = (y);		\
-		__cmp(unique_x, unique_y, op); })
-
-#define __careful_cmp(x, y, op) \
-	__builtin_choose_expr(__safe_cmp(x, y), \
-		__cmp(x, y, op), \
-		__cmp_once(x, y, __UNIQUE_ID(__x), __UNIQUE_ID(__y), op))
-
-#define min(x, y)	__careful_cmp(x, y, <)
-
-#define max(x, y)	__careful_cmp(x, y, >)
-
-#define __must_be_array(a)	BUILD_BUG_ON_ZERO(__same_type((a), &(a)[0]))
-#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]) + __must_be_array(arr))
-
-#define swap(a, b) \
-	do { typeof(a) __tmp = (a); (a) = (b); (b) = __tmp; } while (0)
-
-#define container_of(ptr, type, member) ({				\
-	void *__mptr = (void *)(ptr);					\
-	BUILD_BUG_ON_MSG(!__same_type(*(ptr), ((type *)0)->member) &&	\
-			 !__same_type(*(ptr), void),			\
-			 "pointer type mismatch in container_of()");	\
-	((type *)(__mptr - offsetof(type, member))); })
-
-#define __bitop(x, unique_x, op) ({					\
-	__auto_type unique_x = (x);					\
-	static_assert(sizeof(unique_x) <= sizeof(unsigned long long),	\
-		      "type is too large");				\
-	(unsigned int)(sizeof(unique_x) <= sizeof(unsigned int) ?	\
-		       op(unique_x) :					\
-		       sizeof(unique_x) <= sizeof(unsigned long) ?	\
-		       op##l(unique_x) :				\
-		       op##ll(unique_x));				\
-})
+/** Return whether an expression is an array. */
+#define is_array(x) (!types_compatible(x, &(x)[0]))
 
 /**
- * Return the number of trailing least significant 0-bits in @p x. This is
- * undefined if @p x is zero.
+ * `static_assert(assert_expression, message)` as an expression that evaluates
+ * to `eval_expression`.
  */
-#define ctz(x) __bitop(x, __UNIQUE_ID(__x), __builtin_ctz)
+#define static_assert_expression(assert_expression, message, eval_expression)	\
+	_Generic(sizeof(struct { _Static_assert(assert_expression, message); int _; }),\
+		 default: (eval_expression))
 
-/*
- * The straightfoward implementation is bits - clz. However, as noted by the
- * folly implementation: "If X is a power of two, X - Y = 1 + ((X - 1) ^ Y).
- * Doing this transformation allows GCC to remove its own xor that it adds to
- * implement clz using bsr."
- *
- * This doesn't do the normal macro argument safety stuff because it should only
- * be used via __bitop() which already does it.
- */
-#define ____fls(x, type, suffix)	\
-	(x ? 1 + ((8 * sizeof(type) - 1) ^ __builtin_clz##suffix(x)) : 0)
-#define __fls(x) ____fls(x, unsigned int,)
-#define __flsl(x) ____fls(x, unsigned long, l)
-#define __flsll(x) ____fls(x, unsigned long long, ll)
+#define sizeof_member(type, member) sizeof(((type *)0)->member)
 
-/**
- * Return one plus the index of the most significant 1-bit of @p x or 0 if @p x
- * is 0.
- */
-#define fls(x) __bitop(x, __UNIQUE_ID(__x), __fls)
+#define typeof_member(type, member) typeof(((type *)0)->member)
 
-#define __next_power_of_two(x, unique_x) ({			\
-	__auto_type unique_x = (x);				\
-								\
-	unique_x ? (typeof(unique_x))1 << fls(unique_x - 1) :	\
-	(typeof(unique_x))1;					\
-})
-
-/**
- * Return the smallest power of two greater than or equal to @p x.
- *
- * Note that zero is not a power of two, so <tt>next_power_of_two(0) == 1</tt>.
- */
-#define next_power_of_two(x) __next_power_of_two(x, __UNIQUE_ID(__x))
-
-/** Iterate over each 1-bit in @p mask. This modifies @c mask. */
-#define for_each_bit(i, mask)	\
-	for (i = -1; mask && (i = ctz(mask), mask &= mask - 1, 1);)
+#define container_of(ptr, type, member)				\
+static_assert_expression(					\
+	types_compatible(*(ptr), ((type *)0)->member)		\
+	|| types_compatible(*(ptr), void),			\
+	"pointer does not match member type",			\
+	(type *)((char *)(ptr) - offsetof(type, member))	\
+)
 
 static inline bool strstartswith(const char *s, const char *prefix)
 {
@@ -171,11 +99,149 @@ static inline void *malloc_array(size_t nmemb, size_t size)
 	return malloc(bytes);
 }
 
+static inline void *malloc_flexible_array_impl(size_t struct_size,
+					       size_t element_size,
+					       size_t count)
+{
+	size_t bytes;
+	if (__builtin_mul_overflow(element_size, count, &bytes)
+	    || __builtin_add_overflow(bytes, struct_size, &bytes)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return malloc(bytes);
+}
+
+/**
+ * Allocate a structure with a flexible array member.
+ *
+ * @param[in] type Structure type.
+ * @param[in] member Name of flexible array member in @p type.
+ * @param[in] count Number of flexible array elements to allocate.
+ */
+#define malloc_flexible_array(type, member, count)						\
+	malloc_flexible_array_impl(sizeof(type),						\
+				   static_assert_expression(is_array(((type *)0)->member),	\
+							    "not an array",			\
+							    sizeof(((type *)0)->member[0])),	\
+				   count)
+
 static inline void *malloc64(uint64_t size)
 {
 	if (size > SIZE_MAX)
 		return NULL;
 	return malloc(size);
 }
+
+// glibc added reallocarray() in 2.26, but since it's so trivial, it's easier to
+// duplicate it here than it is to do feature detection.
+static inline void *realloc_array(void *ptr, size_t nmemb, size_t size)
+{
+       size_t bytes;
+       if (__builtin_mul_overflow(nmemb, size, &bytes)) {
+               errno = ENOMEM;
+               return NULL;
+       }
+       return realloc(ptr, bytes);
+}
+
+static inline void *memdup(const void *ptr, size_t size)
+{
+	void *copy = malloc(size);
+	if (copy)
+		memcpy(copy, ptr, size);
+	return copy;
+}
+
+static inline bool alloc_or_reuse(void **buf, size_t *capacity, size_t size)
+{
+	if (size > *capacity) {
+		free(*buf);
+		*buf = malloc(size);
+		if (!*buf) {
+			*capacity = 0;
+			return false;
+		}
+		*capacity = size;
+	}
+	return true;
+}
+
+/** Return the maximum value of an @p n-byte unsigned integer. */
+static inline uint64_t uint_max(int n)
+{
+	assert(n >= 1 && n <= 8);
+	return UINT64_MAX >> (64 - 8 * n);
+}
+
+/*
+ * Calculate the number of decimal digits in 2^n.
+ *
+ * The number of decimal digits in a positive integer x is floor(log10(x)) + 1.
+ * By the power rule of logarithms, log10(2^n) = n * log10(2).
+ * Therefore, the number of decimal digits in 2^n is floor(n * log10(2))) + 1.
+ * 643 / 2136 is an approximation of log10(2) which is accurate enough that
+ * floor(n * 643 / 2136) = floor(n * log10(2))) for 1 <= n <= 15436.
+ */
+#define max_decimal_length_impl(n) ((n) * 643 / 2136 + 1)
+
+/**
+ * Get the maximum number of characters required to format an integer type in
+ * base 10. This is an integer constant expression.
+ */
+#define max_decimal_length(type)						\
+	((type)-1 < 0								\
+	/*									\
+	 * Let f(x) = floor(log10(x)) + 1, which is the number of decimal	\
+	 * digits in a positive integer x.					\
+	 *									\
+	 * For an n-bit two's-complement integer, the worst case is the minimum	\
+	 * value, -2^(n - 1), which is f(2^(n - 1)) decimal digits plus the	\
+	 * minus sign.								\
+	 */									\
+	 ? max_decimal_length_impl(sizeof(type) * CHAR_BIT - 1) + 1		\
+	/*									\
+	 * For an n-bit unsigned integer, the worst case is the maximum value,	\
+	 * 2^n - 1. Note that for any positive integer x, 2^x is not a power of	\
+	 * 10, so floor(log10(2^x - 1)) = floor(log10(2^x)). Therefore,		\
+	 *   f(2^x - 1)								\
+	 * = floor(log10(2^x - 1)) + 1						\
+	 * = floor(log10(2^x)) + 1						\
+	 * = f(2^x).								\
+	 */									\
+	 : max_decimal_length_impl(sizeof(type) * CHAR_BIT))
+
+/**
+ * Safely add to a pointer which may be `NULL`.
+ *
+ * `NULL + 0` is undefined behavior, but it often arises naturally, like when
+ * computing the end of a dynamic array: `arr + length`. This works around the
+ * undefined behavior: `add_to_possibly_null_pointer(NULL, 0)` is defined as
+ * `NULL`.
+ *
+ * A more natural definition would be `i == 0 ? ptr : ptr + i`, but some
+ * versions of GCC and Clang generate an unnecessary branch or conditional move
+ * (https://gcc.gnu.org/bugzilla/show_bug.cgi?id=97225). Note that in standard
+ * C, it is undefined behavior to cast to `uintptr_t`, do arithmetic, and cast
+ * back, but GCC allows this as long as the result is within the same object:
+ * https://gcc.gnu.org/onlinedocs/gcc/Arrays-and-pointers-implementation.html.
+ */
+#define add_to_possibly_null_pointer(ptr, i)	\
+	((typeof(ptr))((uintptr_t)(ptr) + (i) * sizeof(*(ptr))))
+
+/**
+ * Similar to qsort_r (passes @a arg to @a compar) but **not** reentrant
+ *
+ * The qsort_r() function's main feature is that it is reentrant, but also adds
+ * the convenience of including an argument to the callback function.
+ * Unfortunately it is a glibc extension. This provides a similar API but it is
+ * only thread-safe, not reentrant. See qsort_r(3) for details.
+ */
+void qsort_arg(void *base, size_t nmemb, size_t size,
+	       int (*compar)(const void *, const void *, void*), void *arg);
+
+struct uint64_range {
+	uint64_t start, end;
+};
 
 #endif /* DRGN_UTIL_H */

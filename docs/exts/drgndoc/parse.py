@@ -1,12 +1,15 @@
-# Copyright 2020 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import ast
+import dataclasses
 import inspect
 import operator
 import os.path
+import re
 import stat
 from typing import (
+    Any,
     Callable,
     Dict,
     Iterable,
@@ -24,114 +27,118 @@ from drgndoc.visitor import NodeVisitor
 
 class _PreTransformer(ast.NodeTransformer):
     # Replace string forward references with the parsed expression.
-    def _visit_annotation(self, node):
+    @overload
+    def _visit_annotation(self, node: ast.expr) -> ast.expr: ...
+
+    @overload
+    def _visit_annotation(self, node: None) -> None: ...
+
+    def _visit_annotation(self, node: Optional[ast.expr]) -> Optional[ast.expr]:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            node = self.visit(ast.parse(node.value, "<string>", "eval"))
+            node = self.visit(ast.parse(node.value, "<string>", "eval").body)
         return node
 
-    def visit_arg(self, node):
-        node = self.generic_visit(node)
+    def visit_arg(self, node: ast.arg) -> ast.arg:
+        node = cast(ast.arg, self.generic_visit(node))
         node.annotation = self._visit_annotation(node.annotation)
         return node
 
-    def visit_FunctionDef(self, node):
-        node = self.generic_visit(node)
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+        node = cast(ast.FunctionDef, self.generic_visit(node))
         node.returns = self._visit_annotation(node.returns)
         return node
 
-    def visit_AsyncFunctionDef(self, node):
-        node = self.generic_visit(node)
+    def visit_AsyncFunctionDef(
+        self, node: ast.AsyncFunctionDef
+    ) -> ast.AsyncFunctionDef:
+        node = cast(ast.AsyncFunctionDef, self.generic_visit(node))
         node.returns = self._visit_annotation(node.returns)
         return node
 
-    def visit_AnnAssign(self, node):
-        node = self.generic_visit(node)
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> ast.AnnAssign:
+        node = cast(ast.AnnAssign, self.generic_visit(node))
         node.annotation = self._visit_annotation(node.annotation)
         return node
 
-    # Replace the old constant nodes produced by ast.parse() before Python 3.8
-    # with Constant.
-    def visit_Num(self, node: ast.Num) -> ast.Constant:
-        return ast.copy_location(ast.Constant(node.n), node)
-
-    def visit_Str(self, node: ast.Str) -> ast.Constant:
-        return ast.copy_location(ast.Constant(node.s), node)
-
-    def visit_Bytes(self, node: ast.Bytes) -> ast.Constant:
-        return ast.copy_location(ast.Constant(node.s), node)
-
-    def visit_Ellipsis(self, node: ast.Ellipsis) -> ast.Constant:
-        return ast.copy_location(ast.Constant(...), node)
-
-    def visit_NameConstant(self, node: ast.NameConstant) -> ast.Constant:
-        return ast.copy_location(ast.Constant(node.value), node)
+    # Get rid of Index nodes, which are deprecated as of Python 3.9.
+    def visit_Index(self, node: Any) -> Any:
+        return self.visit(node.value)
 
 
-# Once we don't care about Python 3.6, we can replace all of this boilerplate
-# with dataclasses.
-
-
+@dataclasses.dataclass
 class Module:
-    def __init__(
-        self, path: Optional[str], docstring: Optional[str], attrs: Mapping[str, "Node"]
-    ) -> None:
-        self.path = path
-        self.docstring = docstring
-        self.attrs = attrs
+    path: Optional[str]
+    docstring: Optional[str]
+    attrs: Mapping[str, "Node"]
+
+    def has_docstring(self) -> bool:
+        return self.docstring is not None
 
 
+@dataclasses.dataclass
 class Class:
-    def __init__(
-        self,
-        bases: Sequence[ast.expr],
-        docstring: Optional[str],
-        attrs: Mapping[str, "NonModuleNode"],
-    ) -> None:
-        self.bases = bases
-        self.docstring = docstring
-        self.attrs = attrs
+    bases: Sequence[ast.expr]
+    docstring: Optional[str]
+    attrs: Mapping[str, "NonModuleNode"]
+
+    def has_docstring(self) -> bool:
+        if self.docstring is not None:
+            return True
+        init = self.attrs.get("__init__")
+        return isinstance(init, Function) and init.has_docstring()
 
 
-class Function:
-    def __init__(
-        self,
-        args: ast.arguments,
-        decorator_list: Sequence[ast.expr],
-        returns: Optional[ast.expr],
-        async_: bool,
-        docstring: Optional[str],
-    ) -> None:
-        self.args = args
-        self.decorator_list = decorator_list
-        self.returns = returns
-        self.async_ = async_
-        self.docstring = docstring
+@dataclasses.dataclass
+class FunctionSignature:
+    args: ast.arguments
+    returns: Optional[ast.expr]
+    decorator_list: Sequence[ast.expr]
+    docstring: Optional[str]
 
-    def have_decorator(self, name: str) -> bool:
+    def has_decorator(self, name: str) -> bool:
         return any(
             isinstance(decorator, ast.Name) and decorator.id == name
             for decorator in self.decorator_list
         )
 
 
+@dataclasses.dataclass
+class Function:
+    async_: bool
+    signatures: Sequence[FunctionSignature]
+
+    def has_docstring(self) -> bool:
+        return any(signature.docstring is not None for signature in self.signatures)
+
+
+@dataclasses.dataclass
 class Variable:
-    def __init__(
-        self, annotation: Optional[ast.expr], docstring: Optional[str]
-    ) -> None:
-        self.annotation = annotation
-        self.docstring = docstring
+    annotation: Optional[ast.expr]
+    value: Optional[ast.expr]
+    docstring: Optional[str]
+
+    def has_docstring(self) -> bool:
+        return self.docstring is not None
 
 
+@dataclasses.dataclass
 class Import:
-    def __init__(self, module: str) -> None:
-        self.module = module
+    module: str
+    aliased: bool
+
+    def has_docstring(self) -> bool:
+        return False
 
 
+@dataclasses.dataclass
 class ImportFrom:
-    def __init__(self, name: str, module: Optional[str], level: int) -> None:
-        self.name = name
-        self.module = module
-        self.level = level
+    name: str
+    module: Optional[str]
+    level: int
+    aliased: bool
+
+    def has_docstring(self) -> bool:
+        return False
 
 
 Node = Union[Module, Class, Function, Variable, Import, ImportFrom]
@@ -143,13 +150,53 @@ def _docstring_from_node(node: Optional[ast.AST]) -> Optional[str]:
     if not isinstance(node, ast.Expr):
         return None
     node = node.value
-    if isinstance(node, ast.Str):
-        text = node.s
-    elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
         text = node.value
     else:
         return None
     return inspect.cleandoc(text)
+
+
+def _transform_function(node: Function) -> Function:
+    signature = node.signatures[-1]
+
+    if (
+        signature.has_decorator("takes_program_or_default")
+        and signature.docstring is not None
+    ):
+        match = re.search(
+            r"^(\s*):(?:param|return|raises)", signature.docstring, flags=re.M
+        )
+        if match:
+            prefix = match.group(1)
+            pos = match.start()
+        else:
+            prefix = "\n\n"
+            pos = len(signature.docstring)
+        signature.docstring = "".join(
+            (
+                signature.docstring[:pos],
+                prefix,
+                ":param prog: Program, which :ref:`may be omitted to use the default program argument <default-program>`.",
+                signature.docstring[pos:],
+            )
+        )
+
+    if signature.has_decorator("takes_object_or_program_or_default"):
+        del signature.args.args[0]
+        signature.args.args[0].annotation = ast.Subscript(
+            value=ast.Name(id="Union", ctx=ast.Load()),
+            slice=ast.Tuple(
+                elts=[
+                    ast.Name(id="Object", ctx=ast.Load()),
+                    ast.Name(id="Program", ctx=ast.Load()),
+                ],
+                ctx=ast.Load(),
+            ),
+            ctx=ast.Load(),
+        )
+
+    return node
 
 
 class _ModuleVisitor(NodeVisitor):
@@ -176,33 +223,40 @@ class _ModuleVisitor(NodeVisitor):
         self._attrs = attrs
         self._attrs[node.name] = class_node
 
-    def visit_FunctionDef(
+    def _visit_function(
         self,
-        node: ast.FunctionDef,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
         parent: Optional[ast.AST],
         sibling: Optional[ast.AST],
     ) -> None:
-        self._attrs[node.name] = Function(
-            node.args, node.decorator_list, node.returns, False, ast.get_docstring(node)
+        signature = FunctionSignature(
+            node.args, node.returns, node.decorator_list, ast.get_docstring(node)
         )
+        async_ = isinstance(node, ast.AsyncFunctionDef)
+        func = self._attrs.get(node.name)
+        # If we have a previous overload definition, we can add to it.
+        # Otherwise, we replace it.
+        if (
+            func
+            and isinstance(func, Function)
+            and func.async_ == async_
+            and func.signatures[-1].has_decorator("overload")
+        ):
+            signatures = list(func.signatures)
+            signatures.append(signature)
+        else:
+            signatures = [signature]
+        self._attrs[node.name] = _transform_function(Function(async_, signatures))
         # NB: we intentionally don't visit the function body.
 
-    def visit_AsyncFunctionDef(
-        self,
-        node: ast.AsyncFunctionDef,
-        parent: Optional[ast.AST],
-        sibling: Optional[ast.AST],
-    ) -> None:
-        self._attrs[node.name] = Function(
-            node.args, node.decorator_list, node.returns, True, ast.get_docstring(node)
-        )
-        # NB: we intentionally don't visit the function body.
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
 
     def _add_assign(
         self,
         name: str,
-        have_value: bool,
         annotation: Optional[ast.expr],
+        value: Optional[ast.expr],
         docstring: Optional[str],
     ) -> None:
         try:
@@ -211,19 +265,19 @@ class _ModuleVisitor(NodeVisitor):
             pass
         else:
             # The name was previously defined. If it's a variable, add the
-            # annotation and/or docstring. If this is an annotation without a
-            # value, don't do anything. Otherwise, replace the previous
-            # definition.
+            # annotation, value, and/or docstring. If this is an annotation
+            # without a value, don't do anything. Otherwise, replace the
+            # previous definition.
             if isinstance(var, Variable):
-                if not annotation and docstring is None:
-                    return
-                if not annotation:
+                if annotation is None:
                     annotation = var.annotation
+                if value is None:
+                    value = var.value
                 if docstring is None:
                     docstring = var.docstring
-            elif not have_value:
+            elif value is None:
                 return
-        self._attrs[name] = Variable(annotation, docstring)
+        self._attrs[name] = Variable(annotation, value, docstring)
 
     def visit_Assign(
         self, node: ast.Assign, parent: Optional[ast.AST], sibling: Optional[ast.AST]
@@ -234,7 +288,7 @@ class _ModuleVisitor(NodeVisitor):
             docstring = None
         for target in node.targets:
             if isinstance(target, ast.Name):
-                self._add_assign(target.id, True, None, docstring)
+                self._add_assign(target.id, None, node.value, docstring)
 
     def visit_AnnAssign(
         self, node: ast.AnnAssign, parent: Optional[ast.AST], sibling: Optional[ast.AST]
@@ -242,8 +296,8 @@ class _ModuleVisitor(NodeVisitor):
         if isinstance(node.target, ast.Name):
             self._add_assign(
                 node.target.id,
-                node.value is not None,
                 node.annotation,
+                node.value,
                 _docstring_from_node(sibling),
             )
 
@@ -258,7 +312,7 @@ class _ModuleVisitor(NodeVisitor):
             else:
                 name = alias.asname
                 module_name = alias.name
-            self._attrs[name] = Import(module_name)
+            self._attrs[name] = Import(module_name, alias.asname is not None)
 
     def visit_ImportFrom(
         self,
@@ -268,7 +322,9 @@ class _ModuleVisitor(NodeVisitor):
     ) -> None:
         for alias in node.names:
             name = alias.name if alias.asname is None else alias.asname
-            self._attrs[name] = ImportFrom(alias.name, node.module, node.level)
+            self._attrs[name] = ImportFrom(
+                alias.name, node.module, node.level, alias.asname is not None
+            )
 
 
 def parse_source(

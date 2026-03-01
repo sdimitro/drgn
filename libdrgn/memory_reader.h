@@ -1,5 +1,5 @@
-// Copyright 2018-2019 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -12,11 +12,8 @@
 #ifndef DRGN_MEMORY_READER_H
 #define DRGN_MEMORY_READER_H
 
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-
 #include "binary_search_tree.h"
+#include "drgn_internal.h"
 
 /**
  * @ingroup Internals
@@ -28,38 +25,14 @@
  * @ref drgn_memory_reader provides a common interface for registering regions
  * of memory in a program and reading from memory.
  *
+ * @ref drgn_memory_reader does not have a notion of the maximum address or
+ * address overflow/wrap-around. Those must be handled at a higher layer.
+ *
  * @{
  */
 
-/** Memory segment in a @ref drgn_memory_reader. */
-struct drgn_memory_segment {
-	struct binary_tree_node node;
-	/** Address of the segment in memory. */
-	uint64_t address;
-	/** Size of the segment in bytes; */
-	uint64_t size;
-	/**
-	 * The address of the segment when it was added, before any truncations.
-	 *
-	 * This is always greater than or equal to @ref
-	 * drgn_memory_segment::address.
-	 */
-	uint64_t orig_address;
-	/** Read callback. */
-	drgn_memory_read_fn read_fn;
-	/** Argument to pass to @ref drgn_memory_segment::read_fn. */
-	void *arg;
-};
-
-static inline uint64_t
-drgn_memory_segment_to_key(const struct drgn_memory_segment *entry)
-{
-	return entry->address;
-}
-
-DEFINE_BINARY_SEARCH_TREE_TYPE(drgn_memory_segment_tree, struct
-			       drgn_memory_segment, node,
-			       drgn_memory_segment_to_key)
+DEFINE_BINARY_SEARCH_TREE_TYPE(drgn_memory_segment_tree,
+			       struct drgn_memory_segment);
 
 /**
  * Memory reader.
@@ -84,13 +57,29 @@ void drgn_memory_reader_init(struct drgn_memory_reader *reader);
 /** Deinitialize a @ref drgn_memory_reader. */
 void drgn_memory_reader_deinit(struct drgn_memory_reader *reader);
 
+/** Remove all segments from a @ref drgn_memory_reader. */
+void drgn_memory_reader_clear(struct drgn_memory_reader *reader);
+
+/** Remove all virtual memory segments from a @ref drgn_memory_reader. */
+void drgn_memory_reader_clear_virtual(struct drgn_memory_reader *reader);
+
 /** Return whether a @ref drgn_memory_reader has no segments. */
 bool drgn_memory_reader_empty(struct drgn_memory_reader *reader);
 
-/** @sa drgn_program_add_memory_segment() */
+/**
+ * Add a segment to a @ref drgn_memory_reader.
+ *
+ * @param[in] reader Memory reader.
+ * @param[in] min_address Start address (inclusive).
+ * @param[in] max_address End address (inclusive). Must be `>= min_address`.
+ * @param[in] read_fn Callback to read from segment.
+ * @param[in] arg Argument to pass to @p read_fn.
+ * @param[in] physical Whether to add a physical memory segment.
+ * @return @c NULL on success, non-@c NULL on error.
+ */
 struct drgn_error *
 drgn_memory_reader_add_segment(struct drgn_memory_reader *reader,
-			       uint64_t address, uint64_t size,
+			       uint64_t min_address, uint64_t max_address,
 			       drgn_memory_read_fn read_fn, void *arg,
 			       bool physical);
 
@@ -100,7 +89,8 @@ drgn_memory_reader_add_segment(struct drgn_memory_reader *reader,
  * @param[in] reader Memory reader.
  * @param[out] buf Buffer to read into.
  * @param[in] address Starting address in memory to read.
- * @param[in] count Number of bytes to read.
+ * @param[in] count Number of bytes to read. `address + count - 1` must be
+ * `<= UINT64_MAX`
  * @param[in] physical Whether @c address is physical.
  * @return @c NULL on success, non-@c NULL on error.
  */
@@ -114,8 +104,7 @@ struct drgn_memory_file_segment {
 	uint64_t file_offset;
 	/**
 	 * Size of the segment in the file. This may be less than the size of
-	 * the segment in memory, in which case the remaining bytes are treated
-	 * as if they contained zeroes.
+	 * the segment in memory.
 	 */
 	uint64_t file_size;
 	/** File descriptor. */
@@ -125,6 +114,12 @@ struct drgn_memory_file_segment {
 	 * OS error.
 	 */
 	bool eio_is_fault;
+	/**
+	 * If @c true, reads between @ref file_size and the size of the segment
+	 * in memory will be returned as zeroes. Otherwise, such reads will
+	 * result in a fault.
+	 */
+	bool zerofill;
 };
 
 /** @ref drgn_memory_read_fn which reads from a file. */

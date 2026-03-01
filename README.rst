@@ -1,19 +1,21 @@
 drgn
 ====
 
-.. image:: https://img.shields.io/pypi/v/drgn
+|pypi badge| |ci badge| |docs badge| |black badge|
+
+.. |pypi badge| image:: https://img.shields.io/pypi/v/drgn
     :target: https://pypi.org/project/drgn/
     :alt: PyPI
 
-.. image:: https://travis-ci.org/osandov/drgn.svg?branch=master
-    :target: https://travis-ci.org/osandov/drgn
-    :alt: Build Status
+.. |ci badge| image:: https://github.com/osandov/drgn/workflows/CI/badge.svg
+    :target: https://github.com/osandov/drgn/actions
+    :alt: CI Status
 
-.. image:: https://readthedocs.org/projects/drgn/badge/?version=latest
+.. |docs badge| image:: https://readthedocs.org/projects/drgn/badge/?version=latest
     :target: https://drgn.readthedocs.io/en/latest/?badge=latest
     :alt: Documentation Status
 
-.. image:: https://img.shields.io/badge/code%20style-black-000000.svg
+.. |black badge| image:: https://img.shields.io/badge/code%20style-black-000000.svg
     :target: https://github.com/psf/black
 
 .. start-introduction
@@ -38,54 +40,187 @@ scripting in Python. For example, you can debug the Linux kernel:
 Although other debuggers like `GDB <https://www.gnu.org/software/gdb/>`_ have
 scripting support, drgn aims to make scripting as natural as possible so that
 debugging feels like coding. This makes it well-suited for introspecting the
-complex, inter-connected state in large programs. It is also designed as a
-library that can be used to build debugging and introspection tools; see the
-official `tools <https://github.com/osandov/drgn/tree/master/tools>`_.
+complex, inter-connected state in large programs.
 
-drgn was developed for debugging the Linux kernel (as an alternative to the
-`crash <http://people.redhat.com/anderson/>`_ utility), but it can also debug
-userspace programs written in C. C++ support is in progress.
+Additionally, drgn is designed as a library that can be used to build debugging
+and introspection tools; see the official `tools
+<https://github.com/osandov/drgn/tree/main/tools>`_.
+
+drgn was developed at `Meta <https://opensource.fb.com/>`_ for debugging the
+Linux kernel (as an alternative to the `crash
+<https://crash-utility.github.io/>`_ utility), but it can also debug userspace
+programs written in C. C++ support is in progress.
 
 .. end-introduction
 
 Documentation can be found at `drgn.readthedocs.io
 <https://drgn.readthedocs.io>`_.
 
+.. start-installation
+
 Installation
 ------------
 
-.. start-install-dependencies
+Package Manager
+^^^^^^^^^^^^^^^
 
-Install dependencies:
+drgn can be installed using the package manager on some Linux distributions.
 
-Arch Linux::
+.. image:: https://repology.org/badge/vertical-allrepos/drgn.svg?exclude_unsupported=1
+    :target: https://repology.org/project/drgn/versions
+    :alt: Packaging Status
 
-    $ sudo pacman -S --needed autoconf automake bison bzip2 flex gawk gcc libtool make pkgconf python python-setuptools xz zlib
+* Fedora, RHEL/CentOS Stream >= 9
 
-Debian/Ubuntu::
+  .. code-block:: console
 
-    $ sudo apt-get install autoconf automake bison flex gawk gcc libbz2-dev liblzma-dev libtool make pkgconf python3 python3-dev python3-setuptools zlib1g-dev
+      $ sudo dnf install drgn
 
-Note that Debian Stretch, Ubuntu Trusty, and Ubuntu Xenial (and older) ship
-Python versions which are too old. Python 3.6 or newer must be installed
-manually.
+* RHEL/CentOS < 9
 
-Fedora::
+  `Enable EPEL <https://docs.fedoraproject.org/en-US/epel/#_quickstart>`_. Then:
 
-    $ sudo dnf install autoconf automake bison bzip2-devel flex gawk gcc libtool make pkgconf python3 python3-devel python3-setuptools xz-devel zlib-devel
+  .. code-block:: console
 
-Optionally, install:
+      $ sudo dnf install drgn
 
-* `libkdumpfile <https://github.com/ptesarik/libkdumpfile>`_ if you want
-  support for kdump-compressed kernel core dumps
+* Oracle Linux >= 8
 
-.. end-install-dependencies
+  Enable the ``ol8_addons`` or ``ol9_addons`` repository. Then:
 
+  .. code-block:: console
+
+      $ sudo dnf config-manager --enable ol8_addons  # OR: ol9_addons
+      $ sudo dnf install drgn
+
+  drgn is also available for Python versions in application streams. For
+  example, use ``dnf install python3.12-drgn`` to install drgn for Python 3.12.
+  See the documentation for drgn in `Oracle Linux 9
+  <https://docs.oracle.com/en/operating-systems/oracle-linux/9/drgn/how_to_install_drgn.html>`_
+  and `Oracle Linux 8
+  <https://docs.oracle.com/en/operating-systems/oracle-linux/8/drgn/how_to_install_drgn.html>`_
+  for more information.
+
+* Debian >= 12 (Bookworm)/Ubuntu >= 24.04 (Noble Numbat)
+
+  .. code-block:: console
+
+      $ sudo apt install python3-drgn
+
+  To get the latest version on Ubuntu, enable the `michel-slm/kernel-utils PPA
+  <https://launchpad.net/~michel-slm/+archive/ubuntu/kernel-utils>`_ first.
+
+* Arch Linux
+
+  .. code-block:: console
+
+      $ sudo pacman -S drgn
+
+* Gentoo
+
+  .. code-block:: console
+
+      $ sudo emerge dev-debug/drgn
+
+* openSUSE
+
+  .. code-block:: console
+
+      $ sudo zypper install python3-drgn
+
+pip
+^^^
+
+If your Linux distribution doesn't package the latest release of drgn, you can
+install it with `pip <https://pip.pypa.io/>`_.
+
+First, `install pip
+<https://packaging.python.org/guides/installing-using-linux-tools/#installing-pip-setuptools-wheel-with-linux-package-managers>`_.
 Then, run:
 
 .. code-block:: console
 
     $ sudo pip3 install drgn
+
+This will install a binary wheel by default. If you get a build error, then pip
+wasn't able to use the binary wheel. Install the dependencies listed `below
+<#from-source>`_ and try again.
+
+Note that RHEL/CentOS 7, Debian 10 ("buster"), and Ubuntu 18.04 ("Bionic
+Beaver") (and older) ship Python versions which are too old. Python 3.8 or
+newer must be installed.
+
+.. _installation-from-source:
+
+From Source
+^^^^^^^^^^^
+
+To get the development version of drgn, you will need to build it from source.
+First, install dependencies:
+
+* Fedora, RHEL/CentOS Stream >= 9
+
+  .. code-block:: console
+
+      $ sudo dnf install autoconf automake check-devel elfutils-debuginfod-client-devel elfutils-devel gcc git libkdumpfile-devel libtool make pcre2-devel pkgconf python3 python3-devel python3-pip python3-setuptools xz-devel
+
+* RHEL/CentOS < 9, Oracle Linux
+
+  .. code-block:: console
+
+      $ sudo dnf install autoconf automake check-devel elfutils-devel gcc git libtool make pcre2-devel pkgconf python3 python3-devel python3-pip python3-setuptools xz-devel
+
+  Optionally, install ``libkdumpfile-devel`` from EPEL on RHEL/CentOS >= 8 or
+  install `libkdumpfile <https://github.com/ptesarik/libkdumpfile>`_ from
+  source if you want support for the makedumpfile format. For Oracle Linux >= 7,
+  ``libkdumpfile-devel`` can be installed directly from the corresponding addons
+  repository (e.g. ``ol9_addons``).
+
+  Replace ``dnf`` with ``yum`` for RHEL/CentOS/Oracle Linux < 8.
+
+  When building on RHEL/CentOS/Oracle Linux < 8, you may need to use a newer
+  version of GCC, for example, using the ``devtoolset-12`` developer toolset.
+  Check your distribution's documentation for information on installing and
+  using these newer toolchains.
+
+* Debian/Ubuntu
+
+  .. code-block:: console
+
+      $ sudo apt install autoconf automake check gcc git libdebuginfod-dev libkdumpfile-dev liblzma-dev libelf-dev libdw-dev libpcre2-dev libtool make pkgconf python3 python3-dev python3-pip python3-setuptools zlib1g-dev
+
+  On Debian <= 11 (Bullseye) and Ubuntu <= 22.04 (Jammy Jellyfish),
+  ``libkdumpfile-dev`` is not available, so you must install libkdumpfile from
+  source if you want support for the makedumpfile format.
+
+* Arch Linux
+
+  .. code-block:: console
+
+      $ sudo pacman -S --needed autoconf automake check gcc git libelf libkdumpfile libtool make pcre2 pkgconf python python-pip python-setuptools xz
+
+* Gentoo
+
+  .. code-block:: console
+
+      $ sudo emerge --noreplace --oneshot dev-build/autoconf dev-build/automake dev-libs/check dev-libs/elfutils dev-libs/libpcre2 sys-devel/gcc dev-vcs/git dev-libs/libkdumpfile dev-build/libtool dev-build/make dev-python/pip virtual/pkgconfig dev-lang/python dev-python/setuptools app-arch/xz-utils
+
+* openSUSE
+
+  .. code-block:: console
+
+      $ sudo zypper install autoconf automake check-devel gcc git libdebuginfod-devel libdw-devel libelf-devel libkdumpfile-devel libtool make pcre2-devel pkgconf python3 python3-devel python3-pip python3-setuptools xz-devel
+
+Then, run:
+
+.. code-block:: console
+
+    $ git clone https://github.com/osandov/drgn.git
+    $ cd drgn
+    $ python3 setup.py build
+    $ sudo python3 setup.py install
+
+.. end-installation
 
 See the `installation documentation
 <https://drgn.readthedocs.io/en/latest/installation.html>`_ for more options.
@@ -95,39 +230,68 @@ Quick Start
 
 .. start-quick-start
 
-drgn debugs the running kernel by default; run ``sudo drgn``. To debug a
-running program, run ``sudo drgn -p $PID``. To debug a core dump (either a
-kernel vmcore or a userspace core dump), run ``drgn -c $PATH``. The program
-must have debugging symbols available.
+drgn debugs the running kernel by default; simply run ``drgn``. To debug a
+running program, run ``drgn -p $PID``. To debug a core dump (either a kernel
+vmcore or a userspace core dump), run ``drgn -c $PATH``. Make sure to `install
+debugging symbols
+<https://drgn.readthedocs.io/en/latest/getting_debugging_symbols.html>`_ for
+whatever you are debugging.
 
-Then, you can access variables in the program with ``prog['name']``, access
-structure members with ``.``, use various predefined helpers, and more:
+Then, you can access variables in the program with ``prog["name"]`` and access
+structure members with ``.``:
 
 .. code-block:: pycon
 
-    $ sudo drgn
-    >>> prog['init_task'].comm
+    $ drgn
+    >>> prog["init_task"].comm
     (char [16])"swapper/0"
-    >>> d_path(fget(find_task(prog, 1), 0).f_path.address_of_())
-    b'/dev/null'
-    >>> max(task.stime for task in for_each_task(prog))
-    (u64)4192109975952
-    >>> sum(disk.gendisk.part0.nr_sects for disk in for_each_disk(prog))
-    (sector_t)999705952
+
+You can use various predefined helpers:
+
+.. code-block:: pycon
+
+    >>> len(list(bpf_prog_for_each()))
+    11
+    >>> task = find_task(115)
+    >>> cmdline(task)
+    [b'findmnt', b'-p']
+
+You can get stack traces with ``stack_trace()`` and access parameters or local
+variables with ``trace["name"]``:
+
+.. code-block:: pycon
+
+    >>> trace = stack_trace(task)
+    >>> trace[5]
+    #5 at 0xffffffff8a5a32d0 (do_sys_poll+0x400/0x578) in do_poll at ./fs/select.c:961:8 (inlined)
+    >>> poll_list = trace[5]["list"]
+    >>> file = fget(task, poll_list.entries[0].fd)
+    >>> d_path(file.f_path.address_of_())
+    b'/proc/115/mountinfo'
 
 .. end-quick-start
 
 See the `user guide <https://drgn.readthedocs.io/en/latest/user_guide.html>`_
-for more information.
+for more details and features.
+
+.. start-for-index
+
+Getting Help
+------------
+
+* The `GitHub issue tracker <https://github.com/osandov/drgn/issues>`_ is the
+  preferred method to report issues.
+* There is also a `Linux Kernel Debuggers Matrix room
+  <https://matrix.to/#/#linux-debuggers:matrix.org>`_ and a `linux-debuggers
+  mailing list <https://lore.kernel.org/linux-debuggers/>`_ on `vger
+  <https://subspace.kernel.org/vger.kernel.org.html>`_.
 
 License
 -------
 
-.. start-license
+Copyright (c) Meta Platforms, Inc. and affiliates.
 
-Copyright 2018-2020 Omar Sandoval
+drgn is licensed under the `LGPLv2.1
+<https://www.gnu.org/licenses/old-licenses/lgpl-2.1.en.html>`_ or later.
 
-drgn is licensed under the `GPLv3
-<https://www.gnu.org/licenses/gpl-3.0.en.html>`_ or later.
-
-.. end-license
+.. end-for-index

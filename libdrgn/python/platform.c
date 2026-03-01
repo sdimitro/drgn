@@ -1,5 +1,5 @@
-// Copyright 2019 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 #include "drgnpy.h"
 
@@ -7,21 +7,20 @@ PyObject *Platform_wrap(const struct drgn_platform *platform)
 {
 	struct drgn_error *err;
 	struct drgn_platform *tmp;
-	Platform *ret;
-
 	err = drgn_platform_create(drgn_platform_arch(platform),
 				   drgn_platform_flags(platform),
 				   &tmp);
 	if (err)
 		return set_drgn_error(err);
-	ret = (Platform *)Platform_type.tp_alloc(&Platform_type, 0);
+	Platform *ret = call_tp_alloc(Platform);
 	if (!ret)
 		return NULL;
 	ret->platform = tmp;
 	return (PyObject *)ret;
 }
 
-Platform *Platform_new(PyTypeObject *subtype, PyObject *args, PyObject *kwds)
+static Platform *Platform_new(PyTypeObject *subtype, PyObject *args,
+			      PyObject *kwds)
 {
 	static char *keywords[] = {"arch", "flags", NULL};
 	struct enum_arg arch = { .type = Architecture_class, };
@@ -59,18 +58,14 @@ static void Platform_dealloc(Platform *self)
 
 static PyObject *Platform_richcompare(Platform *self, PyObject *other, int op)
 {
-	bool ret;
-
 	if (!PyObject_TypeCheck(other, &Platform_type) ||
 	    (op != Py_EQ && op != Py_NE))
 		Py_RETURN_NOTIMPLEMENTED;
-	ret = drgn_platform_eq(self->platform, ((Platform *)other)->platform);
+	bool ret = drgn_platform_eq(self->platform,
+				    ((Platform *)other)->platform);
 	if (op == Py_NE)
 		ret = !ret;
-	if (ret)
-		Py_RETURN_TRUE;
-	else
-		Py_RETURN_FALSE;
+	Py_RETURN_BOOL(ret);
 }
 
 static PyObject *Platform_get_arch(Platform *self, void *arg)
@@ -87,59 +82,31 @@ static PyObject *Platform_get_flags(Platform *self, void *arg)
 
 static PyObject *Platform_get_registers(Platform *self, void *arg)
 {
-	PyObject *tuple;
-	size_t num_registers, i;
-
-	num_registers = drgn_platform_num_registers(self->platform);
-	tuple = PyTuple_New(num_registers);
+	size_t num_registers = drgn_platform_num_registers(self->platform);
+	_cleanup_pydecref_ PyObject *tuple = PyTuple_New(num_registers);
 	if (!tuple)
 		return NULL;
-	for (i = 0; i < num_registers; i++) {
-		const struct drgn_register *reg;
-		PyObject *item;
-		PyObject *tmp;
-
-		reg = drgn_platform_register(self->platform, i);
-		item = PyStructSequence_New(&Register_type);
-		if (!item) {
-			Py_DECREF(tuple);
+	for (size_t i = 0; i < num_registers; i++) {
+		const struct drgn_register *reg =
+			drgn_platform_register(self->platform, i);
+		Register *item = call_tp_alloc(Register);
+		if (!item)
 			return NULL;
-		}
-		tmp = PyUnicode_FromString(drgn_register_name(reg));
-		if (!tmp) {
-			Py_DECREF(item);
-			Py_DECREF(tuple);
-			return NULL;
-		}
-		PyStructSequence_SET_ITEM(item, 0, tmp);
-		tmp = PyLong_FromLong(drgn_register_number(reg));
-		if (!tmp) {
-			Py_DECREF(item);
-			Py_DECREF(tuple);
-			return NULL;
-		}
-		PyStructSequence_SET_ITEM(item, 1, tmp);
-		PyTuple_SET_ITEM(tuple, i, item);
+		item->reg = reg;
+		PyTuple_SET_ITEM(tuple, i, (PyObject *)item);
 	}
-	return tuple;
+	return_ptr(tuple);
 }
 
 static PyObject *Platform_repr(Platform *self)
 {
-	PyObject *arch_obj, *flags_obj, *ret;
-
-	arch_obj = Platform_get_arch(self, NULL);
+	_cleanup_pydecref_ PyObject *arch_obj = Platform_get_arch(self, NULL);
 	if (!arch_obj)
 		return NULL;
-	flags_obj = Platform_get_flags(self, NULL);
-	if (!flags_obj) {
-		Py_DECREF(arch_obj);
+	_cleanup_pydecref_ PyObject *flags_obj = Platform_get_flags(self, NULL);
+	if (!flags_obj)
 		return NULL;
-	}
-	ret = PyUnicode_FromFormat("Platform(%R, %R)", arch_obj, flags_obj);
-	Py_XDECREF(flags_obj);
-	Py_XDECREF(arch_obj);
-	return ret;
+	return PyUnicode_FromFormat("Platform(%R, %R)", arch_obj, flags_obj);
 }
 
 static PyGetSetDef Platform_getset[] = {
@@ -156,6 +123,7 @@ PyTypeObject Platform_type = {
 	.tp_basicsize = sizeof(Platform),
 	.tp_dealloc = (destructor)Platform_dealloc,
 	.tp_repr = (reprfunc)Platform_repr,
+	// Doesn't reference any objects, no GC needed.
 	.tp_flags = Py_TPFLAGS_DEFAULT,
 	.tp_doc = drgn_Platform_DOC,
 	.tp_richcompare = (richcmpfunc)Platform_richcompare,
@@ -163,17 +131,52 @@ PyTypeObject Platform_type = {
 	.tp_new = (newfunc)Platform_new,
 };
 
-static PyStructSequence_Field Register_fields[] = {
-	{"name", drgn_Register_name_DOC},
-	{"number", drgn_Register_number_DOC},
+static PyObject *Register_richcompare(Register *self, PyObject *other, int op)
+{
+	if (!PyObject_TypeCheck(other, &Register_type) ||
+	    (op != Py_EQ && op != Py_NE))
+		Py_RETURN_NOTIMPLEMENTED;
+	bool ret = self->reg == ((Register *)other)->reg;
+	if (op == Py_NE)
+		ret = !ret;
+	Py_RETURN_BOOL(ret);
+}
+
+static PyObject *Register_get_names(Register *self, void *arg)
+{
+	size_t num_names;
+	const char * const *names = drgn_register_names(self->reg, &num_names);
+	_cleanup_pydecref_ PyObject *ret = PyTuple_New(num_names);
+	for (size_t i = 0; i < num_names; i++) {
+		PyObject *item = PyUnicode_FromString(names[i]);
+		if (!item)
+			return NULL;
+		PyTuple_SET_ITEM(ret, i, item);
+	}
+	return_ptr(ret);
+}
+
+static PyObject *Register_repr(Register *self)
+{
+	_cleanup_pydecref_ PyObject *names_obj = Register_get_names(self, NULL);
+	if (!names_obj)
+		return NULL;
+	return PyUnicode_FromFormat("Register(%R)", names_obj);
+}
+
+static PyGetSetDef Register_getset[] = {
+	{"names", (getter)Register_get_names, NULL, drgn_Register_names_DOC},
 	{},
 };
 
-PyStructSequence_Desc Register_desc = {
-	"Register",
-	drgn_Register_DOC,
-	Register_fields,
-	2,
+PyTypeObject Register_type = {
+	PyVarObject_HEAD_INIT(NULL, 0)
+	.tp_name = "_drgn.Register",
+	.tp_basicsize = sizeof(Register),
+	.tp_repr = (reprfunc)Register_repr,
+	// Doesn't reference any objects, no GC needed.
+	.tp_flags = Py_TPFLAGS_DEFAULT,
+	.tp_doc = drgn_Register_DOC,
+	.tp_richcompare = (richcmpfunc)Register_richcompare,
+	.tp_getset = Register_getset,
 };
-
-PyTypeObject Register_type;

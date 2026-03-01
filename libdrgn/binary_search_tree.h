@@ -1,5 +1,5 @@
-// Copyright 2019 - Omar Sandoval
-// SPDX-License-Identifier: GPL-3.0+
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: LGPL-2.1-or-later
 
 /**
  * @file
@@ -11,6 +11,9 @@
 
 #ifndef DRGN_BINARY_SEARCH_TREE_H
 #define DRGN_BINARY_SEARCH_TREE_H
+
+#include <stdbool.h>
+#include <stddef.h>
 
 #include "util.h"
 
@@ -148,6 +151,16 @@ binary_search_tree_delete_iterator(struct binary_search_tree *tree,
 				   struct binary_search_tree_iterator it);
 
 /**
+ * Delete an entry in a @ref binary_search_tree.
+ *
+ * @return An iterator pointing to the next entry in the tree. See @ref
+ * binary_search_tree_next().
+ */
+struct binary_search_tree_iterator
+binary_search_tree_delete_entry(struct binary_search_tree *tree,
+				entry_type *entry);
+
+/**
  * Get an iterator pointing to the first (in-order) entry in a @ref
  * binary_search_tree.
  *
@@ -158,6 +171,18 @@ binary_search_tree_delete_iterator(struct binary_search_tree *tree,
  */
 struct binary_search_tree_iterator
 binary_search_tree_first(struct binary_search_tree *tree);
+
+/**
+ * Get an iterator pointing to the last (in-order) entry in a @ref
+ * binary_search_tree.
+ *
+ * The last entry is the one with the greatest key.
+ *
+ * @return An iterator pointing to the last entry, or an iterator with
+ * <tt>entry == NULL</tt> if the tree is empty.
+ */
+struct binary_search_tree_iterator
+binary_search_tree_last(struct binary_search_tree *tree);
 
 /**
  * Get an iterator pointing to the next (in-order) entry in a @ref
@@ -231,41 +256,41 @@ struct binary_tree_search_result {
 /*
  * Binary search tree variants need to define three functions:
  *
- * variant##_tree_insert_fixup(root, node, parent) is called after a node is
- * inserted (as *root, parent->left, or parent->right). It must set the node's
- * parent pointer and rebalance the tree.
+ * drgn_##variant##_tree_insert_fixup(root, node, parent) is called after a node
+ * is inserted (as *root, parent->left, or parent->right). It must set the
+ * node's parent pointer and rebalance the tree.
  *
- * variant##_tree_found(root, node) is called when a duplicate node is found for
- * an insert operation or when a node is found for a search operation (but not
- * for a delete operation). It may rebalance the tree or do nothing.
+ * drgn_##variant##_tree_found(root, node) is called when a duplicate node is
+ * found for an insert operation or when a node is found for a search operation
+ * (but not for a delete operation). It may rebalance the tree or do nothing.
  *
- * variant##_tree_delete(root, node) must delete the node and rebalance the
- * tree.
+ * drgn_##variant##_tree_delete(root, node) must delete the node and rebalance
+ * the tree.
  */
 
-void splay_tree_splay(struct binary_tree_node **root,
-		      struct binary_tree_node *node,
-		      struct binary_tree_node *parent);
+void drgn_splay_tree_splay(struct binary_tree_node **root,
+			   struct binary_tree_node *node,
+			   struct binary_tree_node *parent);
 
-static inline void splay_tree_insert_fixup(struct binary_tree_node **root,
-					   struct binary_tree_node *node,
-					   struct binary_tree_node *parent)
+static inline void drgn_splay_tree_insert_fixup(struct binary_tree_node **root,
+						struct binary_tree_node *node,
+						struct binary_tree_node *parent)
 {
 	if (parent)
-		splay_tree_splay(root, node, parent);
+		drgn_splay_tree_splay(root, node, parent);
 	else
 		node->parent = NULL;
 }
 
-static inline void splay_tree_found(struct binary_tree_node **root,
-				    struct binary_tree_node *node)
+static inline void drgn_splay_tree_found(struct binary_tree_node **root,
+					 struct binary_tree_node *node)
 {
 	if (node->parent)
-		splay_tree_splay(root, node, node->parent);
+		drgn_splay_tree_splay(root, node, node->parent);
 }
 
-void splay_tree_delete(struct binary_tree_node **root,
-		       struct binary_tree_node *node);
+void drgn_splay_tree_delete(struct binary_tree_node **root,
+			    struct binary_tree_node *node);
 
 /**
  * Define a binary search tree type without defining its functions.
@@ -277,8 +302,27 @@ void splay_tree_delete(struct binary_tree_node **root,
  *
  * @sa DEFINE_BINARY_SEARCH_TREE()
  */
-#define DEFINE_BINARY_SEARCH_TREE_TYPE(tree, entry_type, member, entry_to_key)	\
-typedef typeof(entry_type) tree##_entry_type;					\
+#define DEFINE_BINARY_SEARCH_TREE_TYPE(tree, entry_type)	\
+typedef typeof(entry_type) tree##_entry_type;			\
+								\
+struct tree {							\
+	struct binary_tree_node *root;				\
+};								\
+struct DEFINE_BINARY_SEARCH_TREE_needs_semicolon
+
+/**
+ * Define the functions for a binary search tree.
+ *
+ * The binary search tree type must have already been defined with @ref
+ * DEFINE_BINARY_SEARCH_TREE_TYPE().
+ *
+ * Unless the type and function definitions must be in separate places, use @ref
+ * DEFINE_BINARY_SEARCH_TREE() instead.
+ *
+ * @sa DEFINE_BINARY_SEARCH_TREE()
+ */
+#define DEFINE_BINARY_SEARCH_TREE_FUNCTIONS(tree, member, entry_to_key,		\
+					    cmp_func, variant)			\
 typedef typeof(entry_to_key((tree##_entry_type *)0)) tree##_key_type;		\
 										\
 static inline struct binary_tree_node *						\
@@ -299,33 +343,17 @@ tree##_entry_to_key(const tree##_entry_type *entry)				\
 	return entry_to_key(entry);						\
 }										\
 										\
-struct tree {									\
-	struct binary_tree_node *root;						\
-};										\
-										\
 struct tree##_iterator {							\
 	tree##_entry_type *entry;						\
-};
-
-/**
- * Define the functions for a binary search tree.
- *
- * The binary search tree type must have already been defined with @ref
- * DEFINE_BINARY_SEARCH_TREE_TYPE().
- *
- * Unless the type and function definitions must be in separate places, use @ref
- * DEFINE_BINARY_SEARCH_TREE() instead.
- *
- * @sa DEFINE_BINARY_SEARCH_TREE()
- */
-#define DEFINE_BINARY_SEARCH_TREE_FUNCTIONS(tree, cmp_func, variant)		\
-__attribute__((unused))								\
+};										\
+										\
+__attribute__((__unused__))							\
 static void tree##_init(struct tree *tree)					\
 {										\
 	tree->root = NULL;							\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static bool tree##_empty(struct tree *tree)					\
 {										\
 	return tree->root == NULL;						\
@@ -357,7 +385,7 @@ tree##_search_internal(struct tree *tree, const tree##_key_type *key)		\
 	return res;								\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static int tree##_insert(struct tree *tree, tree##_entry_type *entry,		\
 			 struct tree##_iterator *it_ret)			\
 {										\
@@ -369,18 +397,18 @@ static int tree##_insert(struct tree *tree, tree##_entry_type *entry,		\
 	if (*res.nodep) {							\
 		if (it_ret)							\
 			it_ret->entry = tree##_node_to_entry(*res.nodep);	\
-		variant##_tree_found(&tree->root, *res.nodep);			\
+		drgn_##variant##_tree_found(&tree->root, *res.nodep);		\
 		return 0;							\
 	}									\
 										\
 	node = tree##_entry_to_node(entry);					\
 	node->left = node->right = NULL;					\
 	*res.nodep = node;							\
-	variant##_tree_insert_fixup(&tree->root, node, res.parent);		\
+	drgn_##variant##_tree_insert_fixup(&tree->root, node, res.parent);	\
 	return 1;								\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static struct tree##_iterator tree##_search(struct tree *tree,			\
 					    const tree##_key_type *key)		\
 {										\
@@ -389,11 +417,11 @@ static struct tree##_iterator tree##_search(struct tree *tree,			\
 	node = *tree##_search_internal(tree, key).nodep;			\
 	if (!node)								\
 		return (struct tree##_iterator){};				\
-	variant##_tree_found(&tree->root, node);				\
+	drgn_##variant##_tree_found(&tree->root, node);				\
 	return (struct tree##_iterator){ tree##_node_to_entry(node), };		\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static struct tree##_iterator tree##_search_le(struct tree *tree,		\
 					       const tree##_key_type *key)	\
 {										\
@@ -419,11 +447,12 @@ static struct tree##_iterator tree##_search_le(struct tree *tree,		\
 		}								\
 	}									\
 	if (entry)								\
-		variant##_tree_found(&tree->root, tree##_entry_to_node(entry));	\
+		drgn_##variant##_tree_found(&tree->root,			\
+					    tree##_entry_to_node(entry));	\
 	return (struct tree##_iterator){ entry, };				\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static bool tree##_delete(struct tree *tree, const tree##_key_type *key)	\
 {										\
 	struct binary_tree_node *node;						\
@@ -431,7 +460,7 @@ static bool tree##_delete(struct tree *tree, const tree##_key_type *key)	\
 	node = *tree##_search_internal(tree, key).nodep;			\
 	if (!node)								\
 		return false;							\
-	variant##_tree_delete(&tree->root, node);				\
+	drgn_##variant##_tree_delete(&tree->root, node);			\
 	return true;								\
 }										\
 										\
@@ -439,13 +468,11 @@ static bool tree##_delete(struct tree *tree, const tree##_key_type *key)	\
  * We want this inlined so that the whole function call can be optimized away	\
  * if the return value is not used.						\
  */										\
-__attribute__((always_inline))							\
+__attribute__((__always_inline__))						\
 static inline struct tree##_iterator						\
 tree##_next_impl(struct tree##_iterator it)					\
 {										\
 	struct binary_tree_node *node = tree##_entry_to_node(it.entry);		\
-	long i;									\
-										\
 	if (node->right) {							\
 		node = node->right;						\
 		/*								\
@@ -454,7 +481,7 @@ tree##_next_impl(struct tree##_iterator it)					\
 		 * (otherwise the counter would overflow, which is undefined	\
 		 * behavior).							\
 		 */								\
-		for (i = 0;; i++) {						\
+		for (long i = 1; i != 0; i++) {					\
 			if (!node->left)					\
 				break;						\
 			node = node->left;					\
@@ -462,7 +489,7 @@ tree##_next_impl(struct tree##_iterator it)					\
 		return (struct tree##_iterator){ tree##_node_to_entry(node), };	\
 	}									\
 										\
-	for (i = 0;; i++) {							\
+	for (long i = 1; i != 0; i++) {						\
 		if (!node->parent || node != node->parent->right)		\
 			break;							\
 		node = node->parent;						\
@@ -475,7 +502,7 @@ tree##_next_impl(struct tree##_iterator it)					\
 	return (struct tree##_iterator){};					\
 }										\
 										\
-__attribute__((always_inline))							\
+__attribute__((__always_inline__))						\
 static inline struct tree##_iterator						\
 tree##_delete_iterator(struct tree *tree, struct tree##_iterator it)		\
 {										\
@@ -483,11 +510,18 @@ tree##_delete_iterator(struct tree *tree, struct tree##_iterator it)		\
 										\
 	node = tree##_entry_to_node(it.entry);					\
 	it = tree##_next_impl(it);						\
-	variant##_tree_delete(&tree->root, node);				\
+	drgn_##variant##_tree_delete(&tree->root, node);			\
 	return it;								\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__always_inline__, __unused__))					\
+static inline struct tree##_iterator						\
+tree##_delete_entry(struct tree *tree, tree##_entry_type *entry)		\
+{										\
+	return tree##_delete_iterator(tree, (struct tree##_iterator){ entry });	\
+}										\
+										\
+__attribute__((__unused__))							\
 static struct tree##_iterator tree##_first(struct tree *tree)			\
 {										\
 	struct binary_tree_node *node = tree->root;				\
@@ -500,13 +534,26 @@ static struct tree##_iterator tree##_first(struct tree *tree)			\
 	return (struct tree##_iterator){ tree##_node_to_entry(node), };		\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
+static struct tree##_iterator tree##_last(struct tree *tree)			\
+{										\
+	struct binary_tree_node *node = tree->root;				\
+										\
+	if (!node)								\
+		return (struct tree##_iterator){};				\
+										\
+	while (node->right)							\
+		node = node->right;						\
+	return (struct tree##_iterator){ tree##_node_to_entry(node), };		\
+}										\
+										\
+__attribute__((__unused__))							\
 static struct tree##_iterator tree##_next(struct tree##_iterator it)		\
 {										\
 	return tree##_next_impl(it);						\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static struct tree##_iterator tree##_first_post_order(struct tree *tree)	\
 {										\
 	struct binary_tree_node *node = tree->root;				\
@@ -528,7 +575,7 @@ static struct tree##_iterator tree##_first_post_order(struct tree *tree)	\
 	}									\
 }										\
 										\
-__attribute__((unused))								\
+__attribute__((__unused__))							\
 static struct tree##_iterator tree##_next_post_order(struct tree##_iterator it)	\
 {										\
 	struct binary_tree_node *node = tree##_entry_to_node(it.entry);		\
@@ -553,7 +600,8 @@ static struct tree##_iterator tree##_next_post_order(struct tree##_iterator it)	
 			tree##_node_to_entry(node->parent),			\
 		};								\
 	}									\
-}
+}										\
+struct DEFINE_BINARY_SEARCH_TREE_needs_semicolon
 
 /**
  * Define a binary search tree interface.
@@ -576,8 +624,9 @@ static struct tree##_iterator tree##_next_post_order(struct tree##_iterator it)	
  */
 #define DEFINE_BINARY_SEARCH_TREE(tree, entry_type, member, entry_to_key,	\
 				  cmp_func, variant)				\
-DEFINE_BINARY_SEARCH_TREE_TYPE(tree, entry_type, member, entry_to_key)		\
-DEFINE_BINARY_SEARCH_TREE_FUNCTIONS(tree, cmp_func, variant)
+DEFINE_BINARY_SEARCH_TREE_TYPE(tree, entry_type);				\
+DEFINE_BINARY_SEARCH_TREE_FUNCTIONS(tree, member, entry_to_key, cmp_func,	\
+				    variant)
 
 #ifdef DOXYGEN
 /** Compare two scalar keys. */

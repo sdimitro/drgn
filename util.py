@@ -1,16 +1,18 @@
-# Copyright 2020 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 from functools import total_ordering
 import os
+from pathlib import Path
 import re
+from typing import Union
 
 
 def nproc() -> int:
     return len(os.sched_getaffinity(0))
 
 
-def out_of_date(path: str, *deps: str) -> bool:
+def out_of_date(path: Union[str, Path], *deps: Union[str, Path]) -> bool:
     try:
         mtime = os.stat(path).st_mtime
     except FileNotFoundError:
@@ -95,6 +97,7 @@ class KernelVersion:
     """
 
     def __init__(self, release: str) -> None:
+        self._release = release
         # ~ sorts before anything, including the end of the version.
         self._key = re.sub(r"-(rc[0-9])", r"~\1", release)
 
@@ -107,3 +110,6 @@ class KernelVersion:
         if not isinstance(other, KernelVersion):
             return NotImplemented
         return verrevcmp(self._key, other._key) < 0
+
+    def __str__(self) -> str:
+        return self._release

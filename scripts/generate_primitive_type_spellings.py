@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 import itertools
 import sys
-
 
 SPELLINGS = [
     ("DRGN_C_TYPE_VOID", ["void"]),

@@ -1,5 +1,5 @@
-# Copyright 2018-2019 - Omar Sandoval
-# SPDX-License-Identifier: GPL-3.0+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 
 """
 Red-Black Trees
@@ -9,10 +9,13 @@ The ``drgn.helpers.linux.rbtree`` module provides helpers for working with
 red-black trees from :linux:`include/linux/rbtree.h`.
 """
 
-from drgn import Object, NULL, container_of
+from typing import Callable, Generator, Iterator, Tuple, TypeVar, Union
 
+from drgn import NULL, Object, Type, container_of
+from drgn.helpers import ValidationError
 
 __all__ = (
+    "RB_EMPTY_ROOT",
     "RB_EMPTY_NODE",
     "rb_find",
     "rb_first",
@@ -22,34 +25,55 @@ __all__ = (
     "rb_prev",
     "rbtree_inorder_for_each",
     "rbtree_inorder_for_each_entry",
+    "rbtree_preorder_for_each",
+    "rbtree_preorder_for_each_entry",
+    "validate_rbtree",
+    "validate_rbtree_inorder_for_each_entry",
 )
 
 
-def RB_EMPTY_NODE(node):
+def RB_EMPTY_ROOT(root: Object) -> bool:
     """
-    .. c:function:: bool RB_EMPTY_NODE(struct rb_node *node)
+    Return whether a red-black tree is empty.
 
+    :param node: ``struct rb_root *``
+    """
+    return not root.rb_node
+
+
+def RB_EMPTY_NODE(node: Object) -> bool:
+    """
     Return whether a red-black tree node is empty, i.e., not inserted in a
     tree.
+
+    :param node: ``struct rb_node *``
     """
     return node.__rb_parent_color.value_() == node.value_()
 
 
-def rb_parent(node):
+def rb_parent(node: Object) -> Object:
     """
-    .. c:function:: struct rb_node *rb_parent(struct rb_node *node)
-
     Return the parent node of a red-black tree node.
+
+    :param node: ``struct rb_node *``
+    :return: ``struct rb_node *``
     """
     return Object(node.prog_, node.type_, value=node.__rb_parent_color.value_() & ~3)
 
 
-def rb_first(root):
-    """
-    .. c:function:: struct rb_node *rb_first(struct rb_root *root)
+# Return parent node and whether the node is black.
+def _rb_parent_color(node: Object) -> Tuple[Object, bool]:
+    value = node.__rb_parent_color.value_()
+    return Object(node.prog_, node.type_, value=value & ~3), (value & 1) != 0
 
-    Return the first node (in sort order) in a red-black tree, or a ``NULL``
-    object if the tree is empty.
+
+def rb_first(root: Object) -> Object:
+    """
+    Return the first node (in sort order) in a red-black tree, or ``NULL`` if
+    the tree is empty.
+
+    :param root: ``struct rb_root *``
+    :return: ``struct rb_node *``
     """
     node = root.rb_node.read_()
     if not node:
@@ -61,12 +85,13 @@ def rb_first(root):
         node = next
 
 
-def rb_last(root):
+def rb_last(root: Object) -> Object:
     """
-    .. c:function:: struct rb_node *rb_last(struct rb_root *root)
+    Return the last node (in sort order) in a red-black tree, or ``NULL`` if
+    the tree is empty.
 
-    Return the last node (in sort order) in a red-black tree, or a ``NULL``
-    object if the tree is empty.
+    :param root: ``struct rb_root *``
+    :return: ``struct rb_node *``
     """
     node = root.rb_node.read_()
     if not node:
@@ -78,12 +103,13 @@ def rb_last(root):
         node = next
 
 
-def rb_next(node):
+def rb_next(node: Object) -> Object:
     """
-    .. c:function:: struct rb_node *rb_next(struct rb_node *node)
+    Return the next node (in sort order) after a red-black node, or ``NULL`` if
+    the node is the last node in the tree or is empty.
 
-    Return the next node (in sort order) after a red-black node, or a ``NULL``
-    object if the node is the last node in the tree or is empty.
+    :param node: ``struct rb_node *``
+    :return: ``struct rb_node *``
     """
     node = node.read_()
 
@@ -106,12 +132,13 @@ def rb_next(node):
     return parent
 
 
-def rb_prev(node):
+def rb_prev(node: Object) -> Object:
     """
-    .. c:function:: struct rb_node *rb_prev(struct rb_node *node)
+    Return the previous node (in sort order) before a red-black node, or
+    ``NULL`` if the node is the first node in the tree or is empty.
 
-    Return the previous node (in sort order) before a red-black node, or a
-    ``NULL`` object if the node is the first node in the tree or is empty.
+    :param node: ``struct rb_node *``
+    :return: ``struct rb_node *``
     """
     node = node.read_()
 
@@ -134,16 +161,15 @@ def rb_prev(node):
     return parent
 
 
-def rbtree_inorder_for_each(root):
+def rbtree_inorder_for_each(root: Object) -> Iterator[Object]:
     """
-    .. c:function:: rbtree_inorder_for_each(struct rb_root *root)
-
     Iterate over all of the nodes in a red-black tree, in sort order.
 
+    :param root: ``struct rb_root *``
     :return: Iterator of ``struct rb_node *`` objects.
     """
 
-    def aux(node):
+    def aux(node: Object) -> Iterator[Object]:
         if node:
             yield from aux(node.rb_left.read_())
             yield node
@@ -152,33 +178,84 @@ def rbtree_inorder_for_each(root):
     yield from aux(root.rb_node.read_())
 
 
-def rbtree_inorder_for_each_entry(type, root, member):
+def rbtree_inorder_for_each_entry(
+    type: Union[str, Type], root: Object, member: str
+) -> Iterator[Object]:
     """
-    .. c:function:: rbtree_inorder_for_each_entry(type, struct rb_root *root, member)
+    Iterate over all of the entries in a red-black tree in sorted order.
 
-    Iterate over all of the entries in a red-black tree, given the type of the
-    entry and the ``struct rb_node`` member in that type. The entries are
-    returned in sort order.
-
+    :param type: Entry type.
+    :param root: ``struct rb_root *``
+    :param member: Name of ``struct rb_node`` member in entry type.
     :return: Iterator of ``type *`` objects.
     """
+    type = root.prog_.type(type)
     for node in rbtree_inorder_for_each(root):
         yield container_of(node, type, member)
 
 
-def rb_find(type, root, member, key, cmp):
+def rbtree_preorder_for_each(root: Object) -> Iterator[Object]:
     """
-    .. c:function:: type *rb_find(type, struct rb_root *root, member, key_type key, int (*cmp)(key_type, type *))
+    Iterate over all of the nodes in a red-black tree, visiting each node
+    before its children.
 
-    Find an entry in a red-black tree, given a key and a comparator function
-    which takes the key and an entry. The comparator should return < 0 if the
-    key is less than the entry, > 0 if it is greater than the entry, or 0 if it
-    matches the entry. This returns a ``NULL`` object if no entry matches the
-    key.
+    :param root: ``struct rb_root *``
+    :return: Iterator of ``struct rb_node *`` objects.
+    """
+
+    def aux(node: Object) -> Iterator[Object]:
+        if node:
+            yield node
+            yield from aux(node.rb_left.read_())
+            yield from aux(node.rb_right.read_())
+
+    yield from aux(root.rb_node.read_())
+
+
+def rbtree_preorder_for_each_entry(
+    type: Union[str, Type], root: Object, member: str
+) -> Iterator[Object]:
+    """
+    Iterate over all of the entries in a red-black tree, visiting each node
+    before its children.
+
+    :param type: Entry type.
+    :param root: ``struct rb_root *``
+    :param member: Name of ``struct rb_node`` member in entry type.
+    :return: Iterator of ``type *`` objects.
+    """
+    type = root.prog_.type(type)
+    for node in rbtree_preorder_for_each(root):
+        yield container_of(node, type, member)
+
+
+KeyType = TypeVar("KeyType")
+
+
+def rb_find(
+    type: Union[str, Type],
+    root: Object,
+    member: str,
+    key: KeyType,
+    cmp: Callable[[KeyType, Object], int],
+) -> Object:
+    """
+    Find an entry in a red-black tree given a key and a comparator function.
 
     Note that this function does not have an analogue in the Linux kernel
     source code, as tree searches are all open-coded.
+
+    :param type: Entry type.
+    :param root: ``struct rb_root *``
+    :param member: Name of ``struct rb_node`` member in entry type.
+    :param key: Key to find.
+    :param cmp: Callback taking key and entry that returns < 0 if the key is
+        less than the entry, > 0 if the key is greater than the entry, and 0 if
+        the key matches the entry.
+    :return: ``type *`` found entry, or ``NULL`` if not found.
     """
+    prog = root.prog_
+    type = prog.type(type)
     node = root.rb_node.read_()
     while node:
         entry = container_of(node, type, member)
@@ -189,4 +266,148 @@ def rb_find(type, root, member, key, cmp):
             node = node.rb_right.read_()
         else:
             return entry
-    return node
+    return NULL(prog, prog.pointer_type(type))
+
+
+def validate_rbtree(
+    type: Union[str, Type],
+    root: Object,
+    member: str,
+    cmp: Callable[[Object, Object], int],
+    allow_equal: bool,
+) -> None:
+    """
+    Validate a red-black tree.
+
+    This checks that:
+
+    1. The tree is a valid binary search tree ordered according to *cmp*.
+    2. If *allow_equal* is ``False``, there are no nodes that compare equal
+       according to *cmp*.
+    3. The ``rb_parent`` pointers are consistent.
+    4. The red-black tree requirements are satisfied: the root node is black,
+       no red node has a red child, and every path from any node to any of its
+       descendant leaf nodes goes through the same number of black nodes.
+
+    :param type: Entry type.
+    :param root: ``struct rb_root *``
+    :param member: Name of ``struct rb_node`` member in entry type.
+    :param cmp: Callback taking two ``type *`` entry objects that returns < 0
+        if the first entry is less than the second entry, > 0 if the first
+        entry is greater than the second entry, and 0 if they are equal.
+    :param allow_equal: Whether the tree may contain entries that compare equal
+        to each other.
+    :raises ValidationError: if the tree is invalid
+    """
+    for _ in validate_rbtree_inorder_for_each_entry(
+        type, root, member, cmp, allow_equal
+    ):
+        pass
+
+
+def validate_rbtree_inorder_for_each_entry(
+    type: Union[str, Type],
+    root: Object,
+    member: str,
+    cmp: Callable[[Object, Object], int],
+    allow_equal: bool,
+) -> Iterator[Object]:
+    """
+    Like :func:`rbtree_inorder_for_each_entry()`, but validates the red-black
+    tree like :func:`validate_rbtree()` while iterating.
+
+    :param type: Entry type.
+    :param root: ``struct rb_root *``
+    :param member: Name of ``struct rb_node`` member in entry type.
+    :param cmp: Callback taking two ``type *`` entry objects that returns < 0
+        if the first entry is less than the second entry, > 0 if the first
+        entry is greater than the second entry, and 0 if they are equal.
+    :param allow_equal: Whether the tree may contain entries that compare equal
+        to each other.
+    :raises ValidationError: if the tree is invalid
+    """
+
+    prog = root.prog_
+    type = prog.type(type)
+
+    def visit(
+        node: Object,
+        parent_node: Object,
+        parent_entry: Object,
+        parent_is_red: bool,
+        is_left: bool,
+    ) -> Generator[Object, None, int]:
+        if node:
+            node_rb_parent, black = _rb_parent_color(node)
+            if node_rb_parent != parent_node:
+                raise ValidationError(
+                    f"{parent_node.format_(dereference=False, symbolize=False)}"
+                    f" rb_{'left' if is_left else 'right'}"
+                    f" {node.format_(dereference=False, symbolize=False, type_name=False)}"
+                    f" has rb_parent {node_rb_parent.format_(dereference=False, symbolize=False, type_name=False)}"
+                )
+
+            if parent_is_red and not black:
+                raise ValidationError(
+                    f"red node {parent_node.format_(dereference=False, symbolize=False)}"
+                    f" has red child {node.format_(dereference=False, symbolize=False, type_name=False)}"
+                )
+
+            entry = container_of(node, type, member)
+            r = cmp(entry, parent_entry)
+            if r > 0:
+                if is_left:
+                    raise ValidationError(
+                        f"{parent_entry.format_(dereference=False, symbolize=False)}"
+                        f" left child {entry.format_(dereference=False, symbolize=False, type_name=False)}"
+                        " compares greater than it"
+                    )
+            elif r < 0:
+                if not is_left:
+                    raise ValidationError(
+                        f"{parent_entry.format_(dereference=False, symbolize=False)}"
+                        f" right child {entry.format_(dereference=False, symbolize=False, type_name=False)}"
+                        " compares less than it"
+                    )
+            elif not allow_equal:
+                raise ValidationError(
+                    f"{parent_entry.format_(dereference=False, symbolize=False)}"
+                    f" {'left' if is_left else 'right'}"
+                    f" child {entry.format_(dereference=False, symbolize=False, type_name=False)}"
+                    " compares equal to it"
+                )
+
+            return (yield from descend(node, entry, black))
+        else:
+            return 0
+
+    def descend(
+        node: Object, entry: Object, black: bool
+    ) -> Generator[Object, None, int]:
+        left_black_height = yield from visit(
+            node.rb_left.read_(), node, entry, parent_is_red=not black, is_left=True
+        )
+        yield entry
+        right_black_height = yield from visit(
+            node.rb_right.read_(), node, entry, parent_is_red=not black, is_left=False
+        )
+        if left_black_height != right_black_height:
+            raise ValidationError(
+                f"left and right subtrees of {node.format_(dereference=False, symbolize=False)}"
+                f" have unequal black heights ({left_black_height} != {right_black_height})"
+            )
+        return left_black_height + black
+
+    root_node = root.rb_node.read_()
+    if root_node:
+        parent, black = _rb_parent_color(root_node)
+        if parent:
+            raise ValidationError(
+                f"root node {root_node.format_(dereference=False, symbolize=False)}"
+                f" has parent {parent.format_(dereference=False, symbolize=False, type_name=False)}"
+            )
+        if not black:
+            raise ValidationError(
+                f"root node {root_node.format_(dereference=False, symbolize=False)} is red"
+            )
+        yield from descend(root_node, container_of(root_node, type, member), black)

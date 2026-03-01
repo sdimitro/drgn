@@ -1,9 +1,11 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 import _drgn
 import drgn
-import unittest
+from tests import TestCase
 
 
-class TestModule(unittest.TestCase):
+class TestModule(TestCase):
     def test_all(self):
         # At least for now, everything in the Python library should go in
         # __all__, so make sure that happens.

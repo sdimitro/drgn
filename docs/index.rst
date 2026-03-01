@@ -11,12 +11,9 @@ also available.
 See the :doc:`installation` instructions. Then, start with the
 :doc:`user_guide`.
 
-License
--------
-
 .. include:: ../README.rst
-    :start-after: start-license
-    :end-before: end-license
+    :start-after: start-for-index
+    :end-before: end-for-index
 
 Acknowledgements
 ----------------
@@ -29,10 +26,29 @@ Table of Contents
 -----------------
 
 .. toctree::
+    :caption: Using drgn
     :maxdepth: 3
 
     installation
     user_guide
     advanced_usage
+    getting_debugging_symbols
+
+.. toctree::
+    :caption: Tutorials
+    :maxdepth: 3
+
+    tutorials
+    case_studies
+
+.. toctree::
+    :caption: Reference
+    :maxdepth: 3
+
     api_reference
     helpers
+    commands
+    crash_compatibility
+    man_pages
+    support_matrix
+    release_highlights
