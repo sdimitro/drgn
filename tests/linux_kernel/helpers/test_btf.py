@@ -17,12 +17,16 @@ from drgn import (
     TypeMember,
     host_platform,
 )
-from drgn.helpers.experimental.btf import (
+from drgn.helpers.linux.btf import (
     build_c_declaration_object_finder,
     load_builtin_btf,
 )
 from tests import TestCase, skip_unless_have_libbpf
-from tests.linux_kernel import LinuxKernelTestCase, skip_unless_have_test_kmod
+from tests.linux_kernel import (
+    LinuxKernelTestCase,
+    skip_unless_have_stack_tracing,
+    skip_unless_have_test_kmod,
+)
 from tests.linux_kernel.helpers import test_block, test_fs
 
 VMLINUX_BTF_PATH = "/sys/kernel/btf/vmlinux"
@@ -54,6 +58,9 @@ class TestBtfLoading(LinuxKernelTestCase):
         names = [
             # Needed for module discovery:
             "modules",
+            # Needed to associate PCs with the main module for unwinding:
+            "_stext",
+            "_end",
             # Needed to find built-in BTF:
             "__start_BTF",
             "__stop_BTF",
@@ -112,6 +119,14 @@ class TestBtfLoading(LinuxKernelTestCase):
         self.prog.main_module().load_btf(data=btf)
         self._do_vmlinux_btf_smoke()
 
+    def test_load_builtin_btf_explicit_raw_path(self):
+        with mock.patch(
+            "drgn.helpers.linux.btf.load_vmlinux_kallsyms",
+            return_value=lambda *_: [],
+        ):
+            load_builtin_btf(self.prog, path=VMLINUX_BTF_PATH, load_modules=False)
+        self._do_vmlinux_btf_smoke()
+
     def _do_drgn_test_kmod_smoke(self):
         t = self.prog.type("drgn_test_anonymous_union")
         self.assertEqual(t.kind, TypeKind.TYPEDEF)
@@ -134,24 +149,35 @@ class TestBtfLoading(LinuxKernelTestCase):
     def test_load_builtin_btf_kernfs(self):
         self._skip_unless_have_module_btf()
         with mock.patch(
-            "drgn.helpers.experimental.btf.load_vmlinux_kallsyms",
+            "drgn.helpers.linux.btf.load_vmlinux_kallsyms",
             return_value=lambda *_: [],
         ), mock.patch(
             "os.path.isdir",
             return_value=True,
         ):
             load_builtin_btf(self.prog)
+            load_builtin_btf(self.prog)
             self._do_vmlinux_btf_smoke()
             self._do_drgn_test_kmod_smoke()
+            self.assertEqual(
+                self.prog.main_module().address_range,
+                (
+                    self.dwarf_prog.symbol("_stext").address,
+                    self.dwarf_prog.symbol("_end").address,
+                ),
+            )
 
     @skip_unless_have_test_kmod
     def test_load_bulitin_btf_internal(self):
         self._skip_unless_have_module_btf()
         with mock.patch(
-            "drgn.helpers.experimental.btf.load_vmlinux_kallsyms",
+            "drgn.helpers.linux.btf.load_vmlinux_kallsyms",
             return_value=lambda *_: [],
         ), mock.patch(
             "os.path.isdir",
+            return_value=False,
+        ), mock.patch(
+            "os.path.isfile",
             return_value=False,
         ):
             load_builtin_btf(self.prog)
@@ -173,6 +199,7 @@ class LinuxKernelBtfTestCase(LinuxKernelTestCase):
     // Needed for tests.linux_kernel.helpers.test_fs:
     struct task_struct init_task;
     struct pid_namespace init_pid_ns;
+    struct task_struct *drgn_test_kthread;
     """
 
     @classmethod
@@ -198,6 +225,12 @@ class LinuxKernelBtfTestCase(LinuxKernelTestCase):
 
 @skip_unless_have_libbpf
 class TestKernelBTF(LinuxKernelBtfTestCase):
+    def test_declared_global_var(self):
+        self.assertEqual(
+            self.prog["init_task"].address_,
+            self.dwarf_prog["init_task"].address_,
+        )
+
     def test_per_cpu_global_var(self):
         # Since v2.6.34-rc2 commit 259354deaaf03 ("module: encapsulate percpu
         # handling better and record percpu_size"), the percpu field of struct
@@ -215,6 +248,14 @@ class TestKernelBTF(LinuxKernelBtfTestCase):
 @skip_unless_have_test_kmod
 @skip_unless_have_libbpf
 class TestKmod(LinuxKernelBtfTestCase):
+    @skip_unless_have_stack_tracing
+    def test_symbolized_stack_trace(self):
+        trace = self.prog.stack_trace(self.prog["drgn_test_kthread"])
+        names = [frame.name for frame in trace]
+        self.assertIn("drgn_test_kthread_fn3", names)
+        self.assertIn("drgn_test_kthread_fn2", names)
+        self.assertIn("drgn_test_kthread_fn", names)
+
     def test_unions(self):
         # The test isn't really about the correct definition of u32/s32, which
         # changes over kernel versions and architectures.
@@ -272,7 +313,6 @@ class TestBlockBTF(test_block.TestBlock, LinuxKernelBtfTestCase):
     pass
 
 
-@skip_unless_have_libbpf
 class TestCDeclarationObjectFinder(TestCase):
     def setUp(self):
         self.prog = Program(host_platform)

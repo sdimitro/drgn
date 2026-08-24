@@ -7,9 +7,10 @@ import unittest
 from _drgn_util.platform import NORMALIZED_MACHINE_NAME
 from drgn import Object, Program, ProgramFlags, UnsupportedOperation
 from drgn.helpers.linux.pid import find_task
+from drgn.helpers.linux.btf import load_builtin_btf
 from drgn.helpers.linux.stack import StackKind, kernel_stack_trace
 from drgn.helpers.linux.timekeeping import ktime_get_real_seconds
-from tests import TestCase
+from tests import TestCase, skip_unless_have_libbpf
 from tests.linux_kernel import skip_unless_have_stack_tracing
 from tests.linux_kernel.vmcore import VMCORE_PATH, LinuxVMCoreTestCase
 from util import KernelVersion
@@ -143,3 +144,26 @@ class TestVMCoreNoDebugInfo(TestCase):
 
     def test_ktime_get_real_seconds(self):
         self.assertIsInstance(ktime_get_real_seconds(self.prog), Object)
+
+
+@unittest.skipUnless(VMCORE_PATH.exists(), "not running in kdump")
+@skip_unless_have_libbpf
+class TestVMCoreBTFNoDebugInfo(TestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.prog = Program()
+        cls.prog.set_core_dump(VMCORE_PATH)
+        load_builtin_btf(cls.prog)
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.prog
+
+    def test_task_struct(self):
+        self.assertGreater(len(self.prog.type("struct task_struct").members), 20)
+
+    @skip_unless_have_stack_tracing
+    def test_symbolized_crashed_thread_stack_trace(self):
+        trace = self.prog.crashed_thread().stack_trace()
+        self.assertTrue(any(frame.name for frame in trace))

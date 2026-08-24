@@ -186,14 +186,27 @@ static PyObject *Module_try_file(Module *self, PyObject *args, PyObject *kwds)
 static PyObject *Module_load_btf(Module *self, PyObject *args, PyObject *kwds)
 {
 	static char *keywords[] = { "data", "main_module_base", NULL };
-	const char *btf_data = NULL;
-	size_t btf_size = 0;
+	PyObject *data_obj = Py_None;
+	PyObject *main_module_base_obj = Py_None;
 	int main_module_base = DRGN_TRISTATE_DEFAULT;
-	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|$z#p:load_btf", keywords,
-					 &btf_data, &btf_size, &main_module_base))
+	if (!PyArg_ParseTupleAndKeywords(args, kwds, "|$OO:load_btf", keywords,
+					 &data_obj, &main_module_base_obj))
 		return NULL;
-	struct drgn_error *err = drgn_module_load_btf(self->module, btf_data,
-						      btf_size, main_module_base);
+	if (main_module_base_obj != Py_None) {
+		main_module_base = PyObject_IsTrue(main_module_base_obj);
+		if (main_module_base < 0)
+			return NULL;
+	}
+
+	Py_buffer data = {};
+	if (data_obj != Py_None
+	    && PyObject_GetBuffer(data_obj, &data, PyBUF_SIMPLE) < 0)
+		return NULL;
+	struct drgn_error *err =
+		drgn_module_load_btf(self->module, data.buf, data.len,
+				     main_module_base);
+	if (data.obj)
+		PyBuffer_Release(&data);
 	if (err)
 		return set_drgn_error(err);
 	Py_RETURN_NONE;

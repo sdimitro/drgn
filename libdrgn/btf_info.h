@@ -18,7 +18,7 @@ enum drgn_tristate {
 };
 
 /**
- * Represents an BTF item which can be indexed by name: a variable, a named
+ * Represents a BTF item which can be indexed by name: a variable, a named
  * type, or an enumerator.
  */
 struct drgn_btf_index_item {
@@ -36,6 +36,7 @@ struct drgn_btf_index_item {
 	unsigned int is_enum : 1;
 	unsigned int is_present : 1;
 	unsigned int addr_valid : 1;
+	unsigned int is_percpu : 1;
 };
 
 DEFINE_VECTOR_TYPE(drgn_btf_index_bucket, struct drgn_btf_index_item, 1);
@@ -44,7 +45,8 @@ DEFINE_HASH_MAP_TYPE(drgn_btf_index, const char *, struct drgn_btf_index_bucket)
 /** BTF type information for the entire program */
 struct drgn_btf_info {
 	struct drgn_type_finder type_finder;
-	struct drgn_object_finder object_finder_symbol, object_finder_datasec;
+	struct drgn_object_finder object_finder_symbol, object_finder_datasec,
+		object_finder_kernel;
 	struct drgn_btf_index htab;
 };
 

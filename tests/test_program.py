@@ -46,6 +46,15 @@ def zero_memory_read(address, count, offset, physical):
 
 
 class TestProgram(TestCase):
+    @unittest.skipIf(_with_libbpf, "test requires a build without libbpf")
+    def test_load_btf_unavailable(self):
+        prog = Program(MOCK_PLATFORM)
+        module = prog.main_module("test", create=True)
+        with self.assertRaisesRegex(
+            NotImplementedError, "drgn was not built with libbpf support"
+        ):
+            module.load_btf(data=b"")
+
     def test_default_program(self):
         self.assertRaises(NoDefaultProgramError, get_default_prog)
         prog = Program()
@@ -614,7 +623,7 @@ class TestObjectFinder(TestCase):
         prog = Program(MOCK_PLATFORM)
 
         if _with_libbpf:
-            expected_reg = {"dwarf", "btf", "btf_symbol"}
+            expected_reg = {"dwarf", "btf", "btf_symbol", "btf_kernel"}
             expected_enabled = ["dwarf", "btf"]
         else:
             expected_reg = {"dwarf"}

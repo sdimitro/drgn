@@ -19,6 +19,7 @@
 #include "hash_table.h"
 #include "lazy_object.h"
 #include "log.h"
+#include "platform.h"
 #include "program.h"
 #include "symbol.h"
 #include "type.h"
@@ -120,7 +121,7 @@ static bool index_name(struct drgn_module *module, const char *name,
 static bool update_var_address_from_datasec(struct drgn_module *module,
 					    const char *name,
 					    uint32_t type_id, uint64_t addr,
-					    bool base_found)
+					    bool base_found, bool is_percpu)
 {
 	struct hash_pair hp = drgn_btf_index_hash(&name);
 	struct drgn_btf_index_iterator it =
@@ -134,6 +135,7 @@ static bool update_var_address_from_datasec(struct drgn_module *module,
 				e->addr = addr;
 				e->is_present = 1;
 				e->addr_valid = base_found;
+				e->is_percpu = is_percpu;
 				return true;
 			}
 		}
@@ -250,35 +252,58 @@ static struct drgn_error *find_section_base(struct drgn_module *module,
 	return &drgn_not_found;
 }
 
-static struct drgn_error *find_symbol_addr(struct drgn_module *module,
-                                           const char *name, uint64_t *ret)
+static bool symbol_kind_matches(enum drgn_symbol_kind actual,
+				enum drgn_symbol_kind expected)
 {
-	struct drgn_error *err;
-	_cleanup_symbol_ struct drgn_symbol *sym = NULL;
+	if (actual == DRGN_SYMBOL_KIND_UNKNOWN || actual == expected)
+		return true;
+	if (expected == DRGN_SYMBOL_KIND_OBJECT)
+		return actual == DRGN_SYMBOL_KIND_COMMON
+		       || actual == DRGN_SYMBOL_KIND_TLS;
+	if (expected == DRGN_SYMBOL_KIND_FUNC)
+		return actual == DRGN_SYMBOL_KIND_IFUNC;
+	return false;
+}
 
-	// If we have a loaded file, bypass the pluggable symbol finder and
-	// directly access the module's symbols. This has the lowest chance of a
-	// name conflict.
-	if (module->loaded_file || module->debug_file) {
-		enum drgn_find_symbol_flags flags =
-			DRGN_FIND_SYMBOL_NAME | DRGN_FIND_SYMBOL_ONE;
-		struct drgn_symbol_result_builder builder;
-		drgn_symbol_result_builder_init(&builder, true);
-		err = drgn_module_elf_symbols_search(module, name, 0, flags, &builder);
-		if (err && !drgn_error_catch(&err, DRGN_ERROR_STOP))
-			return err;
-		if (!drgn_symbol_result_builder_count(&builder))
-			return &drgn_not_found;
-		sym = drgn_symbol_result_builder_single(&builder);
-		*ret = sym->address;
-		return NULL;
+static struct drgn_error *find_symbol_addr(struct drgn_module *module,
+					   const char *name,
+					   enum drgn_symbol_kind kind,
+					   uint64_t *ret)
+{
+	struct drgn_symbol **symbols;
+	size_t count;
+	struct drgn_error *err =
+		drgn_program_find_symbols_by_name(module->prog, name, &symbols,
+						  &count);
+	if (err)
+		return err;
+
+	size_t num_address_ranges;
+	bool have_address_ranges =
+		drgn_module_num_address_ranges(module, &num_address_ranges);
+	bool found = false;
+	uint64_t address = 0;
+	for (size_t i = 0; i < count; i++) {
+		struct drgn_symbol *symbol = symbols[i];
+		if (!symbol_kind_matches(symbol->kind, kind)
+		    || (have_address_ranges
+			&& !drgn_module_contains_address(module, symbol->address)))
+			continue;
+		if (found && address != symbol->address) {
+			drgn_symbols_destroy(symbols, count);
+			return drgn_error_format(
+				DRGN_ERROR_OTHER,
+				"symbol '%s' is ambiguous in module '%s'",
+				name, module->name);
+		}
+		found = true;
+		address = symbol->address;
 	}
-
-	// Otherwise, use the global symbol finder
-	err = drgn_program_find_symbol_by_name(module->prog, name, &sym);
-	if (!err)
-		*ret = sym->address;
-	return err;
+	drgn_symbols_destroy(symbols, count);
+	if (!found)
+		return &drgn_not_found;
+	*ret = address;
+	return NULL;
 }
 
 static struct drgn_error *index_enumerator(struct drgn_module *module,
@@ -342,8 +367,9 @@ static struct drgn_error *index_datasec(struct drgn_module *module,
 	for (int i = 0; i < btf_vlen(tp); i++) {
 		const struct btf_type *var = btf__type_by_id(module->btf.btf, si[i].type);
 		const char *varname = btf__str_by_offset(module->btf.btf, var->name_off);
-		if (!update_var_address_from_datasec(module, varname, si[i].type,
-						     base + si[i].offset, base_found))
+		if (!update_var_address_from_datasec(
+				module, varname, si[i].type, base + si[i].offset,
+				base_found, strcmp(name, ".data..percpu") == 0))
 			return drgn_error_format(
 				DRGN_ERROR_OTHER,
 				"cannot find variable from DATASEC '%s' (id: %u) (section '%s')",
@@ -1061,7 +1087,8 @@ make_function(const char *name, struct drgn_btf_index_item *entry, struct drgn_o
 	uint64_t addr;
 
 	struct drgn_error *err =
-		find_symbol_addr(entry->module, name, &addr);
+		find_symbol_addr(entry->module, name, DRGN_SYMBOL_KIND_FUNC,
+				 &addr);
 	if (err)
 		return err;
 
@@ -1073,45 +1100,130 @@ make_function(const char *name, struct drgn_btf_index_item *entry, struct drgn_o
 	return drgn_object_set_reference(ret, qt, addr, 0, 0);
 }
 
-static struct drgn_error *
-make_variable(struct drgn_btf_info *dbi, const char *name,
-              struct drgn_btf_index_item *entry, bool use_symtab,
-	      struct drgn_object *ret)
+static struct drgn_error *make_variable_at(struct drgn_btf_index_item *entry,
+					   uint64_t address,
+					   struct drgn_object *ret)
 {
 	struct drgn_module *mod = entry->module;
-	struct drgn_error *err;
-	uint64_t address;
-
-	if (use_symtab) {
-		err = find_symbol_addr(mod, name, &address);
-		if (err)
-			return err;
-	} else {
-		if (!entry->is_present)
-			return drgn_error_format(DRGN_ERROR_LOOKUP,
-						 "A BTF VAR is present for \"%s\" in "
-						 "module \"%s\", but it has no DATASEC "
-						 "containing address information. "
-						 "Consider using the btf_symbol "
-						 "object finder.",
-						 name, mod->name);
-		else if (!entry->addr_valid)
-			return drgn_error_format(DRGN_ERROR_LOOKUP,
-						 "A BTF VAR is present for \"%s\" in "
-						 "module \"%s\", but its containing "
-						 "DATASEC base address was not found. "
-						 "Consider using the btf_symbol "
-						 "object finder.",
-						 name, mod->name);
-		else
-			address = entry->addr;
-	}
-	const struct btf_type *tp = btf__type_by_id(mod->btf.btf, entry->type_id);
+	const struct btf_type *tp =
+		btf__type_by_id(mod->btf.btf, entry->type_id);
 	struct drgn_qualified_type qt;
-	err = drgn_btf_type_create(&mod->btf, tp->type, &qt);
+	struct drgn_error *err =
+		drgn_btf_type_create(&mod->btf, tp->type, &qt);
 	if (err)
 		return err;
 	return drgn_object_set_reference(ret, qt, address, 0, 0);
+}
+
+static struct drgn_error *variable_datasec_address(
+	const char *name, struct drgn_btf_index_item *entry, uint64_t *ret)
+{
+	struct drgn_module *mod = entry->module;
+	if (!entry->is_present) {
+		return drgn_error_format(DRGN_ERROR_LOOKUP,
+					 "A BTF VAR is present for \"%s\" in "
+					 "module \"%s\", but it has no DATASEC "
+					 "containing address information. "
+					 "Consider using the btf_symbol "
+					 "object finder.",
+					 name, mod->name);
+	} else if (!entry->addr_valid) {
+		return drgn_error_format(DRGN_ERROR_LOOKUP,
+					 "A BTF VAR is present for \"%s\" in "
+					 "module \"%s\", but its containing "
+					 "DATASEC base address was not found. "
+					 "Consider using the btf_symbol "
+					 "object finder.",
+					 name, mod->name);
+	}
+	*ret = entry->addr;
+	return NULL;
+}
+
+static struct drgn_error *
+make_variable(const char *name, struct drgn_btf_index_item *entry,
+	      bool use_symtab, struct drgn_object *ret)
+{
+	uint64_t address;
+	struct drgn_error *err;
+	if (use_symtab) {
+		err = find_symbol_addr(entry->module, name,
+				       DRGN_SYMBOL_KIND_OBJECT, &address);
+	} else {
+		err = variable_datasec_address(name, entry, &address);
+	}
+	if (err)
+		return err;
+	return make_variable_at(entry, address, ret);
+}
+
+static struct drgn_error *kernel_variable_address(
+	const char *name, struct drgn_btf_index_item *entry, uint64_t *ret)
+{
+	struct drgn_error *err;
+	if (entry->is_percpu) {
+		err = variable_datasec_address(name, entry, ret);
+		if (!err || !drgn_error_catch(&err, DRGN_ERROR_LOOKUP))
+			return err;
+	}
+
+	err = find_symbol_addr(entry->module, name, DRGN_SYMBOL_KIND_OBJECT,
+			       ret);
+	if (!err || !drgn_error_catch(&err, DRGN_ERROR_LOOKUP))
+		return err;
+
+	if (entry->is_present && entry->addr_valid) {
+		*ret = entry->addr;
+		return NULL;
+	}
+	return &drgn_not_found;
+}
+
+static struct drgn_error *drgn_btf_object_find_kernel(
+	const char *name, size_t name_len, const char *filename,
+	enum drgn_find_object_flags flags, void *arg, struct drgn_object *ret)
+{
+	if (filename || !(flags & DRGN_FIND_OBJECT_VARIABLE))
+		return &drgn_not_found;
+
+	struct drgn_btf_info *bi = arg;
+	_cleanup_free_ char *name_copy = strndup(name, name_len);
+	if (!name_copy)
+		return &drgn_enomem;
+	struct drgn_btf_index_iterator it =
+		drgn_btf_index_search(&bi->htab, (const char **)&name_copy);
+	if (!it.entry)
+		return &drgn_not_found;
+
+	struct drgn_btf_index_item *found_entry = NULL;
+	uint64_t found_address = 0;
+	struct drgn_btf_index_bucket *bucket = &it.entry->value;
+	for (size_t i = 0; i < drgn_btf_index_bucket_size(bucket); i++) {
+		struct drgn_btf_index_item *entry =
+			drgn_btf_index_bucket_at(bucket, i);
+		if (entry->kind != BTF_KIND_VAR)
+			continue;
+		uint64_t address;
+		struct drgn_error *err =
+			kernel_variable_address(name_copy, entry, &address);
+		if (drgn_error_catch(&err, DRGN_ERROR_LOOKUP))
+			continue;
+		if (err)
+			return err;
+		if (found_entry
+		    && (found_entry->module != entry->module
+			|| found_entry->type_id != entry->type_id
+			|| found_address != address)) {
+			return drgn_error_format(
+				DRGN_ERROR_OTHER,
+				"BTF variable '%s' is ambiguous", name_copy);
+		}
+		found_entry = entry;
+		found_address = address;
+	}
+	if (!found_entry)
+		return &drgn_not_found;
+	return make_variable_at(found_entry, found_address, ret);
 }
 
 static struct drgn_error *drgn_btf_object_find(
@@ -1120,6 +1232,8 @@ static struct drgn_error *drgn_btf_object_find(
 	struct drgn_object *ret)
 {
 	struct drgn_btf_info *bi = arg;
+	if (filename)
+		return &drgn_not_found;
 	_cleanup_free_ char *name_copy = strndup(name, name_len);
 	if (!name_copy)
 		return &drgn_enomem;
@@ -1135,7 +1249,7 @@ static struct drgn_error *drgn_btf_object_find(
 			return make_constant(entry, ret);
 		} else if (entry->kind == BTF_KIND_VAR &&
 			   (flags & DRGN_FIND_OBJECT_VARIABLE)) {
-			return make_variable(bi, name, entry, use_symtab, ret);
+			return make_variable(name, entry, use_symtab, ret);
 		} else if (entry->kind == BTF_KIND_FUNC &&
 			   (flags & DRGN_FIND_OBJECT_FUNCTION)) {
 			return make_function(name, entry, ret);
@@ -1187,7 +1301,8 @@ find_btf_section(struct drgn_elf_file *file, const void **data_ret, size_t *size
 		if (strcmp(scnname, ".BTF") != 0)
 			continue;
 		Elf_Data *btf_contents;
-		struct drgn_error *err = read_elf_section(scn, &btf_contents);
+		struct drgn_error *err =
+			drgn_elf_file_read_section(file, scn, false, &btf_contents);
 		if (err)
 			return err;
 		*data_ret = btf_contents->d_buf;
@@ -1202,9 +1317,15 @@ drgn_module_load_btf(struct drgn_module *module, const void *btf_data,
                      size_t btf_data_size, enum drgn_tristate main_module_base)
 {
 	struct drgn_program *prog = module->prog;
-	if (module->btf.btf)
-		return drgn_error_create(DRGN_ERROR_INVALID_ARGUMENT,
-					 "BTF is already loaded for this module");
+	if (module->btf.btf) {
+		drgn_log_debug(prog, "%s: BTF is already loaded", module->name);
+		return NULL;
+	}
+	if (!prog->has_platform) {
+		return drgn_error_create(
+			DRGN_ERROR_INVALID_ARGUMENT,
+			"program platform must be known before loading BTF");
+	}
 
 	// Linux kernel modules almost always reference the vmlinux BTF as their
 	// base. On the other hand, userspace programs don't typically have a
@@ -1267,6 +1388,24 @@ drgn_module_load_btf(struct drgn_module *module, const void *btf_data,
 	if (err)
 		return err;
 
+	bool little_endian = btf__endianness(btf) == BTF_LITTLE_ENDIAN;
+	if (little_endian != drgn_platform_is_little_endian(&prog->platform)) {
+		btf__free(btf);
+		return drgn_error_format(
+			DRGN_ERROR_INVALID_ARGUMENT,
+			"%s: BTF byte order does not match the target platform",
+			module->name);
+	}
+	size_t pointer_size = drgn_platform_address_size(&prog->platform);
+	int r = btf__set_pointer_size(btf, pointer_size);
+	if (r) {
+		btf__free(btf);
+		return drgn_error_format(
+			DRGN_ERROR_INVALID_ARGUMENT,
+			"%s: cannot set BTF pointer size to %zu: %s",
+			module->name, pointer_size, strerror(-r));
+	}
+
 	struct drgn_type **cache =
 		calloc(btf__type_cnt(btf), sizeof(*cache));
 	if (!cache) {
@@ -1298,11 +1437,13 @@ void drgn_btf_info_init(struct drgn_debug_info *dbi)
 					"btf", &type_finder_ops,
 					&dbi->btf, 1);
 
-	// We have two ways to find objects:
+	// We have three ways to find objects:
 	// - btf_symbol: Use VAR entries for the types, and use symbol lookup by
 	//   name for object addresses.
 	// - btf_datasec: Use VAR entries for the types, and rely on offset
 	//   information from DATASEC entries to determine object addresses.
+	// - btf_kernel: Prefer DATASEC for per-CPU variables and module-scoped
+	//   symbols for ordinary variables, with DATASEC as a fallback.
 	//
 	// The reason for including btf_symbol is that GCC currently emits BTF
 	// for which the DATASEC offsets are all zero (as of GCC 15,
@@ -1321,6 +1462,13 @@ void drgn_btf_info_init(struct drgn_debug_info *dbi)
 	drgn_program_register_object_finder_impl(dbi->prog, &dbi->btf.object_finder_symbol,
 						 "btf_symbol", &object_finder_symbol_ops,
 						 &dbi->btf, DRGN_HANDLER_REGISTER_DONT_ENABLE);
+	const struct drgn_object_finder_ops object_finder_kernel_ops = {
+		.find = drgn_btf_object_find_kernel,
+	};
+	drgn_program_register_object_finder_impl(
+		dbi->prog, &dbi->btf.object_finder_kernel, "btf_kernel",
+		&object_finder_kernel_ops, &dbi->btf,
+		DRGN_HANDLER_REGISTER_DONT_ENABLE);
 }
 
 void drgn_btf_info_deinit(struct drgn_debug_info *dbi)

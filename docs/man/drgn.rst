@@ -94,6 +94,19 @@ Debugging Symbols
 
     This option may be given more than once.
 
+.. option:: --btf
+
+    When the main Linux kernel DWARF debugging information is unavailable,
+    fall back to built-in kernel BTF for types and ``kallsyms`` for global
+    symbols. DWARF retains precedence when it is available. Combine this with
+    :option:`--no-default-symbols` for an intentional BTF-only session.
+
+.. option:: --btf-file {PATH}
+
+    Load Linux kernel BTF from the given raw BTF file or from the ``.BTF``
+    section of the given ELF file. This forces BTF loading even when DWARF is
+    available.
+
 The following options correspond to :py:attr:`drgn.Program.debug_info_options`
 in the Python API.
 

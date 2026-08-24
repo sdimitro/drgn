@@ -431,20 +431,20 @@ def _load_debugging_symbols(prog: drgn.Program, args: argparse.Namespace) -> Non
 
     if args.default_symbols is None:
         args.default_symbols = {"default": True, "main": True}
+    missing_debug_info = None
+    missing_debug_info_is_critical = False
     try:
         prog.load_debug_info(args.symbols, **args.default_symbols)
     except drgn.MissingDebugInfoError as e:
+        missing_debug_info = e
         if args.default_symbols.get("main"):
             try:
                 main_module = prog.main_module()
-                critical = (
+                missing_debug_info_is_critical = (
                     main_module.wants_debug_file() or main_module.wants_loaded_file()
                 )
             except LookupError:
-                critical = True
-        else:
-            critical = False
-        logger.log(logging.CRITICAL if critical else logging.WARNING, "%s", e)
+                missing_debug_info_is_critical = True
 
     if args.extra_symbols:
         for extra_symbol_path in args.extra_symbols:
@@ -452,6 +452,29 @@ def _load_debugging_symbols(prog: drgn.Program, args: argparse.Namespace) -> Non
             prog.extra_module(extra_symbol_path, create=True).try_file(
                 extra_symbol_path
             )
+
+    btf_loaded = False
+    btf_requested = args.btf or args.btf_file is not None
+    if btf_requested and (
+        args.btf_file is not None
+        or not args.default_symbols
+        or missing_debug_info_is_critical
+    ):
+        try:
+            from drgn.helpers.linux.btf import load_builtin_btf
+
+            load_builtin_btf(prog, path=args.btf_file)
+        except Exception as e:
+            logger.critical("could not load kernel BTF fallback: %s", e)
+        else:
+            btf_loaded = True
+            logger.info("loaded kernel BTF and kallsyms fallback")
+
+    if missing_debug_info is not None:
+        level = logging.CRITICAL if missing_debug_info_is_critical else logging.WARNING
+        if btf_loaded:
+            level = logging.WARNING
+        logger.log(level, "%s", missing_debug_info)
 
 
 def _main() -> None:
@@ -521,6 +544,18 @@ def _main() -> None:
         help="load additional debugging symbols from the given file, "
         "which is assumed not to correspond to a loaded executable, library, or module. "
         "This option may be given more than once",
+    )
+    symbol_group.add_argument(
+        "--btf",
+        action="store_true",
+        help="fall back to built-in kernel BTF and kallsyms if main DWARF "
+        "debugging information is unavailable",
+    )
+    symbol_group.add_argument(
+        "--btf-file",
+        metavar="PATH",
+        help="load kernel BTF from a raw BTF or ELF file; implies BTF loading "
+        "even if DWARF debugging information is available",
     )
     symbol_group.add_argument(
         "--try-symbols-by",

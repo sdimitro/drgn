@@ -22,6 +22,64 @@ don't care about, feel free to ignore them.
 Since drgn 0.0.31, you can run drgn with ``--log-level debug`` to get logs of
 where drgn looked for debugging symbols.
 
+Linux Kernel BTF Fallback
+-------------------------
+
+If a Linux kernel was built without DWARF but has `BPF Type Format (BTF)
+<https://docs.kernel.org/bpf/btf.html>`_, drgn can use BTF for types and
+``kallsyms`` for global symbol addresses. For the running kernel, use::
+
+    $ sudo drgn --btf
+
+``--btf`` is a fallback: normal DWARF debugging information retains precedence
+when it is available. To intentionally skip normal debugging symbol discovery,
+use::
+
+    $ sudo drgn --no-default-symbols --btf
+
+Use ``--btf-file`` to load either raw BTF or the ``.BTF`` section of an ELF
+file::
+
+    $ sudo drgn --no-default-symbols --btf-file /sys/kernel/btf/vmlinux
+    $ drgn -c vmcore --no-default-symbols --btf-file vmlinux
+
+The equivalent Python API is
+:func:`drgn.helpers.linux.btf.load_builtin_btf()`::
+
+    >>> from drgn.helpers.linux.btf import load_builtin_btf
+    >>> load_builtin_btf(prog)
+
+The helper automatically tries :file:`/sys/kernel/btf/vmlinux`, BTF stored in
+the target's memory, or a ``.BTF`` section already associated with the vmlinux
+module. It also loads vmlinux ``kallsyms`` and, by default, split BTF and
+``kallsyms`` for loaded modules. drgn must have been built with libbpf support;
+``drgn --version`` reports ``with libbpf`` when it was.
+
+BTF is less expressive than DWARF. It does not provide source locations,
+inline frames, local variables, function parameters, or call frame
+information. drgn can still produce symbolized stack traces using the kernel's
+frame pointers on x86-64 and arm64, or built-in ORC unwind information on
+x86-64. The vmlinux ``_stext`` and ``_end`` symbols must be available so that
+drgn can associate program counters and ORC data with the main kernel module.
+
+Most stock kernel BTF only contains ``VAR`` records for per-CPU variables.
+Consequently, ``kallsyms`` may provide the address of an ordinary global
+without BTF providing its type. The BTF helper installs declarations for a few
+bootstrap globals. Pass declarations for any other globals that you need::
+
+    >>> load_builtin_btf(prog, "struct task_struct *current_task;")
+
+Kernels built with pahole's ``--btf_features=global_var`` option (see the
+`pahole manual
+<https://manpages.debian.org/testing/pahole/pahole.1.en.html#OPTIONS>`_) encode
+ordinary global variable types, so drgn combines those types with the
+module-scoped ``kallsyms`` addresses automatically.
+
+For vmcores, automatic ``kallsyms`` reconstruction needs the corresponding
+VMCOREINFO metadata (normally from Linux 6.0 or newer) or an explicit vmlinux
+symbol table. Split module BTF from vmcores is supported when the required
+kernel metadata is present, but module loading is best effort.
+
 Building With Debugging Symbols
 -------------------------------
 

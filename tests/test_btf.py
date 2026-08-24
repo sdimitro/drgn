@@ -10,12 +10,21 @@ from drgn import (
     PlatformFlags,
     Program,
     Qualifiers,
+    Symbol,
+    SymbolBinding,
+    SymbolIndex,
+    SymbolKind,
     TypeEnumerator,
     TypeMember,
     TypeParameter,
     host_platform,
 )
-from tests import MOCK_BIG_ENDIAN_PLATFORM, TestCase, skip_unless_have_libbpf
+from tests import (
+    MOCK_32BIT_PLATFORM,
+    MOCK_BIG_ENDIAN_PLATFORM,
+    TestCase,
+    skip_unless_have_libbpf,
+)
 from tests.btf import (
     BtfEnum,
     btf_array,
@@ -44,12 +53,6 @@ from tests.elfwriter import ElfSection, ElfSymbol, create_elf_file
 
 
 def btf_program(types, *, little_endian=True, platform=host_platform):
-    # libbpf infers the pointer size by searching for the "unsigned long" type
-    # size (among others). Include a definition so we get valid pointer sizes
-    # matching the target platform.
-    if not any(t.name == "unsigned long" for t in types):
-        ptr_size = 64 if platform.flags & PlatformFlags.IS_64_BIT else 32
-        types.append(btf_int("unsigned long", bits=ptr_size))
     data = btf_compile(types, little_endian=little_endian).data
     prog = Program(platform=platform)
     module = prog.main_module("btf", create=True)
@@ -64,6 +67,14 @@ def btf_test_type(*types, **kwargs):
 
 @skip_unless_have_libbpf
 class TestBtfTypeFinder(TestCase):
+    def test_requires_target_platform(self):
+        prog = Program()
+        module = prog.main_module("btf", create=True)
+        with self.assertRaisesRegex(ValueError, "platform must be known"):
+            module.load_btf(
+                data=btf_compile([btf_int("int", bits=32, signed=True)]).data
+            )
+
     def test_big_endian(self):
         # A basic correctness check: can big-endian platform read a big-endian
         # encoded BTF data and load a basic int type?
@@ -76,6 +87,32 @@ class TestBtfTypeFinder(TestCase):
             platform=MOCK_BIG_ENDIAN_PLATFORM,
         )
         self.assertIdentical(type_, prog.int_type("int", 4, True, "big"))
+
+    def test_wrong_endian(self):
+        data = btf_compile(
+            [btf_int("int", bits=32, signed=True)],
+            little_endian=not bool(
+                host_platform.flags & PlatformFlags.IS_LITTLE_ENDIAN
+            ),
+        ).data
+        prog = Program(platform=host_platform)
+        module = prog.main_module("btf", create=True)
+        with self.assertRaisesRegex(ValueError, "byte order does not match"):
+            module.load_btf(data=data)
+
+    def test_buffer_and_idempotent_load(self):
+        data = btf_compile([btf_int("int", bits=32, signed=True)]).data
+        prog = Program(platform=host_platform)
+        module = prog.main_module("btf", create=True)
+        module.load_btf(data=memoryview(data))
+        module.load_btf(data=b"not BTF")
+        self.assertIdentical(prog.type("int"), prog.int_type("int", 4, True))
+
+    def test_load_rejects_string_data(self):
+        prog = Program(platform=host_platform)
+        module = prog.main_module("btf", create=True)
+        with self.assertRaises(TypeError):
+            module.load_btf(data="not bytes")  # type: ignore[arg-type]
 
     def test_int(self):
         prog, type_ = btf_test_type(btf_int("u8", bits=8))
@@ -144,6 +181,14 @@ class TestBtfTypeFinder(TestCase):
     def test_pointer(self):
         prog, type_ = btf_test_type(btf_int("int", bits=32, signed=True), btf_ptr(1))
         self.assertIdentical(type_, prog.pointer_type(prog.int_type("int", 4, True)))
+
+    def test_pointer_uses_target_address_size(self):
+        prog, type_ = btf_test_type(
+            btf_int("int", bits=32, signed=True),
+            btf_ptr(1),
+            platform=MOCK_32BIT_PLATFORM,
+        )
+        self.assertIdentical(type_, prog.pointer_type(prog.int_type("int", 4, True), 4))
 
     def test_float(self):
         prog, type_ = btf_test_type(btf_float("float", 4))
@@ -638,6 +683,56 @@ class TestBtfObjectFinder(TestCase):
             prog.variable("counter"),
             Object(prog, prog.int_type("int", 4, True), address=0x2000),
         )
+        prog.set_enabled_object_finders(["btf_kernel", "btf"])
+        self.assertIdentical(
+            prog.variable("counter"),
+            Object(prog, prog.int_type("int", 4, True), address=0x2000),
+        )
+
+    def test_kernel_variable_rejects_ambiguous_symbols(self):
+        prog = btf_elf_program(
+            [btf_int("int", bits=32, signed=True), btf_var("counter", 1)],
+            [
+                ElfSymbol("counter", 0x2000, 4, STT.OBJECT, STB.LOCAL, 1),
+                ElfSymbol("counter", 0x2008, 4, STT.OBJECT, STB.LOCAL, 1),
+            ],
+        )
+        prog.set_enabled_object_finders(["btf_kernel", "btf"])
+        with self.assertRaisesRegex(Exception, "symbol 'counter' is ambiguous"):
+            prog.variable("counter")
+
+    def test_kernel_variable_scopes_symbols_to_module(self):
+        prog = btf_program(
+            [btf_int("int", bits=32, signed=True), btf_var("counter", 1)]
+        )
+        prog.main_module().address_range = (0x1000, 0x2000)
+        prog.register_symbol_finder(
+            "duplicate_symbols",
+            SymbolIndex(
+                (
+                    Symbol(
+                        "counter",
+                        0x1800,
+                        4,
+                        SymbolBinding.GLOBAL,
+                        SymbolKind.OBJECT,
+                    ),
+                    Symbol(
+                        "counter",
+                        0x2800,
+                        4,
+                        SymbolBinding.LOCAL,
+                        SymbolKind.OBJECT,
+                    ),
+                )
+            ),
+            enable_index=0,
+        )
+        prog.set_enabled_object_finders(["btf_kernel", "btf"])
+        self.assertIdentical(
+            prog.variable("counter"),
+            Object(prog, prog.int_type("int", 4, True), address=0x1800),
+        )
 
     def test_variable_with_datasec(self):
         prog = btf_elf_program(
@@ -673,6 +768,11 @@ class TestBtfObjectFinder(TestCase):
         prog.set_enabled_object_finders(["btf_symbol"])
         self.assertRaises(ObjectNotFoundError, prog.variable, "counter")
         self.assertRaises(ObjectNotFoundError, prog.variable, "counter2")
+        prog.set_enabled_object_finders(["btf_kernel", "btf"])
+        self.assertIdentical(
+            prog.variable("counter"),
+            Object(prog, prog.int_type("int", 4, True), address=0x2000),
+        )
 
     def test_variable_with_datasec_unknown_section_address(self):
         prog = btf_elf_program(

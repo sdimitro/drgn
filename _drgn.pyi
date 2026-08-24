@@ -2010,17 +2010,20 @@ class Module:
     def load_btf(
         self,
         *,
-        data: Union[bytes, str, None] = None,
+        data: Optional[Buffer] = None,
         main_module_base: Union[bool, None] = None,
     ) -> None:
         """
         Load BPF Type Format (BTF) for this module, for type and object finding.
 
-        :param data: An optional buffer containing BTF data
+        :param data: An optional buffer containing raw BTF data. If omitted,
+          load the ``.BTF`` section from this module's loaded or debug file.
         :param main_module_base: Whether the main module BTF should be used as
           the split BTF base. When unspecified or ``None``, the default depends
           on the target.  For Linux kernel programs, the default is ``True``,
           and for userspace programs, the default is ``False``.
+
+        If BTF is already loaded for the module, this has no effect.
         """
         ...
 
